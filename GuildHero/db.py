@@ -119,7 +119,7 @@ def _init_db() -> PostgresKV:
         raise RuntimeError(
             "DATABASE_URL environment variable is not set. "
             "Set it to a PostgreSQL connection string, e.g. "
-            "postgres://user:password@host:port/dbname"
+            "postgresql://user:password@host:port/dbname"
         )
     return PostgresKV(url)
 

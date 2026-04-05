@@ -74,7 +74,7 @@ pip install -r requirements.txt
 ### Running Locally
 
 ```bash
-export DATABASE_URL="postgres://user:password@localhost:5432/guildhero"
+export DATABASE_URL="postgresql://user:password@localhost:5432/guildhero"
 export TELEGRAM_BOT_TOKEN="your-token"
 export OPENAI_API_KEY="your-key"
 python GuildHero/bot.py
