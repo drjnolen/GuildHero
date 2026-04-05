@@ -52,7 +52,7 @@ An all-in-one Telegram community management and engagement bot built for crypto-
 - Python 3.10+
 - A [Telegram Bot Token](https://core.telegram.org/bots#botfather)
 - An [OpenAI API Key](https://platform.openai.com/api-keys)
-- [Replit](https://replit.com/) account (for database) or adapt the database layer
+- A PostgreSQL database (provided automatically by Railway)
 - (Optional) A SUI wallet private key for airdrop functionality
 
 ### Installation
@@ -65,16 +65,27 @@ pip install -r requirements.txt
 
 | Variable | Required | Description |
 |----------|----------|-------------|
+| `DATABASE_URL` | Yes | PostgreSQL connection string (set automatically by Railway when you add a Postgres plugin) |
 | `TELEGRAM_BOT_TOKEN` | Yes | Your Telegram bot token from BotFather |
 | `OPENAI_API_KEY` | Yes | Your OpenAI API key |
 | `SUI_PRIVATE_KEY` | No | Hex-encoded 32-byte Ed25519 private key (64 hex characters) for the bot's SUI wallet (required for `/airdrop`) |
 | `SUI_RPC_URL` | No | SUI JSON-RPC endpoint (defaults to `https://fullnode.mainnet.sui.io:443`) |
 
-### Running
+### Running Locally
 
 ```bash
-python "GuildHero/GuildHero Bot"
+export DATABASE_URL="postgres://user:password@localhost:5432/guildhero"
+export TELEGRAM_BOT_TOKEN="your-token"
+export OPENAI_API_KEY="your-key"
+python GuildHero/bot.py
 ```
+
+### Deploying on Railway
+
+1. **Create a new project** on [Railway](https://railway.app/) and connect this repository.
+2. **Add a PostgreSQL plugin** — Railway will automatically set the `DATABASE_URL` variable. The bot creates its database table on first start.
+3. **Set environment variables** — In the Railway service settings, add `TELEGRAM_BOT_TOKEN` and `OPENAI_API_KEY` (and optionally `SUI_PRIVATE_KEY`).
+4. **Deploy** — Railway will build and run the bot using the included `Dockerfile` and `railway.toml`.
 
 ### SUI Airdrop Setup
 
@@ -101,7 +112,7 @@ To enable airdrops:
 The bot is a single-file Python application using:
 - **python-telegram-bot** — Telegram Bot API framework
 - **OpenAI GPT-3.5** — AI-powered chat analysis and content generation
-- **Replit DB** — Persistent key-value storage
+- **PostgreSQL** — Persistent key-value storage (via `psycopg2`)
 - **CoinGecko API** — Real-time cryptocurrency price data
 - **SUI JSON-RPC** — Blockchain token transfers for airdrops
 - **PyNaCl** — Ed25519 signing for SUI transactions
