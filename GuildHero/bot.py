@@ -15,7 +15,7 @@ import html
 from collections import defaultdict
 import pytz
 import httpx
-from replit import db
+from db import db
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ParseMode
 from telegram.ext import (
