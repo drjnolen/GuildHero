@@ -488,8 +488,7 @@ def choose_weighted_raffle_winner(entries):
 
     def get_raffle_weight(rank):
         """Keep every eligible rank winnable while giving higher ranks a slight edge."""
-        bounded_rank = max(1, rank)
-        pool_bonus = max(RAFFLE_POOL_SIZE + 1 - bounded_rank, 0)
+        pool_bonus = max(RAFFLE_POOL_SIZE + 1 - rank, 0)
         return 1.0 + (pool_bonus / RAFFLE_POOL_SIZE) * RAFFLE_WEIGHT_FACTOR
 
     weights = [get_raffle_weight(entry["rank"]) for entry in entries]
@@ -503,6 +502,13 @@ def choose_weighted_raffle_winner(entries):
             return entry, weight
 
     return entries[-1], weights[-1]
+
+
+def abbreviate_wallet_address(wallet_address: str) -> str:
+    """Return a shortened wallet string for user-facing messages."""
+    if len(wallet_address) <= 16:
+        return wallet_address
+    return f"{wallet_address[:8]}…{wallet_address[-6:]}"
 
 
 async def sui_rpc_call(method: str, params: list) -> dict:
@@ -1450,7 +1456,7 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🪂 <b>Airdrop Complete</b>\n\n"
         f"Token: <code>{html.escape(coin_type)}</code>\n"
         f"Amount per user: {amount}\n"
-        f"Selected wallets: {len(recipients)}/{count}\n"
+        f"Eligible wallets found: {len(recipients)}/{count}\n"
         f"✅ Sent: {success_count} | ⏭️ Missing wallet skipped: {len(skipped_missing_wallet)} | "
         f"🔁 Duplicate wallet skipped: {len(skipped_duplicate_wallet)} | ❌ Failed: {fail_count}\n\n"
         f"<b>Details:</b>\n{results_text}"
@@ -1500,7 +1506,7 @@ async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ None of the top {RAFFLE_POOL_SIZE} contributors currently have an eligible wallet.")
         return
 
-    winner, winner_weight = choose_weighted_raffle_winner(eligible_entries)
+    winner, _ = choose_weighted_raffle_winner(eligible_entries)
     coin_type = db.get(_get_airdrop_token_key(chat_id), DEFAULT_SUI_COIN_TYPE)
 
     try:
@@ -1519,12 +1525,11 @@ async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = (
         f"🎟️ <b>Raffle Complete</b>\n\n"
         f"Winner: #{winner['rank']} @{html.escape(winner['username'])}\n"
-        f"Wallet: <code>{html.escape(winner['wallet_address'])}</code>\n"
+        f"Wallet: <code>{html.escape(abbreviate_wallet_address(winner['wallet_address']))}</code>\n"
         f"Token: <code>{html.escape(coin_type)}</code>\n"
         f"Amount: {amount}\n"
         f"Eligible wallets considered: {len(eligible_entries)} of top {RAFFLE_POOL_SIZE} contributors\n"
         f"Skipped: {len(skipped_missing_wallet)} without wallet, {len(skipped_duplicate_wallet)} duplicate wallet entries\n"
-        f"Weight applied: {winner_weight:.2f}\n"
         f"Transaction: <code>{html.escape(tx_digest)}</code>"
     )
     if leaderboard_snapshot.get("start_str") and leaderboard_snapshot.get("end_str"):
