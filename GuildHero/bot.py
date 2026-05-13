@@ -68,6 +68,15 @@ class SecretRedactionFilter(logging.Filter):
 
 logging.getLogger().addFilter(SecretRedactionFilter())
 
+
+def mask_wallet_address(wallet_address: str) -> str:
+    """Shorten wallet addresses before logging them."""
+    if not wallet_address:
+        return "[unknown-wallet]"
+    if len(wallet_address) <= 12:
+        return wallet_address
+    return f"{wallet_address[:6]}…{wallet_address[-4:]}"
+
 # Initialize OpenAI client once
 openai_client = None
 def get_openai_client():
@@ -1439,7 +1448,7 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logging.error(
                 "Airdrop transfer failed for %s (%s): %s",
                 recipient["username"],
-                redact_sensitive_text(wallet_address),
+                mask_wallet_address(wallet_address),
                 redact_sensitive_text(e),
             )
             results.append(f"❌ #{recipient['rank']} @{safe_username}: Transfer failed")
@@ -1510,7 +1519,7 @@ async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(
             "Raffle transfer failed for %s (%s): %s",
             winner["username"],
-            redact_sensitive_text(winner["wallet_address"]),
+            mask_wallet_address(winner["wallet_address"]),
             redact_sensitive_text(e),
         )
         await update.message.reply_text("❌ Raffle transfer failed. Please verify wallet balances and try again.")
