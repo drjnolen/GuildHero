@@ -119,6 +119,7 @@ SUI_RPC_URL = os.environ.get("SUI_RPC_URL", "https://fullnode.mainnet.sui.io:443
 DEFAULT_SUI_COIN_TYPE = "0x2::sui::SUI"
 SUI_GAS_BUDGET = "50000000"  # 0.05 SUI
 RAFFLE_POOL_SIZE = 20
+RAFFLE_WEIGHT_FACTOR = 0.5
 
 
 # --- Helper Functions ---
@@ -485,10 +486,13 @@ def choose_weighted_raffle_winner(entries):
     if not entries:
         return None, None
 
-    weights = []
-    for entry in entries:
-        pool_bonus = max(RAFFLE_POOL_SIZE + 1 - max(1, entry["rank"]), 0)
-        weights.append(1.0 + (pool_bonus / RAFFLE_POOL_SIZE) * 0.5)
+    def get_raffle_weight(rank):
+        """Keep every eligible rank winnable while giving higher ranks a slight edge."""
+        bounded_rank = max(1, rank)
+        pool_bonus = max(RAFFLE_POOL_SIZE + 1 - bounded_rank, 0)
+        return 1.0 + (pool_bonus / RAFFLE_POOL_SIZE) * RAFFLE_WEIGHT_FACTOR
+
+    weights = [get_raffle_weight(entry["rank"]) for entry in entries]
     total_weight = sum(weights)
     threshold = random.SystemRandom().uniform(0, total_weight)
     cumulative_weight = 0.0
@@ -1435,7 +1439,7 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logging.error(
                 "Airdrop transfer failed for %s (%s): %s",
                 recipient["username"],
-                wallet_address,
+                redact_sensitive_text(wallet_address),
                 redact_sensitive_text(e),
             )
             results.append(f"❌ #{recipient['rank']} @{safe_username}: Transfer failed")
@@ -1506,7 +1510,7 @@ async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(
             "Raffle transfer failed for %s (%s): %s",
             winner["username"],
-            winner["wallet_address"],
+            redact_sensitive_text(winner["wallet_address"]),
             redact_sensitive_text(e),
         )
         await update.message.reply_text("❌ Raffle transfer failed. Please verify wallet balances and try again.")
