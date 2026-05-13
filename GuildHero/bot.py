@@ -120,6 +120,7 @@ DEFAULT_SUI_COIN_TYPE = "0x2::sui::SUI"
 SUI_GAS_BUDGET = "50000000"  # 0.05 SUI
 RAFFLE_POOL_SIZE = 20
 RAFFLE_WEIGHT_FACTOR = 0.5
+SYSTEM_RANDOM = random.SystemRandom()
 
 
 # --- Helper Functions ---
@@ -493,7 +494,7 @@ def choose_weighted_raffle_winner(entries):
 
     weights = [get_raffle_weight(entry["rank"]) for entry in entries]
     total_weight = sum(weights)
-    threshold = random.SystemRandom().uniform(0, total_weight)
+    threshold = SYSTEM_RANDOM.uniform(0, total_weight)
     cumulative_weight = 0.0
 
     for entry, weight in zip(entries, weights):
@@ -502,13 +503,6 @@ def choose_weighted_raffle_winner(entries):
             return entry, weight
 
     return entries[-1], weights[-1]
-
-
-def abbreviate_wallet_address(wallet_address: str) -> str:
-    """Return a shortened wallet string for user-facing messages."""
-    if len(wallet_address) <= 16:
-        return wallet_address
-    return f"{wallet_address[:8]}…{wallet_address[-6:]}"
 
 
 async def sui_rpc_call(method: str, params: list) -> dict:
@@ -1525,7 +1519,6 @@ async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = (
         f"🎟️ <b>Raffle Complete</b>\n\n"
         f"Winner: #{winner['rank']} @{html.escape(winner['username'])}\n"
-        f"Wallet: <code>{html.escape(abbreviate_wallet_address(winner['wallet_address']))}</code>\n"
         f"Token: <code>{html.escape(coin_type)}</code>\n"
         f"Amount: {amount}\n"
         f"Eligible wallets considered: {len(eligible_entries)} of top {RAFFLE_POOL_SIZE} contributors\n"
