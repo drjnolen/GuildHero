@@ -511,12 +511,12 @@ def choose_weighted_raffle_winner(entries):
 
     weights = [get_raffle_weight(entry["rank"]) for entry in entries]
     total_weight = sum(weights)
-    threshold = SYSTEM_RANDOM.uniform(0, total_weight)
+    threshold = SYSTEM_RANDOM.random() * total_weight
     cumulative_weight = 0.0
 
     for entry, weight in zip(entries, weights):
         cumulative_weight += weight
-        if threshold <= cumulative_weight:
+        if threshold < cumulative_weight:
             return entry, weight
 
     return entries[-1], weights[-1]
@@ -1423,7 +1423,7 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ No saved leaderboard was found for this group. Run /score or /publicscore first.")
         return
 
-    recipients, skipped_missing_wallet, skipped_duplicate_wallet = await asyncio.to_thread(
+    recipients, skipped_missing_wallets, skipped_duplicate_wallets = await asyncio.to_thread(
         resolve_wallet_recipients, chat_id, leaderboard, count
     )
     if not recipients:
@@ -1468,8 +1468,8 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Token: <code>{html.escape(coin_type)}</code>\n"
         f"Amount per user: {amount}\n"
         f"Eligible wallets found: {len(recipients)}/{count}\n"
-        f"✅ Sent: {success_count} | ⏭️ Missing wallet skipped: {len(skipped_missing_wallet)} | "
-        f"🔁 Duplicate wallet skipped: {len(skipped_duplicate_wallet)} | ❌ Failed: {fail_count}\n\n"
+        f"✅ Sent: {success_count} | ⏭️ Missing wallet skipped: {len(skipped_missing_wallets)} | "
+        f"🔁 Duplicate wallet skipped: {len(skipped_duplicate_wallets)} | ❌ Failed: {fail_count}\n\n"
         f"<b>Details:</b>\n{results_text}"
     )
     await update.message.reply_text(summary + FOOTER_HTML, parse_mode=ParseMode.HTML)
@@ -1510,8 +1510,8 @@ async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ No saved leaderboard was found for this group. Run /score or /publicscore first.")
         return
 
-    eligible_entries, skipped_missing_wallet, skipped_duplicate_wallet = await asyncio.to_thread(
-        resolve_wallet_recipients, chat_id, leaderboard, RAFFLE_POOL_SIZE, RAFFLE_POOL_SIZE
+    eligible_entries, skipped_missing_wallets, skipped_duplicate_wallets = await asyncio.to_thread(
+        resolve_wallet_recipients, chat_id, leaderboard, RAFFLE_POOL_SIZE, top_limit=RAFFLE_POOL_SIZE
     )
     if not eligible_entries:
         await update.message.reply_text(f"❌ None of the top {RAFFLE_POOL_SIZE} contributors currently have an eligible wallet.")
@@ -1539,7 +1539,7 @@ async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Token: <code>{html.escape(coin_type)}</code>\n"
         f"Amount: {amount}\n"
         f"Eligible wallets considered: {len(eligible_entries)} of top {RAFFLE_POOL_SIZE} contributors\n"
-        f"Skipped: {len(skipped_missing_wallet)} without wallet, {len(skipped_duplicate_wallet)} duplicate wallet entries\n"
+        f"Skipped: {len(skipped_missing_wallets)} without wallet, {len(skipped_duplicate_wallets)} duplicate wallet entries\n"
         f"Transaction: <code>{html.escape(tx_digest)}</code>"
     )
     if leaderboard_snapshot.get("start_str") and leaderboard_snapshot.get("end_str"):
