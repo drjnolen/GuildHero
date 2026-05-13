@@ -36,6 +36,38 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
+
+def redact_sensitive_text(value):
+    """Redact configured secrets from log and error output."""
+    text = value if isinstance(value, str) else str(value)
+    for env_name in ("DATABASE_URL", "TELEGRAM_BOT_TOKEN", "OPENAI_API_KEY", "SUI_PRIVATE_KEY"):
+        secret = os.environ.get(env_name)
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    return text
+
+
+class SecretRedactionFilter(logging.Filter):
+    """Redacts configured secrets from log messages."""
+
+    def filter(self, record):
+        if record.msg is not None:
+            record.msg = redact_sensitive_text(record.msg)
+        if isinstance(record.args, dict):
+            record.args = {
+                key: redact_sensitive_text(value) if isinstance(value, str) else value
+                for key, value in record.args.items()
+            }
+        elif isinstance(record.args, tuple):
+            record.args = tuple(
+                redact_sensitive_text(value) if isinstance(value, str) else value
+                for value in record.args
+            )
+        return True
+
+
+logging.getLogger().addFilter(SecretRedactionFilter())
+
 # Initialize OpenAI client once
 openai_client = None
 def get_openai_client():
@@ -216,6 +248,11 @@ def _get_airdrop_token_key(chat_id):
     """Returns the database key for the group's airdrop token type."""
     return f"airdrop_token:{chat_id}"
 
+
+def _get_latest_leaderboard_key(chat_id):
+    """Returns the database key for the group's latest leaderboard snapshot."""
+    return f"leaderboard:latest:{chat_id}"
+
 def get_events_for_month(chat_id, year, month):
     event_dates = set()
     prefix = f"event:{chat_id}:{year}-{str(month).zfill(2)}"
@@ -383,6 +420,81 @@ def get_top_users_by_messages(chat_id, count):
             continue
     user_counts.sort(key=lambda item: item[1], reverse=True)
     return user_counts[:count]
+
+
+def store_latest_leaderboard(chat_id, leaderboard_data, start_str, end_str):
+    """Persist the latest leaderboard snapshot for a chat."""
+    db[_get_latest_leaderboard_key(chat_id)] = {
+        "leaderboard": leaderboard_data,
+        "start_str": start_str,
+        "end_str": end_str,
+        "saved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+
+
+def get_latest_leaderboard(chat_id):
+    """Return the latest stored leaderboard snapshot for a chat."""
+    return db.get(_get_latest_leaderboard_key(chat_id))
+
+
+def resolve_wallet_recipients(chat_id, leaderboard, count, top_limit=None):
+    """Return the first N unique wallet recipients from the leaderboard."""
+    recipients = []
+    skipped_missing_wallet = []
+    skipped_duplicate_wallet = []
+    seen_wallets = set()
+    leaderboard_slice = leaderboard[:top_limit] if top_limit else leaderboard
+
+    for rank, entry in enumerate(leaderboard_slice, start=1):
+        username, metrics, message_count, user_id = entry
+        wallet_data = get_wallet(chat_id, user_id)
+        wallet_address = (wallet_data or {}).get("wallet_address", "").strip()
+        safe_username = username or f"user_{user_id}"
+
+        if not wallet_address:
+            skipped_missing_wallet.append({"rank": rank, "username": safe_username, "user_id": str(user_id)})
+            continue
+
+        normalized_wallet = wallet_address.lower()
+        if normalized_wallet in seen_wallets:
+            skipped_duplicate_wallet.append(
+                {"rank": rank, "username": safe_username, "user_id": str(user_id), "wallet_address": wallet_address}
+            )
+            continue
+
+        seen_wallets.add(normalized_wallet)
+        recipients.append(
+            {
+                "rank": rank,
+                "username": safe_username,
+                "user_id": str(user_id),
+                "wallet_address": wallet_address,
+                "message_count": message_count,
+                "metrics": metrics,
+            }
+        )
+        if len(recipients) >= count:
+            break
+
+    return recipients, skipped_missing_wallet, skipped_duplicate_wallet
+
+
+def choose_weighted_raffle_winner(entries):
+    """Slightly weight raffle odds toward higher-ranked contributors."""
+    if not entries:
+        return None, None
+
+    weights = [1.0 + ((21 - min(entry["rank"], 20)) / 20.0) * 0.5 for entry in entries]
+    total_weight = sum(weights)
+    threshold = random.SystemRandom().uniform(0, total_weight)
+    cumulative_weight = 0.0
+
+    for entry, weight in zip(entries, weights):
+        cumulative_weight += weight
+        if threshold <= cumulative_weight:
+            return entry, weight
+
+    return entries[-1], weights[-1]
 
 
 async def sui_rpc_call(method: str, params: list) -> dict:
@@ -852,6 +964,7 @@ async def generate_leaderboard(context: ContextTypes.DEFAULT_TYPE, chat_id, star
         metrics["total"] = (sum(metrics.values()) / 4) * (math.log1p(min(n, 200)) * 1.37)
         leaderboard.append((username, metrics, n, user_id))
     leaderboard.sort(key=lambda x: x[1]["total"], reverse=True)
+    store_latest_leaderboard(chat_id, leaderboard, start_str, end_str)
 
     detailed_text = format_detailed_leaderboard(leaderboard[:20], start_str, end_str, len(filtered_messages), len(user_messages))
     csv_data = await generate_csv_from_leaderboard(leaderboard, chat_id) if export else None
@@ -934,8 +1047,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/copypasta - Create a copypasta based on your message history.\n\n"
         "<b>💰 Crypto</b>\n"
         "/price &lt;symbol&gt; - Look up a cryptocurrency price.\n"
-        "/airdrop &lt;count&gt; &lt;amount&gt; - Airdrop tokens to top scorers (admin, reply to /score).\n"
-        "/settoken &lt;coin_type&gt; - Set the airdrop token for this group (admin).\n\n"
+        "/token &lt;coin_type&gt; - Set the airdrop token for this group (admin).\n"
+        "/airdrop &lt;count&gt; &lt;amount&gt; - Airdrop tokens to the top eligible leaderboard wallets (admin).\n"
+        "/raffle &lt;amount&gt; - Raffle tokens to a weighted-random wallet from the top 20 contributors (admin).\n\n"
         "<b>🗓️ Group Management</b>\n"
         "/calendar - Manage the group's event calendar (admin).\n"
         "/events - List all upcoming events.\n"
@@ -1226,8 +1340,8 @@ async def settoken_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_token = db.get(_get_airdrop_token_key(update.effective_chat.id), DEFAULT_SUI_COIN_TYPE)
         await update.message.reply_text(
             f"Current airdrop token: <code>{html.escape(current_token)}</code>\n\n"
-            f"Usage: /settoken &lt;coin_type&gt;\n"
-            f"Example: /settoken 0x2::sui::SUI",
+            f"Usage: /token &lt;coin_type&gt;\n"
+            f"Example: /token 0x2::sui::SUI",
             parse_mode=ParseMode.HTML
         )
         return
@@ -1241,10 +1355,7 @@ async def settoken_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Airdrops tokens to top users from a /score leaderboard via SUI blockchain.
-
-    Must be used as a reply to a leaderboard message generated by /score.
-    """
+    """Airdrops tokens to the top eligible wallets from the latest leaderboard."""
     chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
     if chat_member.status not in ['administrator', 'creator']:
         await update.message.reply_text("❌ Only administrators can use this command.")
@@ -1252,13 +1363,12 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if len(context.args) < 2:
         await update.message.reply_text(
-            "Usage: Reply to a /score leaderboard message with:\n"
+            "Usage:\n"
             "/airdrop &lt;count&gt; &lt;amount&gt;\n\n"
             "Example:\n"
-            "1. Run /score 30 days\n"
-            "2. Broadcast the leaderboard to the group\n"
-            "3. Reply to that leaderboard message with /airdrop 10 1000000000\n\n"
-            "<i>Count = number of top leaderboard users to receive tokens.\n"
+            "1. Run /score 30 days or /publicscore 30 days\n"
+            "2. Run /airdrop 10 1000000000\n\n"
+            "<i>Count = number of top leaderboard wallets to receive tokens.\n"
             "Amount = token amount per user in smallest unit (e.g. 1000000000 MIST = 1 SUI).</i>",
             parse_mode=ParseMode.HTML
         )
@@ -1275,69 +1385,55 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Count and amount must be positive numbers.")
         return
 
-    # Must be a reply to a leaderboard message
-    if not update.message.reply_to_message:
-        await update.message.reply_text(
-            "❌ Please reply to a /score leaderboard message to use /airdrop.\n\n"
-            "1. Run /score (e.g. /score 30 days)\n"
-            "2. Broadcast the leaderboard to the group\n"
-            "3. Reply to that leaderboard message with /airdrop &lt;count&gt; &lt;amount&gt;",
-            parse_mode=ParseMode.HTML
-        )
-        return
-
-    replied_msg_id = update.message.reply_to_message.message_id
-    leaderboard_messages = context.chat_data.get('leaderboard_messages', {})
-    leaderboard = leaderboard_messages.get(replied_msg_id)
-
-    if not leaderboard:
-        await update.message.reply_text("❌ The replied message is not a recognized leaderboard. Please reply to a leaderboard broadcasted by /score.")
-        return
-
     if not os.environ.get("SUI_PRIVATE_KEY"):
         await update.message.reply_text("❌ SUI airdrop is not configured. The bot operator must set the SUI_PRIVATE_KEY environment variable.")
         return
 
     chat_id = update.effective_chat.id
     coin_type = db.get(_get_airdrop_token_key(chat_id), DEFAULT_SUI_COIN_TYPE)
-
-    # Take the top N users from the score-based leaderboard
-    # Leaderboard entries are tuples: (username, metrics_dict, message_count, user_id)
-    top_entries = leaderboard[:count]
-    if not top_entries:
-        await update.message.reply_text("❌ No eligible users found in the leaderboard.")
+    leaderboard_snapshot = get_latest_leaderboard(chat_id)
+    leaderboard = (leaderboard_snapshot or {}).get("leaderboard")
+    if not leaderboard:
+        await update.message.reply_text("❌ No saved leaderboard was found for this group. Run /score or /publicscore first.")
         return
 
+    recipients, skipped_missing_wallet, skipped_duplicate_wallet = await asyncio.to_thread(
+        resolve_wallet_recipients, chat_id, leaderboard, count
+    )
+    if not recipients:
+        await update.message.reply_text("❌ No eligible wallets were found in the saved leaderboard.")
+        return
+
+    period_label = ""
+    if leaderboard_snapshot.get("start_str") and leaderboard_snapshot.get("end_str"):
+        period_label = f"\nLeaderboard: {leaderboard_snapshot['start_str']} → {leaderboard_snapshot['end_str']}"
+
     await update.message.reply_text(
-        f"🪂 Starting airdrop of <code>{html.escape(coin_type)}</code> to the top {len(top_entries)} users from the leaderboard...",
+        f"🪂 Starting airdrop of <code>{html.escape(coin_type)}</code> to {len(recipients)} wallet(s)...{period_label}",
         parse_mode=ParseMode.HTML
     )
 
     results = []
     success_count = 0
-    skip_count = 0
     fail_count = 0
 
-    for username, _, msg_count, user_id_str in top_entries:
-        safe_username = html.escape(username)
-
-        # Look up wallet
-        wallet_data = await asyncio.to_thread(get_wallet, chat_id, int(user_id_str))
-        if not wallet_data or not wallet_data.get("wallet_address"):
-            results.append(f"⏭️ @{safe_username}: No wallet registered — skipped")
-            skip_count += 1
-            continue
-
-        wallet_address = wallet_data["wallet_address"]
+    for recipient in recipients:
+        safe_username = html.escape(recipient["username"])
+        wallet_address = recipient["wallet_address"]
 
         try:
             tx_result = await sui_transfer_token(wallet_address, amount, coin_type)
             tx_digest = tx_result.get("digest", "unknown")
-            results.append(f"✅ @{safe_username}: <code>{tx_digest}</code>")
+            results.append(f"✅ #{recipient['rank']} @{safe_username}: <code>{tx_digest}</code>")
             success_count += 1
         except Exception as e:
-            logging.error(f"Airdrop transfer failed for {username} ({wallet_address}): {e}")
-            results.append(f"❌ @{safe_username}: {html.escape(str(e)[:60])}")
+            logging.error(
+                "Airdrop transfer failed for %s (%s): %s",
+                recipient["username"],
+                wallet_address,
+                redact_sensitive_text(e),
+            )
+            results.append(f"❌ #{recipient['rank']} @{safe_username}: Transfer failed")
             fail_count += 1
 
     results_text = "\n".join(results)
@@ -1345,10 +1441,86 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🪂 <b>Airdrop Complete</b>\n\n"
         f"Token: <code>{html.escape(coin_type)}</code>\n"
         f"Amount per user: {amount}\n"
-        f"✅ Sent: {success_count} | ⏭️ Skipped (no wallet): {skip_count} | ❌ Failed: {fail_count}\n\n"
+        f"Selected wallets: {len(recipients)}/{count}\n"
+        f"✅ Sent: {success_count} | ⏭️ Missing wallet skipped: {len(skipped_missing_wallet)} | "
+        f"🔁 Duplicate wallet skipped: {len(skipped_duplicate_wallet)} | ❌ Failed: {fail_count}\n\n"
         f"<b>Details:</b>\n{results_text}"
     )
     await update.message.reply_text(summary + FOOTER_HTML, parse_mode=ParseMode.HTML)
+
+
+async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Airdrops tokens to a weighted-random wallet from the top 20 contributors."""
+    chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
+    if chat_member.status not in ['administrator', 'creator']:
+        await update.message.reply_text("❌ Only administrators can use this command.")
+        return
+
+    if len(context.args) != 1:
+        await update.message.reply_text(
+            "Usage:\n/raffle &lt;amount&gt;\n\nExample:\n/raffle 1000000000",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    try:
+        amount = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Amount must be a whole number.")
+        return
+
+    if amount < 1:
+        await update.message.reply_text("❌ Amount must be a positive number.")
+        return
+
+    if not os.environ.get("SUI_PRIVATE_KEY"):
+        await update.message.reply_text("❌ SUI airdrop is not configured. The bot operator must set the SUI_PRIVATE_KEY environment variable.")
+        return
+
+    chat_id = update.effective_chat.id
+    leaderboard_snapshot = get_latest_leaderboard(chat_id)
+    leaderboard = (leaderboard_snapshot or {}).get("leaderboard")
+    if not leaderboard:
+        await update.message.reply_text("❌ No saved leaderboard was found for this group. Run /score or /publicscore first.")
+        return
+
+    eligible_entries, skipped_missing_wallet, skipped_duplicate_wallet = await asyncio.to_thread(
+        resolve_wallet_recipients, chat_id, leaderboard, 20, 20
+    )
+    if not eligible_entries:
+        await update.message.reply_text("❌ None of the top 20 contributors currently have an eligible wallet.")
+        return
+
+    winner, winner_weight = choose_weighted_raffle_winner(eligible_entries)
+    coin_type = db.get(_get_airdrop_token_key(chat_id), DEFAULT_SUI_COIN_TYPE)
+
+    try:
+        tx_result = await sui_transfer_token(winner["wallet_address"], amount, coin_type)
+        tx_digest = tx_result.get("digest", "unknown")
+    except Exception as e:
+        logging.error(
+            "Raffle transfer failed for %s (%s): %s",
+            winner["username"],
+            winner["wallet_address"],
+            redact_sensitive_text(e),
+        )
+        await update.message.reply_text("❌ Raffle transfer failed. Please verify wallet balances and try again.")
+        return
+
+    message = (
+        f"🎟️ <b>Raffle Complete</b>\n\n"
+        f"Winner: #{winner['rank']} @{html.escape(winner['username'])}\n"
+        f"Wallet: <code>{html.escape(winner['wallet_address'])}</code>\n"
+        f"Token: <code>{html.escape(coin_type)}</code>\n"
+        f"Amount: {amount}\n"
+        f"Eligible wallets considered: {len(eligible_entries)} of top 20 contributors\n"
+        f"Skipped: {len(skipped_missing_wallet)} without wallet, {len(skipped_duplicate_wallet)} duplicate wallet entries\n"
+        f"Weight applied: {winner_weight:.2f}\n"
+        f"Transaction: <code>{html.escape(tx_digest)}</code>"
+    )
+    if leaderboard_snapshot.get("start_str") and leaderboard_snapshot.get("end_str"):
+        message += f"\nLeaderboard: {leaderboard_snapshot['start_str']} → {leaderboard_snapshot['end_str']}"
+    await update.message.reply_text(message + FOOTER_HTML, parse_mode=ParseMode.HTML)
 
 
 async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1408,8 +1580,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/copypasta - Create a copypasta based on your message history.\n\n"
         "<b>💰 Crypto</b>\n"
         "/price &lt;symbol&gt; - Look up a cryptocurrency price.\n"
-        "/airdrop &lt;count&gt; &lt;amount&gt; - Airdrop tokens to top scorers (admin, reply to /score).\n"
-        "/settoken &lt;coin_type&gt; - Set the airdrop token for this group (admin).\n\n"
+        "/token &lt;coin_type&gt; - Set the airdrop token for this group (admin).\n"
+        "/airdrop &lt;count&gt; &lt;amount&gt; - Airdrop tokens to the top eligible leaderboard wallets (admin).\n"
+        "/raffle &lt;amount&gt; - Raffle tokens to a weighted-random wallet from the top 20 contributors (admin).\n\n"
         "<b>🗓️ Group Management</b>\n"
         "/calendar - Manage the group's event calendar (admin).\n"
         "/events - List all upcoming events.\n"
@@ -1777,7 +1950,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("❌ Could not generate CSV data.", show_alert=True)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logging.error("Exception while handling an update:", exc_info=context.error)
+    logging.error("Exception while handling an update: %s", redact_sensitive_text(context.error))
 
 async def setup_bot_commands(application):
     commands = [
@@ -1790,8 +1963,9 @@ async def setup_bot_commands(application):
         BotCommand("vibecheck", "AI sentiment: /vibecheck <#> [topic]"),
         BotCommand("copypasta", "Generate a copypasta of your history"),
         BotCommand("price", "Crypto price: /price <symbol>"),
-        BotCommand("airdrop", "Airdrop tokens: reply to /score with /airdrop <count> <amount>"),
-        BotCommand("settoken", "Set airdrop token (admin)"),
+        BotCommand("airdrop", "Airdrop tokens to top leaderboard wallets"),
+        BotCommand("token", "Set airdrop token (admin)"),
+        BotCommand("raffle", "Weighted raffle across top 20 contributors"),
         BotCommand("mybadges", "View your earned badges"),
         BotCommand("allbadges", "See all available badges"),
         BotCommand("mystats", "View your personal stats"),
@@ -1851,7 +2025,8 @@ def main():
     application.add_handler(CommandHandler("copypasta", copypasta_command))
     application.add_handler(CommandHandler("price", price_command))
     application.add_handler(CommandHandler("airdrop", airdrop_command))
-    application.add_handler(CommandHandler("settoken", settoken_command))
+    application.add_handler(CommandHandler(["token", "settoken"], settoken_command))
+    application.add_handler(CommandHandler("raffle", raffle_command))
     application.add_handler(CommandHandler("setwelcome", setwelcome_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("mybadges", mybadges_command))

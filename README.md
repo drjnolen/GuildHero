@@ -11,8 +11,9 @@ An all-in-one Telegram community management and engagement bot built for crypto-
 
 ### 💰 Crypto Tools
 - **/price** `<symbol>` — Live cryptocurrency price lookup with 24h change, market cap, and volume
-- **/airdrop** `<count>` `<amount>` — Airdrop SUI tokens to top scorers by replying to a `/score` leaderboard (admin only)
-- **/settoken** `<coin_type>` — Set the airdrop token type for the group (admin only, default: `0x2::sui::SUI`)
+- **/token** `<coin_type>` — Set the airdrop token type for the group (admin only, default: `0x2::sui::SUI`)
+- **/airdrop** `<count>` `<amount>` — Airdrop tokens to the top eligible leaderboard wallets from the latest saved leaderboard (admin only)
+- **/raffle** `<amount>` — Airdrop tokens to a weighted-random wallet from the top 20 contributors on the latest saved leaderboard (admin only)
 
 ### 📊 Leaderboards & Stats
 - **/score** — Detailed AI-integrated contribution leaderboard with quality, tone, helpfulness, and humor scoring (admin only)
@@ -96,15 +97,17 @@ To enable airdrops:
 1. **Generate an Ed25519 keypair** — you can use the [SUI CLI](https://docs.sui.io/build/install) (`sui keytool generate ed25519`) or any Ed25519 key generator. You need the raw 32-byte private key as 64 hex characters.
 2. **Fund the wallet** — send SUI (or your custom token) to the bot's derived address. The bot derives its address automatically from the private key on each transfer.
 3. **Set `SUI_PRIVATE_KEY`** — add the hex-encoded private key to your environment variables.
-4. **(Optional) Set a custom token** — use `/settoken <coin_type>` in your group to airdrop a token other than native SUI.
+4. **(Optional) Set a custom token** — use `/token <coin_type>` in your group to airdrop a token other than native SUI.
 
 **Airdrop workflow:**
 ```
 1. Admin runs:  /score 30 days
-2. Admin clicks: "📢 Broadcast in Group"
-3. Admin replies to the leaderboard message with:  /airdrop 10 1000000000
-   → Sends 1 SUI (1,000,000,000 MIST) to each of the top 10 users who have registered wallets.
-   → Users without wallets are gracefully skipped.
+2. Admin runs:  /token 0x2::sui::SUI   (optional)
+3. Admin runs:  /airdrop 10 1000000000
+   → Sends 1 SUI (1,000,000,000 MIST) to each of the top 10 eligible wallets on the saved leaderboard.
+   → Users without wallets are skipped and the bot continues down the leaderboard until it finds the next wallet.
+4. Admin can also run: /raffle 1000000000
+   → Randomly selects one wallet from the top 20 contributors with slight weighting toward higher ranks.
 ```
 
 ## Architecture
