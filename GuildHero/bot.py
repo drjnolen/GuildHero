@@ -12,6 +12,7 @@ import csv
 import signal
 import sys
 import html
+import traceback
 from collections import defaultdict
 import pytz
 import httpx
@@ -76,6 +77,11 @@ def mask_wallet_address(wallet_address: str) -> str:
     if len(wallet_address) <= 12:
         return wallet_address
     return f"{wallet_address[:6]}…{wallet_address[-4:]}"
+
+
+def format_exception_for_log(exc: Exception) -> str:
+    """Format and redact an exception traceback for logs."""
+    return redact_sensitive_text("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip())
 
 # Initialize OpenAI client once
 openai_client = None
@@ -498,7 +504,9 @@ def choose_weighted_raffle_winner(entries):
 
     def get_raffle_weight(rank):
         """Keep every eligible rank winnable while giving higher ranks a slight edge."""
-        pool_bonus = max(RAFFLE_POOL_SIZE + 1 - rank, 0)
+        if rank > RAFFLE_POOL_SIZE:
+            return 1.0
+        pool_bonus = RAFFLE_POOL_SIZE + 1 - rank
         return 1.0 + (pool_bonus / RAFFLE_POOL_SIZE) * RAFFLE_WEIGHT_FACTOR
 
     weights = [get_raffle_weight(entry["rank"]) for entry in entries]
@@ -1449,7 +1457,7 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Airdrop transfer failed for %s (%s): %s",
                 recipient["username"],
                 mask_wallet_address(wallet_address),
-                redact_sensitive_text(e),
+                format_exception_for_log(e),
             )
             results.append(f"❌ #{recipient['rank']} @{safe_username}: Transfer failed")
             fail_count += 1
@@ -1520,7 +1528,7 @@ async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Raffle transfer failed for %s (%s): %s",
             winner["username"],
             mask_wallet_address(winner["wallet_address"]),
-            redact_sensitive_text(e),
+            format_exception_for_log(e),
         )
         await update.message.reply_text("❌ Raffle transfer failed. Please verify wallet balances and try again.")
         return
@@ -1966,7 +1974,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("❌ Could not generate CSV data.", show_alert=True)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logging.error("Exception while handling an update: %s", redact_sensitive_text(context.error))
+    logging.error("Exception while handling an update: %s", format_exception_for_log(context.error))
 
 async def setup_bot_commands(application):
     commands = [
