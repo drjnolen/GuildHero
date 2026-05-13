@@ -118,6 +118,7 @@ COINGECKO_API_URL = "https://api.coingecko.com/api/v3"
 SUI_RPC_URL = os.environ.get("SUI_RPC_URL", "https://fullnode.mainnet.sui.io:443")
 DEFAULT_SUI_COIN_TYPE = "0x2::sui::SUI"
 SUI_GAS_BUDGET = "50000000"  # 0.05 SUI
+RAFFLE_POOL_SIZE = 20
 
 
 # --- Helper Functions ---
@@ -484,7 +485,10 @@ def choose_weighted_raffle_winner(entries):
     if not entries:
         return None, None
 
-    weights = [1.0 + ((21 - min(entry["rank"], 20)) / 20.0) * 0.5 for entry in entries]
+    weights = []
+    for entry in entries:
+        pool_bonus = max(RAFFLE_POOL_SIZE + 1 - max(1, entry["rank"]), 0)
+        weights.append(1.0 + (pool_bonus / RAFFLE_POOL_SIZE) * 0.5)
     total_weight = sum(weights)
     threshold = random.SystemRandom().uniform(0, total_weight)
     cumulative_weight = 0.0
@@ -1047,7 +1051,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/copypasta - Create a copypasta based on your message history.\n\n"
         "<b>💰 Crypto</b>\n"
         "/price &lt;symbol&gt; - Look up a cryptocurrency price.\n"
-        "/token &lt;coin_type&gt; - Set the airdrop token for this group (admin).\n"
+        "/token &lt;coin_type&gt; - Set the airdrop token for this group (admin, legacy /settoken also works).\n"
         "/airdrop &lt;count&gt; &lt;amount&gt; - Airdrop tokens to the top eligible leaderboard wallets (admin).\n"
         "/raffle &lt;amount&gt; - Raffle tokens to a weighted-random wallet from the top 20 contributors (admin).\n\n"
         "<b>🗓️ Group Management</b>\n"
@@ -1341,7 +1345,8 @@ async def settoken_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"Current airdrop token: <code>{html.escape(current_token)}</code>\n\n"
             f"Usage: /token &lt;coin_type&gt;\n"
-            f"Example: /token 0x2::sui::SUI",
+            f"Example: /token 0x2::sui::SUI\n"
+            f"<i>Legacy alias: /settoken still works.</i>",
             parse_mode=ParseMode.HTML
         )
         return
@@ -1450,7 +1455,7 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Airdrops tokens to a weighted-random wallet from the top 20 contributors."""
+    """Airdrops tokens to a weighted-random wallet from the top contributors."""
     chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
     if chat_member.status not in ['administrator', 'creator']:
         await update.message.reply_text("❌ Only administrators can use this command.")
@@ -1485,10 +1490,10 @@ async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     eligible_entries, skipped_missing_wallet, skipped_duplicate_wallet = await asyncio.to_thread(
-        resolve_wallet_recipients, chat_id, leaderboard, 20, 20
+        resolve_wallet_recipients, chat_id, leaderboard, RAFFLE_POOL_SIZE, RAFFLE_POOL_SIZE
     )
     if not eligible_entries:
-        await update.message.reply_text("❌ None of the top 20 contributors currently have an eligible wallet.")
+        await update.message.reply_text(f"❌ None of the top {RAFFLE_POOL_SIZE} contributors currently have an eligible wallet.")
         return
 
     winner, winner_weight = choose_weighted_raffle_winner(eligible_entries)
@@ -1513,7 +1518,7 @@ async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Wallet: <code>{html.escape(winner['wallet_address'])}</code>\n"
         f"Token: <code>{html.escape(coin_type)}</code>\n"
         f"Amount: {amount}\n"
-        f"Eligible wallets considered: {len(eligible_entries)} of top 20 contributors\n"
+        f"Eligible wallets considered: {len(eligible_entries)} of top {RAFFLE_POOL_SIZE} contributors\n"
         f"Skipped: {len(skipped_missing_wallet)} without wallet, {len(skipped_duplicate_wallet)} duplicate wallet entries\n"
         f"Weight applied: {winner_weight:.2f}\n"
         f"Transaction: <code>{html.escape(tx_digest)}</code>"
@@ -1580,7 +1585,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/copypasta - Create a copypasta based on your message history.\n\n"
         "<b>💰 Crypto</b>\n"
         "/price &lt;symbol&gt; - Look up a cryptocurrency price.\n"
-        "/token &lt;coin_type&gt; - Set the airdrop token for this group (admin).\n"
+        "/token &lt;coin_type&gt; - Set the airdrop token for this group (admin, legacy /settoken also works).\n"
         "/airdrop &lt;count&gt; &lt;amount&gt; - Airdrop tokens to the top eligible leaderboard wallets (admin).\n"
         "/raffle &lt;amount&gt; - Raffle tokens to a weighted-random wallet from the top 20 contributors (admin).\n\n"
         "<b>🗓️ Group Management</b>\n"

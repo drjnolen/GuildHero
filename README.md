@@ -11,7 +11,7 @@ An all-in-one Telegram community management and engagement bot built for crypto-
 
 ### 💰 Crypto Tools
 - **/price** `<symbol>` — Live cryptocurrency price lookup with 24h change, market cap, and volume
-- **/token** `<coin_type>` — Set the airdrop token type for the group (admin only, default: `0x2::sui::SUI`)
+- **/token** `<coin_type>` — Set the airdrop token type for the group (admin only, default: `0x2::sui::SUI`; legacy `/settoken` still works)
 - **/airdrop** `<count>` `<amount>` — Airdrop tokens to the top eligible leaderboard wallets from the latest saved leaderboard (admin only)
 - **/raffle** `<amount>` — Airdrop tokens to a weighted-random wallet from the top 20 contributors on the latest saved leaderboard (admin only)
 
