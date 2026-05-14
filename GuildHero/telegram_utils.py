@@ -33,7 +33,7 @@ HELP_TEXT = (
 
 _ALLOWED_TAGS = {"b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "code", "pre", "a", "blockquote"}
 _ALLOWED_SCHEMES = {"http", "https", "tg", "mailto"}
-_SUI_ADDRESS_PATTERN = re.compile(r"^(?:0x)?[0-9a-fA-F]{64}$")
+_SUI_ADDRESS_REGEX = re.compile(r"^(?:0x)?[0-9a-fA-F]{64}$")
 
 
 class TelegramHTMLSanitizer(HTMLParser):
@@ -105,6 +105,6 @@ async def require_admin(update: Update, context) -> bool:
 def normalize_wallet_address(wallet_address: str) -> str | None:
     """Validate a SUI wallet address and normalize it to lowercase 0x-prefixed form."""
     candidate = (wallet_address or "").strip()
-    if not _SUI_ADDRESS_PATTERN.fullmatch(candidate):
+    if not _SUI_ADDRESS_REGEX.fullmatch(candidate):
         return None
     return f"0x{candidate.removeprefix('0x').lower()}"

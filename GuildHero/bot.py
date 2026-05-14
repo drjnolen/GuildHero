@@ -1243,7 +1243,7 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     skip_count = 0
     fail_count = 0
 
-    for username, _, _, user_id_str in top_entries:
+    for username, _metrics, _message_count, user_id_str in top_entries:
         safe_username = html.escape(username)
         wallet_data = await asyncio.to_thread(get_wallet, chat_id, int(user_id_str))
         if not wallet_data or not wallet_data.get('wallet_address'):
