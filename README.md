@@ -77,7 +77,7 @@ pip install -r requirements.txt
 export DATABASE_URL="postgresql://user:password@localhost:5432/guildhero"
 export TELEGRAM_BOT_TOKEN="your-token"
 export OPENAI_API_KEY="your-key"
-python GuildHero/bot.py
+python main.py
 ```
 
 ### Deploying on Railway
@@ -85,7 +85,7 @@ python GuildHero/bot.py
 1. **Create a new project** on [Railway](https://railway.app/) and connect this repository.
 2. **Add a PostgreSQL plugin** — Railway will automatically set the `DATABASE_URL` variable. The bot creates its database table on first start.
 3. **Set environment variables** — In the Railway service settings, add `TELEGRAM_BOT_TOKEN` and `OPENAI_API_KEY` (and optionally `SUI_PRIVATE_KEY`).
-4. **Deploy** — Railway will build and run the bot using the included `Dockerfile` and `railway.toml`.
+4. **Deploy** — Railway can start the bot through the repository root `main.py`, and the included `Dockerfile` uses the same entrypoint for container-based deploys.
 
 ### SUI Airdrop Setup
 
