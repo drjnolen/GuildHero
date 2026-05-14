@@ -248,7 +248,7 @@ def _get_recent_user_messages(chat_id, user_id, limit):
 
 
 def _new_flow_token() -> str:
-    return uuid.uuid4().hex[:8]
+    return uuid.uuid4().hex[:16]
 
 
 def _get_score_requests(context):
@@ -1502,7 +1502,7 @@ async def receive_wallet_address(update: Update, context: ContextTypes.DEFAULT_T
     logging.info(f'Received wallet address from user {user_id}: {submitted_wallet[:10]}...')
 
     if not normalized_wallet:
-        await update.message.reply_text('❌ Please send a valid SUI wallet address (64 hex characters after the optional 0x prefix) or type /cancel.')
+        await update.message.reply_text('❌ Please send a valid SUI wallet address (64 hexadecimal characters, optionally prefixed with 0x) or type /cancel.')
         return AWAITING_WALLET
 
     target_chat_id = _get_wallet_flows(context).get(user_id)

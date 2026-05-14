@@ -25,6 +25,7 @@ class TelegramUtilsTests(unittest.TestCase):
         text = '<div>Hello</div><script>alert(1)</script><a href="javascript:alert(1)">bad</a><a href="https://example.com">ok</a>'
         result = sanitize_html_for_telegram(text)
         self.assertEqual(result, 'Helloalert(1)bad<a href="https://example.com">ok</a>')
+        self.assertNotIn('<script>', result)
         self.assertNotIn('javascript:', result)
 
 
