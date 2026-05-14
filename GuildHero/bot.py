@@ -560,7 +560,7 @@ async def fetch_crypto_price(symbol: str) -> dict | None:
             candidates = []
             seen_coin_ids = set()
 
-            def add_unique_candidate(coin_id: str | None, search_coin: dict | None = None, search_index: int | None = None):
+            def _add_unique_candidate(coin_id: str | None, search_coin: dict | None = None, search_index: int | None = None):
                 if not coin_id or coin_id in seen_coin_ids:
                     return
                 seen_coin_ids.add(coin_id)
@@ -570,11 +570,11 @@ async def fetch_crypto_price(symbol: str) -> dict | None:
                     "search_index": search_index,
                 })
 
-            add_unique_candidate(preferred_coin_id)
+            _add_unique_candidate(preferred_coin_id)
             for index, coin in enumerate(coins[:10]):
-                add_unique_candidate(coin.get("id"), coin, index)
+                _add_unique_candidate(coin.get("id"), coin, index)
 
-            async def load_coin_details(candidate: dict) -> dict:
+            async def _load_coin_details(candidate: dict) -> dict:
                 try:
                     details_resp = await client.get(
                         f"{COINGECKO_API_URL}/coins/{candidate['id']}",
@@ -593,12 +593,12 @@ async def fetch_crypto_price(symbol: str) -> dict | None:
                     candidate["details"] = {}
                 return candidate
 
-            candidates = await asyncio.gather(*(load_coin_details(candidate) for candidate in candidates))
+            candidates = await asyncio.gather(*(_load_coin_details(candidate) for candidate in candidates))
 
-            def normalize_coin_text(value: str | None) -> str:
+            def _normalize_coin_text(value: str | None) -> str:
                 return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
 
-            def is_sui_coin(details: dict) -> bool:
+            def _is_sui_coin(details: dict) -> bool:
                 if not details:
                     return False
                 asset_platform_id = (details.get("asset_platform_id") or "").lower()
@@ -606,7 +606,12 @@ async def fetch_crypto_price(symbol: str) -> dict | None:
                 platform_names = {str(name).lower() for name in platforms.keys()}
                 return asset_platform_id == "sui" or "sui" in platform_names
 
-            def candidate_sort_key(candidate: dict) -> tuple:
+            def _calculate_market_cap_score(market_cap_rank: int | None) -> int:
+                if not isinstance(market_cap_rank, int) or market_cap_rank <= 0:
+                    return 0
+                return max(0, COINGECKO_SCORE_MARKET_CAP_BONUS - min(market_cap_rank, COINGECKO_SCORE_MARKET_CAP_BONUS))
+
+            def _candidate_sort_key(candidate: dict) -> tuple:
                 details = candidate.get("details") or {}
                 search_coin = candidate.get("search_coin") or {}
                 candidate_id = candidate["id"]
@@ -618,24 +623,23 @@ async def fetch_crypto_price(symbol: str) -> dict | None:
                 score = 0
                 if preferred_coin_id and candidate_id == preferred_coin_id:
                     score += COINGECKO_SCORE_PREFERRED_ALIAS
-                if normalize_coin_text(coin_symbol) == normalized_query:
+                if _normalize_coin_text(coin_symbol) == normalized_query:
                     score += COINGECKO_SCORE_EXACT_SYMBOL_MATCH
-                if normalize_coin_text(coin_name) == normalized_query:
+                if _normalize_coin_text(coin_name) == normalized_query:
                     score += COINGECKO_SCORE_EXACT_NAME_MATCH
-                if normalize_coin_text(candidate_id) == normalized_query:
+                if _normalize_coin_text(candidate_id) == normalized_query:
                     score += COINGECKO_SCORE_EXACT_ID_MATCH
-                if is_sui_coin(details):
+                if _is_sui_coin(details):
                     score += COINGECKO_SCORE_SUI_PLATFORM_MATCH
-                if normalized_query and normalized_query in normalize_coin_text(coin_symbol):
+                if normalized_query and normalized_query in _normalize_coin_text(coin_symbol):
                     score += COINGECKO_SCORE_PARTIAL_SYMBOL_MATCH
-                if normalized_query and normalized_query in normalize_coin_text(coin_name):
+                if normalized_query and normalized_query in _normalize_coin_text(coin_name):
                     score += COINGECKO_SCORE_PARTIAL_NAME_MATCH
-                if normalized_query and normalized_query in normalize_coin_text(candidate_id):
+                if normalized_query and normalized_query in _normalize_coin_text(candidate_id):
                     score += COINGECKO_SCORE_PARTIAL_ID_MATCH
                 if search_index is not None:
                     score += max(0, COINGECKO_SCORE_SEARCH_ORDER_BONUS - search_index)
-                if isinstance(market_cap_rank, int) and market_cap_rank > 0:
-                    score += max(0, COINGECKO_SCORE_MARKET_CAP_BONUS - min(market_cap_rank, COINGECKO_SCORE_MARKET_CAP_BONUS))
+                score += _calculate_market_cap_score(market_cap_rank)
 
                 return (
                     score,
@@ -644,7 +648,7 @@ async def fetch_crypto_price(symbol: str) -> dict | None:
                     -(COINGECKO_SCORE_SEARCH_ORDER_BONUS - search_index if search_index is not None else 0),
                 )
 
-            best_candidate = max(candidates, key=candidate_sort_key, default=None)
+            best_candidate = max(candidates, key=_candidate_sort_key, default=None)
             if not best_candidate:
                 return None
 
