@@ -103,6 +103,7 @@ async def require_admin(update: Update, context) -> bool:
 
 
 def normalize_wallet_address(wallet_address: str) -> str | None:
+    """Validate a SUI wallet address and normalize it to lowercase 0x-prefixed form."""
     candidate = (wallet_address or "").strip()
     if not _SUI_ADDRESS_PATTERN.fullmatch(candidate):
         return None

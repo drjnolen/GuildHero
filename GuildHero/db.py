@@ -145,6 +145,7 @@ class PostgresKV:
             return cur.fetchone() is not None
 
     def add_message(self, chat_id: int, message_id: int, user_id: int, username: str | None, text: str, sent_at: datetime, is_reply: bool):
+        """Persist one chat message, auto-enrolling the chat and normalizing naive datetimes to UTC."""
         self.enroll_chat(chat_id)
         if sent_at.tzinfo is None:
             sent_at = sent_at.replace(tzinfo=timezone.utc)

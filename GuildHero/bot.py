@@ -595,7 +595,7 @@ async def fetch_crypto_price(symbol: str) -> dict | None:
             coin_symbol = market.get("symbol") or ""
             coin_name = market.get("name") or ""
             market_cap_rank = market.get("market_cap_rank")
-            _, search_index = search_coin_map.get(coin_id, ({}, None))
+            search_coin, search_index = search_coin_map.get(coin_id, ({}, None))
 
             score = 0
             if preferred_coin_id and coin_id == preferred_coin_id:
@@ -1501,7 +1501,7 @@ async def receive_wallet_address(update: Update, context: ContextTypes.DEFAULT_T
     logging.info(f'Received wallet address from user {user_id}: {submitted_wallet[:10]}...')
 
     if not normalized_wallet:
-        await update.message.reply_text('❌ Please send a valid SUI wallet address (64 hex characters, with or without 0x) or type /cancel.')
+        await update.message.reply_text('❌ Please send a valid SUI wallet address (64 hex characters after the optional 0x prefix) or type /cancel.')
         return AWAITING_WALLET
 
     target_chat_id = _get_wallet_flows(context).get(user_id)
