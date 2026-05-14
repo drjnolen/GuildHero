@@ -81,6 +81,17 @@ BADGES = {
 
 # --- CoinGecko API ---
 COINGECKO_API_URL = "https://api.coingecko.com/api/v3"
+COINGECKO_CANDIDATE_FALLBACK_RANK = 10_000
+COINGECKO_SCORE_PREFERRED_ALIAS = 1000
+COINGECKO_SCORE_EXACT_SYMBOL_MATCH = 500
+COINGECKO_SCORE_EXACT_NAME_MATCH = 450
+COINGECKO_SCORE_EXACT_ID_MATCH = 400
+COINGECKO_SCORE_SUI_PLATFORM_MATCH = 300
+COINGECKO_SCORE_PARTIAL_SYMBOL_MATCH = 100
+COINGECKO_SCORE_PARTIAL_NAME_MATCH = 75
+COINGECKO_SCORE_PARTIAL_ID_MATCH = 50
+COINGECKO_SCORE_SEARCH_ORDER_BONUS = 20
+COINGECKO_SCORE_MARKET_CAP_BONUS = 125
 SUI_PRICE_ALIASES = {
     "afsui": "aftermath-staked-sui",
     "blub": "blub",
@@ -549,7 +560,7 @@ async def fetch_crypto_price(symbol: str) -> dict | None:
             candidates = []
             seen_coin_ids = set()
 
-            def add_candidate(coin_id: str | None, search_coin: dict | None = None, search_index: int | None = None):
+            def add_unique_candidate(coin_id: str | None, search_coin: dict | None = None, search_index: int | None = None):
                 if not coin_id or coin_id in seen_coin_ids:
                     return
                 seen_coin_ids.add(coin_id)
@@ -559,9 +570,9 @@ async def fetch_crypto_price(symbol: str) -> dict | None:
                     "search_index": search_index,
                 })
 
-            add_candidate(preferred_coin_id)
+            add_unique_candidate(preferred_coin_id)
             for index, coin in enumerate(coins[:10]):
-                add_candidate(coin.get("id"), coin, index)
+                add_unique_candidate(coin.get("id"), coin, index)
 
             async def load_coin_details(candidate: dict) -> dict:
                 try:
@@ -606,31 +617,31 @@ async def fetch_crypto_price(symbol: str) -> dict | None:
 
                 score = 0
                 if preferred_coin_id and candidate_id == preferred_coin_id:
-                    score += 1000
+                    score += COINGECKO_SCORE_PREFERRED_ALIAS
                 if normalize_coin_text(coin_symbol) == normalized_query:
-                    score += 500
+                    score += COINGECKO_SCORE_EXACT_SYMBOL_MATCH
                 if normalize_coin_text(coin_name) == normalized_query:
-                    score += 450
+                    score += COINGECKO_SCORE_EXACT_NAME_MATCH
                 if normalize_coin_text(candidate_id) == normalized_query:
-                    score += 400
+                    score += COINGECKO_SCORE_EXACT_ID_MATCH
                 if is_sui_coin(details):
-                    score += 300
+                    score += COINGECKO_SCORE_SUI_PLATFORM_MATCH
                 if normalized_query and normalized_query in normalize_coin_text(coin_symbol):
-                    score += 100
+                    score += COINGECKO_SCORE_PARTIAL_SYMBOL_MATCH
                 if normalized_query and normalized_query in normalize_coin_text(coin_name):
-                    score += 75
+                    score += COINGECKO_SCORE_PARTIAL_NAME_MATCH
                 if normalized_query and normalized_query in normalize_coin_text(candidate_id):
-                    score += 50
+                    score += COINGECKO_SCORE_PARTIAL_ID_MATCH
                 if search_index is not None:
-                    score += max(0, 20 - search_index)
+                    score += max(0, COINGECKO_SCORE_SEARCH_ORDER_BONUS - search_index)
                 if isinstance(market_cap_rank, int) and market_cap_rank > 0:
-                    score += max(0, 125 - min(market_cap_rank, 125))
+                    score += max(0, COINGECKO_SCORE_MARKET_CAP_BONUS - min(market_cap_rank, COINGECKO_SCORE_MARKET_CAP_BONUS))
 
                 return (
                     score,
                     isinstance(market_cap_rank, int),
-                    -(market_cap_rank or 10_000),
-                    -(20 - search_index if search_index is not None else 0),
+                    -(market_cap_rank or COINGECKO_CANDIDATE_FALLBACK_RANK),
+                    -(COINGECKO_SCORE_SEARCH_ORDER_BONUS - search_index if search_index is not None else 0),
                 )
 
             best_candidate = max(candidates, key=candidate_sort_key, default=None)
