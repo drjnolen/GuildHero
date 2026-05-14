@@ -7,6 +7,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
+COPY main.py .
 COPY GuildHero/ ./GuildHero/
 
-CMD ["python", "GuildHero/bot.py"]
+CMD ["python", "main.py"]
