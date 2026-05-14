@@ -657,6 +657,7 @@ async def fetch_crypto_price(symbol: str) -> dict | None:
             }
     except Exception as e:
         logging.error(f"Error fetching price for {symbol}: {e}")
+        return None
 
     if result is not None:
         _price_cache[cache_key] = (result, time.monotonic())
