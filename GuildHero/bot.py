@@ -6,17 +6,18 @@ import datetime
 import calendar
 import asyncio
 import logging
-import json
 import io
 import csv
 import signal
 import sys
 import html
 import time
+import uuid
 from collections import defaultdict
 import pytz
-import httpx
+from ai_services import analyze_user_messages, summarize_chat_history, get_best_of_messages, get_vibe_check, generate_copypasta
 from db import db
+from http_clients import close_shared_async_client, get_shared_async_client
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -29,33 +30,13 @@ from telegram.ext import (
     ConversationHandler,
 )
 from telegram.request import HTTPXRequest
-from openai import OpenAI
+from telegram_utils import HELP_TEXT, normalize_wallet_address, require_admin, sanitize_html_for_telegram, user_is_admin
 
 # Configure logging for debugging.
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-
-# Initialize OpenAI client once
-openai_client = None
-def get_openai_client():
-    """Returns a singleton OpenAI client instance."""
-    global openai_client
-    if openai_client is None:
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key:
-            raise ValueError("OPENAI_API_KEY environment variable not set")
-        openai_client = OpenAI(api_key=api_key)
-    return openai_client
-
-# LRU cache for user analysis to avoid re-analyzing same content with bounded size
-from functools import lru_cache
-@lru_cache(maxsize=128)
-def _analysis_cache_key(username: str, message_count: int, messages_text: str) -> str:
-    """Generate cache key for analysis (using LRU cache with max 128 entries)."""
-    import hashlib
-    return hashlib.md5(f"{username}:{message_count}:{messages_text}".encode()).hexdigest()
 
 # Conversation states
 SELECTING_ACTION, AWAITING_EVENT_TEXT, AWAITING_WALLET = range(3)
@@ -136,25 +117,6 @@ def escape_markdown(text: str) -> str:
     """Escapes special characters for Telegram's MarkdownV2 parse mode."""
     escape_chars = r'_*[]()~`>#+-=|{}.!'
     return ''.join(f'\\{char}' if char in escape_chars else char for char in text)
-
-def sanitize_html_for_telegram(text: str) -> str:
-    """Sanitizes HTML content to only include tags supported by Telegram."""
-    # Remove unsupported HTML tags like <p>, <div>, etc. but keep their content
-    # List of supported Telegram HTML tags: b, strong, i, em, u, ins, s, strike, del, code, pre, a
-    unsupported_tags = ['p', 'div', 'span', 'br', 'hr', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']
-
-    for tag in unsupported_tags:
-        # Remove opening and closing tags but keep content
-        text = re.sub(f'<{tag}[^>]*>', '', text, flags=re.IGNORECASE)
-        text = re.sub(f'</{tag}>', '', text, flags=re.IGNORECASE)
-
-    # Replace <br> tags with newlines
-    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
-
-    # Clean up multiple consecutive newlines
-    text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
-
-    return text.strip()
 
 def get_stable_proportional_sample(messages, max_messages):
     """
@@ -259,6 +221,55 @@ def _get_airdrop_token_key(chat_id):
     """Returns the database key for the group's airdrop token type."""
     return f"airdrop_token:{chat_id}"
 
+
+def _track_chat(chat_id):
+    db.enroll_chat(int(chat_id))
+
+
+def _ensure_messages_migrated(chat_id):
+    chat_id_int = int(chat_id)
+    if db.has_messages(chat_id_int):
+        db.enroll_chat(chat_id_int)
+        return
+    legacy_messages = db.get(_get_messages_key(chat_id_int), [])
+    if legacy_messages:
+        db.migrate_legacy_messages(chat_id_int, legacy_messages)
+    db.enroll_chat(chat_id_int)
+
+
+def _get_recent_messages(chat_id, limit):
+    _ensure_messages_migrated(chat_id)
+    return db.get_recent_messages(int(chat_id), int(limit))
+
+
+def _get_recent_user_messages(chat_id, user_id, limit):
+    _ensure_messages_migrated(chat_id)
+    return db.get_recent_user_messages(int(chat_id), int(user_id), int(limit))
+
+
+def _new_flow_token() -> str:
+    return uuid.uuid4().hex[:8]
+
+
+def _get_score_requests(context):
+    return context.application.bot_data.setdefault('score_requests', {})
+
+
+def _get_score_results(context):
+    return context.application.bot_data.setdefault('score_results', {})
+
+
+def _get_calendar_sessions(context):
+    return context.application.bot_data.setdefault('calendar_sessions', {})
+
+
+def _get_wallet_flows(context):
+    return context.application.bot_data.setdefault('wallet_flows', {})
+
+
+def _get_leaderboard_messages(context):
+    return context.application.bot_data.setdefault('leaderboard_messages', {})
+
 def get_events_for_month(chat_id, year, month):
     event_dates = set()
     prefix = f"event:{chat_id}:{year}-{str(month).zfill(2)}"
@@ -301,25 +312,21 @@ async def award_badge(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id:
 async def store_message_db(context: ContextTypes.DEFAULT_TYPE, chat_id, user_id, username, first_name, last_name, text, date, is_reply, message_id):
     try:
         chat_id_str, user_id_str = str(chat_id), str(user_id)
+        _track_chat(chat_id)
+        _ensure_messages_migrated(chat_id)
         user_key = _get_user_key(chat_id_str, user_id_str)
         existing_user_data = db.get(user_key)
         new_user_data = {"username": username, "first_name": first_name, "last_name": last_name}
         if not existing_user_data or any(existing_user_data.get(k) != v for k, v in new_user_data.items()):
-            db[user_key] = {**new_user_data, "updated_at": datetime.datetime.now().isoformat()}
+            db[user_key] = {**new_user_data, "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
 
-        # Store the message itself
-        message_key = _get_messages_key(chat_id_str)
-        messages = db.get(message_key, [])
-        messages.append({"user_id": user_id, "username": username, "text": text, "date": date.isoformat(), "is_reply": is_reply, "message_id": message_id})
-        db[message_key] = messages[-10000:]
+        db.add_message(int(chat_id), int(message_id), int(user_id), username, text, date, is_reply)
 
-        # --- OPTIMIZATION: Increment message count in user_stats ---
         stats_key = _get_user_stats_key(chat_id_str, user_id_str)
         user_stats = db.get(stats_key, {"message_count": 0})
         user_stats["message_count"] += 1
         db[stats_key] = user_stats
 
-        # Check for message count badges using the efficient count
         message_count = user_stats["message_count"]
         if message_count == 100:
             await award_badge(context, chat_id, user_id, 'contributor_100')
@@ -328,7 +335,6 @@ async def store_message_db(context: ContextTypes.DEFAULT_TYPE, chat_id, user_id,
         elif message_count == 1000:
             await award_badge(context, chat_id, user_id, 'godlike_1000')
 
-        # Check for Diamond Hands badge (active for 30+ distinct days)
         if "first_seen" not in user_stats:
             user_stats["first_seen"] = date.isoformat()
             db[stats_key] = user_stats
@@ -360,27 +366,19 @@ def store_wallet_private(user_id, username, wallet_address):
     return True
 
 def get_messages_by_date_range(chat_id, start_date, end_date):
-    """Get messages from database, checking for both new and old key formats."""
-    chat_id_str = str(chat_id)
-    new_message_key = _get_messages_key(chat_id_str)
-    messages = db.get(new_message_key)
-    if messages is None:
-        old_message_key = f"{chat_id_str}:messages"
-        messages = db.get(old_message_key, [])
-    if start_date.tzinfo is None: start_date = start_date.replace(tzinfo=datetime.timezone.utc)
-    if end_date.tzinfo is None: end_date = end_date.replace(tzinfo=datetime.timezone.utc)
-    filtered = [msg for msg in messages if start_date <= datetime.datetime.fromisoformat(msg["date"]).replace(tzinfo=datetime.timezone.utc) <= end_date]
-    return filtered
+    """Get messages from normalized storage, lazily migrating legacy chat blobs."""
+    _ensure_messages_migrated(chat_id)
+    if start_date.tzinfo is None:
+        start_date = start_date.replace(tzinfo=datetime.timezone.utc)
+    if end_date.tzinfo is None:
+        end_date = end_date.replace(tzinfo=datetime.timezone.utc)
+    return db.get_messages(int(chat_id), start_date, end_date)
+
 
 def get_chat_stats(chat_id):
-    messages = get_messages_by_date_range(chat_id, datetime.datetime.min.replace(tzinfo=datetime.timezone.utc), datetime.datetime.max.replace(tzinfo=datetime.timezone.utc))
-    if not messages: return {'total_messages': 0, 'user_count': 0, 'oldest_date': None, 'newest_date': None, 'top_users': []}
-    user_ids = {msg["user_id"] for msg in messages}
-    dates = [datetime.datetime.fromisoformat(msg["date"]).replace(tzinfo=datetime.timezone.utc) for msg in messages if "date" in msg]
-    user_message_counts = defaultdict(int)
-    for msg in messages: user_message_counts[msg["username"]] += 1
-    top_users = sorted(user_message_counts.items(), key=lambda item: item[1], reverse=True)[:5]
-    return {'total_messages': len(messages), 'user_count': len(user_ids), 'oldest_date': min(dates), 'newest_date': max(dates), 'top_users': top_users}
+    _ensure_messages_migrated(chat_id)
+    return db.get_chat_stats(int(chat_id))
+
 
 def get_group_specific_wallet(chat_id, user_id):
     """Get wallet address for a specific group only, without global fallback."""
@@ -413,33 +411,22 @@ def get_wallet(chat_id, user_id):
 # --- SUI Airdrop Functions ---
 def get_top_users_by_messages(chat_id, count):
     """Returns the top N users by message count, with user_id included."""
-    chat_id_str = str(chat_id)
-    all_stats_keys = db.prefix(f"user_stats:{chat_id_str}:")
-    user_counts = []
-    for key in all_stats_keys:
-        try:
-            key_user_id = key.split(":")[-1]
-            stats = db.get(key)
-            if stats and "message_count" in stats:
-                user_counts.append((key_user_id, stats["message_count"]))
-        except (ValueError, IndexError):
-            continue
-    user_counts.sort(key=lambda item: item[1], reverse=True)
-    return user_counts[:count]
+    _ensure_messages_migrated(chat_id)
+    return [(str(user_id), message_count) for user_id, _, message_count in db.get_top_message_counts(int(chat_id), int(count))]
 
 
 async def sui_rpc_call(method: str, params: list) -> dict:
     """Makes a JSON-RPC call to the SUI network."""
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(
-            SUI_RPC_URL,
-            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-        )
-        resp.raise_for_status()
-        result = resp.json()
-        if "error" in result:
-            raise Exception(f"SUI RPC error: {result['error']}")
-        return result.get("result")
+    client = await get_shared_async_client()
+    resp = await client.post(
+        SUI_RPC_URL,
+        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+    )
+    resp.raise_for_status()
+    result = resp.json()
+    if "error" in result:
+        raise Exception(f"SUI RPC error: {result['error']}")
+    return result.get("result")
 
 
 async def sui_get_coins(owner: str, coin_type: str = None) -> dict:
@@ -559,102 +546,98 @@ async def fetch_crypto_price(symbol: str) -> dict | None:
 
     result = None
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            normalized_query = re.sub(r"[^a-z0-9]+", "", symbol.lower())
-            preferred_coin_id = SUI_PRICE_ALIASES.get(normalized_query)
+        client = await get_shared_async_client()
+        normalized_query = re.sub(r"[^a-z0-9]+", "", symbol.lower())
+        preferred_coin_id = SUI_PRICE_ALIASES.get(normalized_query)
 
-            search_coin_map: dict[str, tuple[dict, int]] = {}
+        search_coin_map: dict[str, tuple[dict, int]] = {}
 
-            if preferred_coin_id:
-                # Known alias – skip the search entirely
-                coin_ids = [preferred_coin_id]
-            else:
-                # Search for the coin by symbol/name
-                search_resp = await client.get(
-                    f"{COINGECKO_API_URL}/search",
-                    params={"query": symbol}
-                )
-                search_resp.raise_for_status()
-                coins = search_resp.json().get("coins", [])
-
-                if not coins:
-                    return None
-
-                coin_ids = [coin["id"] for coin in coins[:10]]
-                search_coin_map = {coin["id"]: (coin, i) for i, coin in enumerate(coins[:10])}
-
-            # Single batch call replaces N×/coins/{id} + /simple/price
-            markets_resp = await client.get(
-                f"{COINGECKO_API_URL}/coins/markets",
-                params={
-                    "vs_currency": "usd",
-                    "ids": ",".join(coin_ids),
-                    "price_change_percentage": "24h",
-                    "order": "market_cap_desc",
-                    "per_page": str(len(coin_ids)),
-                    "page": "1",
-                }
+        if preferred_coin_id:
+            coin_ids = [preferred_coin_id]
+        else:
+            search_resp = await client.get(
+                f"{COINGECKO_API_URL}/search",
+                params={"query": symbol},
             )
-            markets_resp.raise_for_status()
-            markets: list[dict] = markets_resp.json()
+            search_resp.raise_for_status()
+            coins = search_resp.json().get("coins", [])
 
-            if not markets:
+            if not coins:
                 return None
 
-            def _normalize(v: str | None) -> str:
-                return re.sub(r"[^a-z0-9]+", "", (v or "").lower())
+            coin_ids = [coin["id"] for coin in coins[:10]]
+            search_coin_map = {coin["id"]: (coin, i) for i, coin in enumerate(coins[:10])}
 
-            # Known SUI ecosystem coin IDs (for scoring, replaces platform API calls)
-            _sui_coin_ids = set(SUI_PRICE_ALIASES.values())
+        markets_resp = await client.get(
+            f"{COINGECKO_API_URL}/coins/markets",
+            params={
+                "vs_currency": "usd",
+                "ids": ",".join(coin_ids),
+                "price_change_percentage": "24h",
+                "order": "market_cap_desc",
+                "per_page": str(len(coin_ids)),
+                "page": "1",
+            },
+        )
+        markets_resp.raise_for_status()
+        markets: list[dict] = markets_resp.json()
 
-            def _score(market: dict) -> tuple:
-                coin_id = market["id"]
-                coin_symbol = market.get("symbol") or ""
-                coin_name = market.get("name") or ""
-                market_cap_rank = market.get("market_cap_rank")
-                search_coin, search_index = search_coin_map.get(coin_id, ({}, None))
+        if not markets:
+            return None
 
-                score = 0
-                if preferred_coin_id and coin_id == preferred_coin_id:
-                    score += COINGECKO_SCORE_PREFERRED_ALIAS
-                if _normalize(coin_symbol) == normalized_query:
-                    score += COINGECKO_SCORE_EXACT_SYMBOL_MATCH
-                if _normalize(coin_name) == normalized_query:
-                    score += COINGECKO_SCORE_EXACT_NAME_MATCH
-                if _normalize(coin_id) == normalized_query:
-                    score += COINGECKO_SCORE_EXACT_ID_MATCH
-                if coin_id in _sui_coin_ids:
-                    score += COINGECKO_SCORE_SUI_PLATFORM_MATCH
-                if normalized_query and normalized_query in _normalize(coin_symbol):
-                    score += COINGECKO_SCORE_PARTIAL_SYMBOL_MATCH
-                if normalized_query and normalized_query in _normalize(coin_name):
-                    score += COINGECKO_SCORE_PARTIAL_NAME_MATCH
-                if normalized_query and normalized_query in _normalize(coin_id):
-                    score += COINGECKO_SCORE_PARTIAL_ID_MATCH
-                if search_index is not None:
-                    score += max(0, COINGECKO_SCORE_SEARCH_ORDER_BONUS - search_index)
-                if isinstance(market_cap_rank, int) and market_cap_rank > 0:
-                    score += max(0, COINGECKO_SCORE_MARKET_CAP_BONUS - min(market_cap_rank, COINGECKO_SCORE_MARKET_CAP_BONUS))
+        def _normalize(v: str | None) -> str:
+            return re.sub(r"[^a-z0-9]+", "", (v or "").lower())
 
-                return (
-                    score,
-                    isinstance(market_cap_rank, int),
-                    -(market_cap_rank or COINGECKO_CANDIDATE_FALLBACK_RANK),
-                    -(COINGECKO_SCORE_SEARCH_ORDER_BONUS - search_index if search_index is not None else 0),
-                )
+        _sui_coin_ids = set(SUI_PRICE_ALIASES.values())
 
-            best = max(markets, key=_score, default=None)
-            if not best:
-                return None
+        def _score(market: dict) -> tuple:
+            coin_id = market["id"]
+            coin_symbol = market.get("symbol") or ""
+            coin_name = market.get("name") or ""
+            market_cap_rank = market.get("market_cap_rank")
+            _, search_index = search_coin_map.get(coin_id, ({}, None))
 
-            result = {
-                "name": best.get("name") or symbol,
-                "symbol": (best.get("symbol") or symbol).upper(),
-                "price": best.get("current_price") or 0,
-                "change_24h": best.get("price_change_percentage_24h") or 0,
-                "market_cap": best.get("market_cap") or 0,
-                "volume_24h": best.get("total_volume") or 0,
-            }
+            score = 0
+            if preferred_coin_id and coin_id == preferred_coin_id:
+                score += COINGECKO_SCORE_PREFERRED_ALIAS
+            if _normalize(coin_symbol) == normalized_query:
+                score += COINGECKO_SCORE_EXACT_SYMBOL_MATCH
+            if _normalize(coin_name) == normalized_query:
+                score += COINGECKO_SCORE_EXACT_NAME_MATCH
+            if _normalize(coin_id) == normalized_query:
+                score += COINGECKO_SCORE_EXACT_ID_MATCH
+            if coin_id in _sui_coin_ids:
+                score += COINGECKO_SCORE_SUI_PLATFORM_MATCH
+            if normalized_query and normalized_query in _normalize(coin_symbol):
+                score += COINGECKO_SCORE_PARTIAL_SYMBOL_MATCH
+            if normalized_query and normalized_query in _normalize(coin_name):
+                score += COINGECKO_SCORE_PARTIAL_NAME_MATCH
+            if normalized_query and normalized_query in _normalize(coin_id):
+                score += COINGECKO_SCORE_PARTIAL_ID_MATCH
+            if search_index is not None:
+                score += max(0, COINGECKO_SCORE_SEARCH_ORDER_BONUS - search_index)
+            if isinstance(market_cap_rank, int) and market_cap_rank > 0:
+                score += max(0, COINGECKO_SCORE_MARKET_CAP_BONUS - min(market_cap_rank, COINGECKO_SCORE_MARKET_CAP_BONUS))
+
+            return (
+                score,
+                isinstance(market_cap_rank, int),
+                -(market_cap_rank or COINGECKO_CANDIDATE_FALLBACK_RANK),
+                -(COINGECKO_SCORE_SEARCH_ORDER_BONUS - search_index if search_index is not None else 0),
+            )
+
+        best = max(markets, key=_score, default=None)
+        if not best:
+            return None
+
+        result = {
+            "name": best.get("name") or symbol,
+            "symbol": (best.get("symbol") or symbol).upper(),
+            "price": best.get("current_price") or 0,
+            "change_24h": best.get("price_change_percentage_24h") or 0,
+            "market_cap": best.get("market_cap") or 0,
+            "volume_24h": best.get("total_volume") or 0,
+        }
     except Exception as e:
         logging.error(f"Error fetching price for {symbol}: {e}")
         return None
@@ -698,17 +681,18 @@ def generate_calendar_keyboard(year, month, chat_id):
 
 async def check_and_announce_events(context: ContextTypes.DEFAULT_TYPE):
     """Job to check for and announce today's events based on chat-specific timezones."""
-    message_keys = db.prefix("messages:")
-    chat_ids = set(key.split(":")[1] for key in message_keys)
-
-    for chat_id_str in chat_ids:
+    chat_ids = set(db.get_enrolled_chat_ids())
+    for key in db.prefix('event:'):
         try:
-            chat_id = int(chat_id_str)
-            tz_name = db.get(_get_timezone_key(chat_id), "UTC")
+            chat_ids.add(int(key.split(':')[1]))
+        except (ValueError, IndexError):
+            continue
 
+    for chat_id in chat_ids:
+        try:
+            tz_name = db.get(_get_timezone_key(chat_id), "UTC")
             chat_tz = pytz.timezone(tz_name)
             now_in_tz = datetime.datetime.now(chat_tz)
-
             today_date = now_in_tz.date()
             announced_key = _get_announced_key(chat_id, today_date)
 
@@ -716,172 +700,17 @@ async def check_and_announce_events(context: ContextTypes.DEFAULT_TYPE):
                 event_key = _get_event_key(chat_id, today_date)
                 event_text = db.get(event_key)
                 if event_text:
-                    await context.bot.send_message(chat_id=chat_id, text=f"📢 <b>Today's Event</b>\n\n{event_text}", parse_mode=ParseMode.HTML)
-                    db[announced_key] = True 
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"📢 <b>Today's Event</b>\n\n{event_text}",
+                        parse_mode=ParseMode.HTML,
+                    )
+                    db[announced_key] = True
         except Exception as e:
-            logging.error(f"Failed during event announcement check for chat {chat_id_str}: {e}")
+            logging.error(f"Failed during event announcement check for chat {chat_id}: {e}")
 
 
 # --- Core Bot Logic ---
-def analyze_user_messages(username: str, message_count: int, messages_text: str) -> dict:
-    cache_key = _analysis_cache_key(username, message_count, messages_text)
-    prompt = f"User {username} posted {message_count} messages. Evaluate contributions on quality, tone, helpfulness, humor (0-20). Return valid JSON with keys: \"quality\", \"tone\", \"helpfulness\", \"humor\". Messages:\n\n{messages_text}"
-    try:
-        client = get_openai_client()
-        response = client.chat.completions.create(model="gpt-3.5-turbo", messages=[{"role": "system", "content": "You are an analytical assistant."}, {"role": "user", "content": prompt}], temperature=0.1, max_tokens=100, timeout=30.0)
-        breakdown = json.loads(response.choices[0].message.content.strip())
-        return breakdown
-    except Exception as e:
-        logging.error(f"Error analyzing messages for {username}: {e}")
-        return {"quality": 8, "tone": 10, "helpfulness": 8, "humor": 8}
-
-def summarize_chat_history(chat_transcript: str, days: int = None, topic: str = None) -> str:
-    """Uses OpenAI to summarize a chat transcript, optionally focusing on a topic."""
-
-    summary_context = f"from the last {days} day(s)" if days is not None else "from the recent chat history"
-
-    if topic:
-        prompt = f"""
-Analyze the following Telegram chat transcript {summary_context}, focusing specifically on discussions related to "{topic}".
-Provide a detailed summary of these specific conversations. Include key points made and the users who made them. Be specific about entities mentioned. For example, instead of saying "user discussed a certain coin," specifically state the coin described. Make sure to format usernames as clickable links (e.g., @Username). Use only HTML tags for formatting (e.g., <b>, <i>, <blockquote>). Do not use Markdown (e.g., **, __).
-
-Transcript:
-{chat_transcript}
-"""
-    else:
-        prompt = f"""
-Analyze the following Telegram chat transcript {summary_context}.
-Provide a summary of the conversation in chronological order, grouped by date.
-
-For each date, create a heading using the HTML bold tag in <b>MM/DD/YYYY</b> format. Do not use Markdown for dates.
-Under each date, provide 3-5 bullet points summarizing the key conversations.
-It is crucial that you include specific names of cryptocurrencies, projects, or campaigns directly within these bullet points.
-In each bullet point, mention the key participants by their clickable usernames (e.g., @Username).
-
-Transcript:
-{chat_transcript}
-"""
-    try:
-        client = get_openai_client()
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that provides detailed, chronologically ordered summaries of chat conversations in HTML format. Do not include `<html>`, `<head>`, or `<body>` tags in your response. Only use HTML tags like <b> for formatting."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.2,
-            max_tokens=700,
-            timeout=120.0
-        )
-        summary = response.choices[0].message.content.strip()
-        return sanitize_html_for_telegram(summary)
-    except Exception as e:
-        logging.error(f"Error summarizing chat history: {e}")
-        return "Sorry, I was unable to generate a summary at this time."
-
-def get_best_of_messages(chat_transcript: str, days: int) -> str:
-    """Uses OpenAI to select the best messages from a transcript."""
-    prompt = f"""
-Act as a community moderator reviewing a Telegram chat transcript from the last {days} day(s).
-Your task is to select 1-3 of the best messages for each of the following categories: Most Humorous, Most Degen (ridiculous trade suggestions, big bets), Best Alpha (thoughtful advice/information), and Most Helpful.
-
-Format your response exactly as follows, using HTML and emojis:
-
-😂 <b>Most Humorous</b>
-<blockquote>@Username: [Full text of the first humorous message]</blockquote>
-<blockquote>@Username: [Full text of the second humorous message]</blockquote>
-
-💰 <b>Most Degen</b>
-<blockquote>@Username: [Full text of the first degen message]</blockquote>
-
-🧠 <b>Best Alpha</b>
-<blockquote>@Username: [Full text of the first alpha message]</blockquote>
-
-🙏 <b>Most Helpful</b>
-<blockquote>@Username: [Full text of the first helpful message]</blockquote>
-
-If you can't find any messages for a category, omit that category entirely from your response.
-
-Transcript:
-{chat_transcript}
-"""
-    try:
-        client = get_openai_client()
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a community moderator who highlights the best contributions in a chat using HTML formatting. Do not include `<html>`, `<head>`, or `<body>` tags in your response."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.6,
-            max_tokens=800,
-            timeout=120.0
-        )
-        best_of = response.choices[0].message.content.strip()
-        return sanitize_html_for_telegram(best_of)
-    except Exception as e:
-        logging.error(f"Error getting 'best of' messages: {e}")
-        return "Could not generate the 'Best Of' digest at this time."
-
-def get_vibe_check(chat_transcript: str, topic: str = None) -> dict:
-    """Uses OpenAI to analyze the sentiment of a chat transcript."""
-    topic_prompt = f"focusing on the topic '{topic}'" if topic else "on the overall conversation"
-
-    prompt = f"""
-Analyze the sentiment of the following Telegram chat transcript {topic_prompt}.
-Your response must be a valid JSON object with three keys:
-1. "key_messages": An array of 3-4 strings, each containing a key message that exemplifies the sentiment. Format them as "@Username: [Full message text]".
-2. "sentiment": A single string qualifier from this list: "Mega-bearish", "Bearish", "Neutral", "Bullish", "Mega-bullish".
-3. "summary": A brief summary (less than 200 characters) of the sentiment.
-
-Transcript:
-{chat_transcript}
-"""
-    try:
-        client = get_openai_client()
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo-0125",
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": "You are a sentiment analysis expert who analyzes Telegram chat transcripts and responds with structured JSON."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.2,
-            max_tokens=600,
-            timeout=120.0
-        )
-        vibe_data = json.loads(response.choices[0].message.content)
-        return vibe_data
-    except Exception as e:
-        logging.error(f"Error getting vibe check: {e}")
-        return None
-
-def generate_copypasta(user_transcript: str) -> str:
-    """Uses OpenAI to generate a copypasta based on a user's message history."""
-    prompt = f"""
-Based on the following messages from a user, write a short, unhinged, and deranged-sounding copypasta that captures their personality, writing style, and common topics. The copypasta should be from their perspective.
-
-Messages:
-{user_transcript}
-"""
-    try:
-        client = get_openai_client()
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a creative writer who specializes in internet humor and copypastas."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.8,
-            max_tokens=250,
-            timeout=60.0
-        )
-        copypasta = response.choices[0].message.content.strip()
-        return copypasta
-    except Exception as e:
-        logging.error(f"Error generating copypasta: {e}")
-        return "I tried to get weird, but something went wrong."
-
 async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text or update.message.from_user.is_bot: return
     text = update.message.text.strip()
@@ -1001,7 +830,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         try:
             target_chat_id = int(context.args[0].split('_')[1])
-            context.user_data['target_chat_id'] = target_chat_id
+            _get_wallet_flows(context)[user_id] = target_chat_id
             logging.info(f"Wallet flow initiated for user {user_id} and chat {target_chat_id}")
         except (IndexError, ValueError) as e:
             logging.error(f"Invalid wallet start link from user {user_id}: {e}")
@@ -1009,20 +838,21 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
 
         try:
-            # Get only group-specific wallet, don't fall back to global
             wallet_data = await asyncio.to_thread(get_group_specific_wallet, target_chat_id, user_id)
             chat_info = await context.bot.get_chat(target_chat_id)
             chat_name = chat_info.title or f"Group (ID: {target_chat_id})"
 
             if wallet_data:
                 await update.message.reply_text(
-                    f"You have a wallet submitted for *{escape_markdown(chat_name)}*:\n\n`{wallet_data['wallet_address']}`\n\nTo replace it, simply reply with your new wallet address\\. To keep it, type /cancel\\.",
+                    f"You have a wallet submitted for *{escape_markdown(chat_name)}*:\n\n"
+                    f"`{wallet_data['wallet_address']}`\n\n"
+                    "To replace it, simply reply with your new wallet address\\. To keep it, type /cancel\\.",
                     parse_mode='MarkdownV2'
                 )
                 logging.info(f"Existing wallet found for user {user_id} in chat {target_chat_id}")
             else:
                 await update.message.reply_text(
-                    f"Please reply to this message with your wallet address to submit it for the group: *{escape_markdown(chat_name)}*",
+                    f"Please reply to this message with your SUI wallet address to submit it for the group: *{escape_markdown(chat_name)}*",
                     parse_mode='MarkdownV2'
                 )
                 logging.info(f"No existing wallet found for user {user_id} in chat {target_chat_id}, awaiting submission")
@@ -1032,108 +862,97 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("There was an error accessing the group information. Please try again from the group chat.")
             return ConversationHandler.END
 
-    help_text = (
-        "Hello! I'm an all-in-one community management and leaderboard bot. Here's what I can do:\n\n"
-        "<b>🤖 AI Analysis</b>\n"
-        "/summarize &lt;number&gt; - Get an AI summary of the last number of messages.\n"
-        "/bestof &lt;number&gt; - See the best messages from the last number of posts.\n"
-        "/vibecheck &lt;number&gt; - Check the group's vibe on the last number of messages.\n"
-        "<i>You can add a topic to any of the above, like /summarize 500 bitcoin</i>\n\n"
-        "<b>📊 Stats & Fun</b>\n"
-        "/score - Get a detailed, AI-integrated contribution leaderboard (admin).\n"
-        "/publicscore - Show a simple leaderboard in the chat (admin).\n"
-        "/mystats - See your personal stats for this group.\n"
-        "/mybadges - View the badges you've earned.\n"
-        "/allbadges - See all available badges.\n"
-        "/copypasta - Create a copypasta based on your message history.\n\n"
-        "<b>💰 Crypto</b>\n"
-        "/price &lt;symbol&gt; - Look up a cryptocurrency price (including SUI ecosystem tokens like SUI, DEEP, WAL, NS).\n"
-        "/airdrop &lt;count&gt; &lt;amount&gt; - Airdrop tokens to top scorers (admin, reply to /score).\n"
-        "/settoken &lt;coin_type&gt; - Set the airdrop token for this group (admin).\n\n"
-        "<b>🗓️ Group Management</b>\n"
-        "/calendar - Manage the group's event calendar (admin).\n"
-        "/events - List all upcoming events.\n"
-        "/wallet - Submit or check your wallet address.\n"
-        "/setwelcome on|off - Toggle welcome messages (admin).\n"
-        "/settimezone - Set the timezone for event announcements (admin).\n"
-    )
-    await update.message.reply_text(help_text + FOOTER_HTML, parse_mode='HTML')
+    await update.message.reply_text(HELP_TEXT + FOOTER_HTML, parse_mode='HTML')
     return ConversationHandler.END
 
 
 async def score_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
-    if chat_member.status not in ['administrator', 'creator']:
-        await update.message.reply_text("❌ Only administrators can use this command.")
+    if not await require_admin(update, context):
         return
 
+    _track_chat(update.effective_chat.id)
     start_date, end_date = None, None
-    score_invalid_format = "Invalid format. Try \"# messages\", \"# days\", or \"MM/DD/YYYY-MM/DD/YYYY\""
+    score_invalid_format = 'Invalid format. Try "# messages", "# days", or "MM/DD/YYYY-MM/DD/YYYY"'
 
-    # Check for message count format
     if len(context.args) >= 2 and context.args[1].lower().startswith('message'):
         try:
             count = int(context.args[0])
-            all_messages = db.get(_get_messages_key(update.effective_chat.id), [])
-            messages = all_messages[-count:]
+            messages = await asyncio.to_thread(_get_recent_messages, update.effective_chat.id, count)
             if messages:
                 start_date = datetime.datetime.fromisoformat(messages[0]['date'])
                 end_date = datetime.datetime.fromisoformat(messages[-1]['date'])
         except (ValueError, IndexError):
             await update.message.reply_text(score_invalid_format)
             return
-    else: # Fallback to date-based format
+    else:
         start_date, end_date, _ = await _parse_date_range(context.args)
 
     if not start_date or not end_date:
         await update.message.reply_text(score_invalid_format)
         return
 
-    user_id = update.effective_user.id
-    context.user_data['score_params'] = {'start_date': start_date, 'end_date': end_date, 'start_str': start_date.strftime("%m/%d/%Y"), 'end_str': end_date.strftime("%m/%d/%Y"), 'export': len(context.args) > 2 and context.args[2].lower() == "export", 'chat_id': update.effective_chat.id}
-    keyboard = [[InlineKeyboardButton("📩 Send to Private Chat", callback_data=f"score_private_{user_id}")], [InlineKeyboardButton("📢 Broadcast in Group", callback_data=f"score_broadcast_{user_id}")]]
-    await update.message.reply_text(f"📊 **Leaderboard for {context.user_data['score_params']['start_str']} → {context.user_data['score_params']['end_str']}**\n\nWhere would you like to receive the result?", reply_markup=InlineKeyboardMarkup(keyboard))
+    request_token = _new_flow_token()
+    _get_score_requests(context)[request_token] = {
+        'requester_id': update.effective_user.id,
+        'start_date': start_date,
+        'end_date': end_date,
+        'start_str': start_date.strftime('%m/%d/%Y'),
+        'end_str': end_date.strftime('%m/%d/%Y'),
+        'export': len(context.args) > 2 and context.args[2].lower() == 'export',
+        'chat_id': update.effective_chat.id,
+    }
+    keyboard = [
+        [InlineKeyboardButton('📩 Send to Private Chat', callback_data=f'score_private_{request_token}')],
+        [InlineKeyboardButton('📢 Broadcast in Group', callback_data=f'score_broadcast_{request_token}')],
+    ]
+    await update.message.reply_text(
+        f"📊 <b>Leaderboard for {start_date:%m/%d/%Y} → {end_date:%m/%d/%Y}</b>\n\n"
+        "Where would you like to receive the result?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
 
 async def public_score_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
-    if chat_member.status not in ['administrator', 'creator']:
-        await update.message.reply_text("❌ Only administrators can use this command.")
+    if not await require_admin(update, context):
         return
 
+    _track_chat(update.effective_chat.id)
     start_date, end_date = None, None
-    score_invalid_format = "Invalid format. Try \"# messages\", \"# days\", or \"MM/DD/YYYY-MM/DD/YYYY\""
+    score_invalid_format = 'Invalid format. Try "# messages", "# days", or "MM/DD/YYYY-MM/DD/YYYY"'
 
-    # Check for message count format
     if len(context.args) >= 2 and context.args[1].lower().startswith('message'):
         try:
             count = int(context.args[0])
-            all_messages = db.get(_get_messages_key(update.effective_chat.id), [])
-            messages = all_messages[-count:]
+            messages = await asyncio.to_thread(_get_recent_messages, update.effective_chat.id, count)
             if messages:
                 start_date = datetime.datetime.fromisoformat(messages[0]['date'])
                 end_date = datetime.datetime.fromisoformat(messages[-1]['date'])
         except (ValueError, IndexError):
             await update.message.reply_text(score_invalid_format)
             return
-    else:  # Fallback to date-based format
+    else:
         start_date, end_date, _ = await _parse_date_range(context.args)
 
     if not start_date or not end_date:
         await update.message.reply_text(score_invalid_format)
         return
 
-    await update.message.reply_text("🔍 Generating public score...")
-    result, error = await generate_leaderboard(context, update.effective_chat.id, start_date, end_date, start_date.strftime("%m/%d/%Y"), end_date.strftime("%m/%d/%Y"))
-    if error: await update.message.reply_text(f"❌ {error}"); return
+    await update.message.reply_text('🔍 Generating public score...')
+    result, error = await generate_leaderboard(context, update.effective_chat.id, start_date, end_date, start_date.strftime('%m/%d/%Y'), end_date.strftime('%m/%d/%Y'))
+    if error:
+        await update.message.reply_text(f'❌ {error}')
+        return
     leaderboard_data = result[2]
     public_text = f"🏆 <b>Public Score</b> ({start_date:%m/%d/%Y} → {end_date:%m/%d/%Y})\n\n<pre>"
     public_text += "Rank | User                 | Total Score\n" + "-" * 40 + "\n"
     for idx, (uname, met, _, _) in enumerate(leaderboard_data[:20], 1):
-        medal = "🥇" if idx == 1 else "🥈" if idx == 2 else "🥉" if idx == 3 else "  "
+        medal = '🥇' if idx == 1 else '🥈' if idx == 2 else '🥉' if idx == 3 else '  '
         safe_uname = html.escape(uname[:19])
         public_text += f"{medal}{idx:2d} | {safe_uname:<19} | {met['total']:7.1f}\n"
-    public_text += "</pre>"
+    public_text += '</pre>'
     await update.message.reply_text(public_text + FOOTER_HTML, parse_mode=ParseMode.HTML)
+
 
 async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generates an AI-powered summary of recent chat activity."""
@@ -1147,8 +966,8 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text("Summarizing conversation, this may take a moment...")
 
-        all_messages = db.get(_get_messages_key(update.effective_chat.id), [])
-        messages = all_messages[-count:]
+        _track_chat(update.effective_chat.id)
+        messages = await asyncio.to_thread(_get_recent_messages, update.effective_chat.id, count)
 
         if not messages:
             await update.message.reply_text("No messages found to summarize.")
@@ -1197,8 +1016,8 @@ async def bestof_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text("Curating the best messages, please wait...")
 
-        all_messages = db.get(_get_messages_key(update.effective_chat.id), [])
-        messages = all_messages[-count:]
+        _track_chat(update.effective_chat.id)
+        messages = await asyncio.to_thread(_get_recent_messages, update.effective_chat.id, count)
 
         if not messages:
             await update.message.reply_text("No messages found to create a digest from.")
@@ -1242,8 +1061,8 @@ async def vibecheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text("Checking the vibe, please wait...")
 
-        all_messages = db.get(_get_messages_key(update.effective_chat.id), [])
-        messages = all_messages[-count:]
+        _track_chat(update.effective_chat.id)
+        messages = await asyncio.to_thread(_get_recent_messages, update.effective_chat.id, count)
 
         if not messages:
             await update.message.reply_text("No messages found to analyze.")
@@ -1299,8 +1118,8 @@ async def copypasta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Digging through your post history to get your essence...")
 
-    all_messages = db.get(_get_messages_key(chat_id), [])
-    user_messages = [msg for msg in all_messages if msg['user_id'] == user_id][-200:]
+    _track_chat(chat_id)
+    user_messages = await asyncio.to_thread(_get_recent_user_messages, chat_id, user_id, 200)
 
     if len(user_messages) < 10:
         await update.message.reply_text("I don't have enough of your message history to create a copypasta yet. Keep chatting!")
@@ -1314,35 +1133,33 @@ async def copypasta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def setwelcome_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Allows admins to toggle welcome messages on or off."""
-    chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
-    if chat_member.status not in ['administrator', 'creator']:
-        await update.message.reply_text("❌ Only administrators can use this command.")
+    if not await require_admin(update, context):
         return
 
+    _track_chat(update.effective_chat.id)
     if not context.args or context.args[0].lower() not in ('on', 'off'):
-        await update.message.reply_text("Usage: /setwelcome on or /setwelcome off")
+        await update.message.reply_text('Usage: /setwelcome on or /setwelcome off')
         return
 
     enabled = context.args[0].lower() == 'on'
     db[_get_welcome_key(update.effective_chat.id)] = enabled
-    status = "enabled ✅" if enabled else "disabled ❌"
-    await update.message.reply_text(f"Welcome messages have been {status}.")
+    status = 'enabled ✅' if enabled else 'disabled ❌'
+    await update.message.reply_text(f'Welcome messages have been {status}.')
 
 
 async def settoken_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Allows admins to set the airdrop token type for the group."""
-    chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
-    if chat_member.status not in ['administrator', 'creator']:
-        await update.message.reply_text("❌ Only administrators can use this command.")
+    if not await require_admin(update, context):
         return
 
+    _track_chat(update.effective_chat.id)
     if not context.args:
         current_token = db.get(_get_airdrop_token_key(update.effective_chat.id), DEFAULT_SUI_COIN_TYPE)
         await update.message.reply_text(
             f"Current airdrop token: <code>{html.escape(current_token)}</code>\n\n"
-            f"Usage: /settoken &lt;coin_type&gt;\n"
-            f"Example: /settoken 0x2::sui::SUI",
-            parse_mode=ParseMode.HTML
+            "Usage: /settoken &lt;coin_type&gt;\n"
+            "Example: /settoken 0x2::sui::SUI",
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -1350,7 +1167,7 @@ async def settoken_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db[_get_airdrop_token_key(update.effective_chat.id)] = coin_type
     await update.message.reply_text(
         f"✅ Airdrop token set to: <code>{html.escape(coin_type)}</code>",
-        parse_mode=ParseMode.HTML
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -1359,11 +1176,10 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     Must be used as a reply to a leaderboard message generated by /score.
     """
-    chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
-    if chat_member.status not in ['administrator', 'creator']:
-        await update.message.reply_text("❌ Only administrators can use this command.")
+    if not await require_admin(update, context):
         return
 
+    _track_chat(update.effective_chat.id)
     if len(context.args) < 2:
         await update.message.reply_text(
             "Usage: Reply to a /score leaderboard message with:\n"
@@ -1374,7 +1190,7 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "3. Reply to that leaderboard message with /airdrop 10 1000000000\n\n"
             "<i>Count = number of top leaderboard users to receive tokens.\n"
             "Amount = token amount per user in smallest unit (e.g. 1000000000 MIST = 1 SUI).</i>",
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -1382,49 +1198,44 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         count = int(context.args[0])
         amount = int(context.args[1])
     except ValueError:
-        await update.message.reply_text("❌ Both count and amount must be whole numbers.")
+        await update.message.reply_text('❌ Both count and amount must be whole numbers.')
         return
 
     if count < 1 or amount < 1:
-        await update.message.reply_text("❌ Count and amount must be positive numbers.")
+        await update.message.reply_text('❌ Count and amount must be positive numbers.')
         return
 
-    # Must be a reply to a leaderboard message
     if not update.message.reply_to_message:
         await update.message.reply_text(
             "❌ Please reply to a /score leaderboard message to use /airdrop.\n\n"
             "1. Run /score (e.g. /score 30 days)\n"
             "2. Broadcast the leaderboard to the group\n"
             "3. Reply to that leaderboard message with /airdrop &lt;count&gt; &lt;amount&gt;",
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
         )
         return
 
+    chat_id = update.effective_chat.id
     replied_msg_id = update.message.reply_to_message.message_id
-    leaderboard_messages = context.chat_data.get('leaderboard_messages', {})
-    leaderboard = leaderboard_messages.get(replied_msg_id)
+    leaderboard = _get_leaderboard_messages(context).get((chat_id, replied_msg_id))
 
     if not leaderboard:
-        await update.message.reply_text("❌ The replied message is not a recognized leaderboard. Please reply to a leaderboard broadcasted by /score.")
+        await update.message.reply_text('❌ The replied message is not a recognized leaderboard. Please reply to a leaderboard broadcasted by /score.')
         return
 
-    if not os.environ.get("SUI_PRIVATE_KEY"):
-        await update.message.reply_text("❌ SUI airdrop is not configured. The bot operator must set the SUI_PRIVATE_KEY environment variable.")
+    if not os.environ.get('SUI_PRIVATE_KEY'):
+        await update.message.reply_text('❌ SUI airdrop is not configured. The bot operator must set the SUI_PRIVATE_KEY environment variable.')
         return
 
-    chat_id = update.effective_chat.id
     coin_type = db.get(_get_airdrop_token_key(chat_id), DEFAULT_SUI_COIN_TYPE)
-
-    # Take the top N users from the score-based leaderboard
-    # Leaderboard entries are tuples: (username, metrics_dict, message_count, user_id)
     top_entries = leaderboard[:count]
     if not top_entries:
-        await update.message.reply_text("❌ No eligible users found in the leaderboard.")
+        await update.message.reply_text('❌ No eligible users found in the leaderboard.')
         return
 
     await update.message.reply_text(
         f"🪂 Starting airdrop of <code>{html.escape(coin_type)}</code> to the top {len(top_entries)} users from the leaderboard...",
-        parse_mode=ParseMode.HTML
+        parse_mode=ParseMode.HTML,
     )
 
     results = []
@@ -1432,26 +1243,23 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     skip_count = 0
     fail_count = 0
 
-    for username, _, msg_count, user_id_str in top_entries:
+    for username, _, _, user_id_str in top_entries:
         safe_username = html.escape(username)
-
-        # Look up wallet
         wallet_data = await asyncio.to_thread(get_wallet, chat_id, int(user_id_str))
-        if not wallet_data or not wallet_data.get("wallet_address"):
-            results.append(f"⏭️ @{safe_username}: No wallet registered — skipped")
+        if not wallet_data or not wallet_data.get('wallet_address'):
+            results.append(f'⏭️ @{safe_username}: No wallet registered — skipped')
             skip_count += 1
             continue
 
-        wallet_address = wallet_data["wallet_address"]
-
+        wallet_address = wallet_data['wallet_address']
         try:
             tx_result = await sui_transfer_token(wallet_address, amount, coin_type)
-            tx_digest = tx_result.get("digest", "unknown")
-            results.append(f"✅ @{safe_username}: <code>{tx_digest}</code>")
+            tx_digest = tx_result.get('digest', 'unknown')
+            results.append(f'✅ @{safe_username}: <code>{tx_digest}</code>')
             success_count += 1
         except Exception as e:
-            logging.error(f"Airdrop transfer failed for {username} ({wallet_address}): {e}")
-            results.append(f"❌ @{safe_username}: {html.escape(str(e)[:60])}")
+            logging.error(f'Airdrop transfer failed for {username} ({wallet_address}): {e}')
+            results.append(f'❌ @{safe_username}: {html.escape(str(e)[:60])}')
             fail_count += 1
 
     results_text = "\n".join(results)
@@ -1506,32 +1314,7 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Displays the help message with all available commands."""
-    help_text = (
-        "Hello! I'm an all-in-one community management and leaderboard bot. Here's what I can do:\n\n"
-        "<b>🤖 AI Analysis</b>\n"
-        "/summarize &lt;number&gt; - Get an AI summary of the last number of messages.\n"
-        "/bestof &lt;number&gt; - See the best messages from the last number of posts.\n"
-        "/vibecheck &lt;number&gt; - Check the group's vibe on the last number of messages.\n"
-        "<i>You can add a topic to any of the above, like /summarize 500 bitcoin</i>\n\n"
-        "<b>📊 Stats & Fun</b>\n"
-        "/score - Get a detailed, AI-integrated contribution leaderboard (admin).\n"
-        "/publicscore - Show a simple leaderboard in the chat (admin).\n"
-        "/mystats - See your personal stats for this group.\n"
-        "/mybadges - View the badges you've earned.\n"
-        "/allbadges - See all available badges.\n"
-        "/copypasta - Create a copypasta based on your message history.\n\n"
-        "<b>💰 Crypto</b>\n"
-        "/price &lt;symbol&gt; - Look up a cryptocurrency price (including SUI ecosystem tokens like SUI, DEEP, WAL, NS).\n"
-        "/airdrop &lt;count&gt; &lt;amount&gt; - Airdrop tokens to top scorers (admin, reply to /score).\n"
-        "/settoken &lt;coin_type&gt; - Set the airdrop token for this group (admin).\n\n"
-        "<b>🗓️ Group Management</b>\n"
-        "/calendar - Manage the group's event calendar (admin).\n"
-        "/events - List all upcoming events.\n"
-        "/wallet - Submit or check your wallet address.\n"
-        "/setwelcome on|off - Toggle welcome messages (admin).\n"
-        "/settimezone - Set the timezone for event announcements (admin).\n"
-    )
-    await update.message.reply_text(help_text + FOOTER_HTML, parse_mode='HTML')
+    await update.message.reply_text(HELP_TEXT + FOOTER_HTML, parse_mode='HTML')
 
 
 async def mybadges_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1563,6 +1346,7 @@ async def allbadges_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _track_chat(update.effective_chat.id)
     stats = await asyncio.to_thread(get_chat_stats, update.effective_chat.id)
     if stats['total_messages'] == 0: await update.message.reply_text("No messages stored yet."); return
 
@@ -1588,50 +1372,21 @@ async def mystats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
 
+    _track_chat(chat_id)
+    await asyncio.to_thread(_ensure_messages_migrated, chat_id)
     await update.message.reply_text("Checking your stats... I'll send them to you in a private message.")
+    rank_row = await asyncio.to_thread(db.get_user_rank, chat_id, user_id)
+    if rank_row:
+        rank, user_message_count = rank_row
+    else:
+        rank, user_message_count = -1, 0
 
-    # --- OPTIMIZATION: Fetch stats directly, not all messages ---
-    chat_id_str = str(chat_id)
-    user_id_str = str(user_id)
-
-    # Get this user's message count
-    stats_key = _get_user_stats_key(chat_id_str, user_id_str)
-    user_stats = db.get(stats_key, {"message_count": 0})
-    user_message_count = user_stats["message_count"]
-
-    # Calculate rank efficiently
-    rank = -1
-    if user_message_count > 0:
-        all_stats_keys = db.prefix(f"user_stats:{chat_id_str}:")
-        # Create a list of (user_id, count) tuples
-        user_counts = []
-        for key in all_stats_keys:
-            try:
-                # Extract user_id from key f"user_stats:{chat_id}:{user_id}"
-                key_user_id = int(key.split(":")[-1])
-                stats = db.get(key)
-                if stats and "message_count" in stats:
-                    user_counts.append((key_user_id, stats["message_count"]))
-            except (ValueError, IndexError):
-                continue # Skip malformed keys
-
-        # Sort by message count (descending)
-        sorted_users = sorted(user_counts, key=lambda item: item[1], reverse=True)
-
-        # Find rank
-        for i, (uid, _) in enumerate(sorted_users):
-            if uid == user_id:
-                rank = i + 1
-                break
-
-    # Get badge info (this part is already efficient)
     badges_key = _get_badges_key(chat_id, user_id)
     user_badges = db.get(badges_key, [])
-    badge_text = ""
     if user_badges:
-        badge_text = "<b>Badges Earned:</b> " + " ".join([BADGES[b]['emoji'] for b in user_badges if b in BADGES])
+        badge_text = '<b>Badges Earned:</b> ' + ' '.join([BADGES[b]['emoji'] for b in user_badges if b in BADGES])
     else:
-        badge_text = "<b>Badges Earned:</b> None yet!"
+        badge_text = '<b>Badges Earned:</b> None yet!'
 
     stats_message = (
         f"📊 <b>Your Stats for this Group</b>\n\n"
@@ -1643,21 +1398,26 @@ async def mystats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_message(chat_id=user_id, text=stats_message + FOOTER_HTML, parse_mode=ParseMode.HTML)
     except Exception as e:
-        logging.error(f"Failed to send private stats to {user_id}: {e}")
+        logging.error(f'Failed to send private stats to {user_id}: {e}')
         await update.message.reply_text("I couldn't send you a private message. Please start a chat with me first!")
 
 
 async def calendar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
-    if chat_member.status not in ['administrator', 'creator']:
-        await update.message.reply_text("❌ Only administrators can use this command.")
+    if not await require_admin(update, context):
         return ConversationHandler.END
+    _track_chat(update.effective_chat.id)
     now = datetime.datetime.now()
-    await update.message.reply_text("📅 <b>Event Calendar</b>\nClick a date to add or view an event.", reply_markup=generate_calendar_keyboard(now.year, now.month, update.effective_chat.id), parse_mode=ParseMode.HTML)
+    await update.message.reply_text(
+        "📅 <b>Event Calendar</b>\nClick a date to add or view an event.",
+        reply_markup=generate_calendar_keyboard(now.year, now.month, update.effective_chat.id),
+        parse_mode=ParseMode.HTML,
+    )
     return SELECTING_ACTION
+
 
 async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    _track_chat(chat_id)
     prefix = f"event:{chat_id}:"
     event_keys = db.prefix(prefix)
     upcoming_events = []
@@ -1683,212 +1443,244 @@ async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_timezone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Sets the timezone for the chat."""
-    chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
-    if chat_member.status not in ['administrator', 'creator']:
-        await update.message.reply_text("❌ Only administrators can use this command.")
+    if not await require_admin(update, context):
         return
 
+    _track_chat(update.effective_chat.id)
     if not context.args:
-        await update.message.reply_text("Usage: /settimezone <Timezone>\nExample: /settimezone America/New_York\nFind timezones here: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones")
+        await update.message.reply_text(
+            "Usage: /settimezone <Timezone>\n"
+            "Example: /settimezone America/New_York\n"
+            "Find timezones here: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones"
+        )
         return
 
     tz_name = context.args[0]
     try:
         pytz.timezone(tz_name)
         db[_get_timezone_key(update.effective_chat.id)] = tz_name
-        await update.message.reply_text(f"✅ Timezone successfully set to {tz_name}.")
+        await update.message.reply_text(f'✅ Timezone successfully set to {tz_name}.')
     except pytz.UnknownTimeZoneError:
-        await update.message.reply_text(f"❌ Unknown timezone: {tz_name}. Please use a valid timezone name.")
+        await update.message.reply_text(f'❌ Unknown timezone: {tz_name}. Please use a valid timezone name.')
+
 
 async def wallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the /wallet command to initiate wallet submission/checking."""
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
 
-    # Check if this is a private message
     if update.effective_chat.type == 'private':
-        await update.message.reply_text("Please use this command in a group chat to submit your wallet for that group.")
+        await update.message.reply_text('Please use this command in a group chat to submit your wallet for that group.')
         return
 
+    _track_chat(chat_id)
     try:
         bot_username = context.bot.username
         if not bot_username:
-            # Fallback to get bot info if username is not available
             bot_info = await context.bot.get_me()
             bot_username = bot_info.username
 
-        keyboard = [[InlineKeyboardButton("🔒 Submit or Check Wallet", url=f"https://t.me/{bot_username}?start=wallet_{chat_id}")]]
+        keyboard = [[InlineKeyboardButton('🔒 Submit or Check Wallet', url=f'https://t.me/{bot_username}?start=wallet_{chat_id}')]]
         await update.message.reply_text(
-            "To protect your privacy, please click the button below to submit or check your wallet in a private chat with me.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            'To protect your privacy, please click the button below to submit or check your wallet in a private chat with me.',
+            reply_markup=InlineKeyboardMarkup(keyboard),
         )
-        logging.info(f"Wallet command used by user {user_id} in chat {chat_id}")
+        logging.info(f'Wallet command used by user {user_id} in chat {chat_id}')
     except Exception as e:
-        logging.error(f"Error in wallet command for user {user_id} in chat {chat_id}: {e}")
-        await update.message.reply_text("There was an error generating the wallet submission link. Please try again.")
+        logging.error(f'Error in wallet command for user {user_id} in chat {chat_id}: {e}')
+        await update.message.reply_text('There was an error generating the wallet submission link. Please try again.')
+
 
 async def receive_wallet_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Receives and validates the wallet address from the user."""
-    wallet_address = update.message.text.strip()
+    submitted_wallet = update.message.text.strip()
+    normalized_wallet = normalize_wallet_address(submitted_wallet)
     user_id = update.effective_user.id
     username = update.effective_user.username or update.effective_user.first_name
 
-    logging.info(f"Received wallet address from user {user_id}: {wallet_address[:10]}...")
+    logging.info(f'Received wallet address from user {user_id}: {submitted_wallet[:10]}...')
 
-    # Removed validation to allow any string format
-    if not wallet_address:
-        await update.message.reply_text("❌ Wallet address cannot be empty. Please try again or type /cancel.")
+    if not normalized_wallet:
+        await update.message.reply_text('❌ Please send a valid SUI wallet address (64 hex characters, with or without 0x) or type /cancel.')
         return AWAITING_WALLET
 
-    target_chat_id = context.user_data.get('target_chat_id')
+    target_chat_id = _get_wallet_flows(context).get(user_id)
     if not target_chat_id:
-        await update.message.reply_text("Error: Could not find the original group. Please start the process again from the group chat.")
-        logging.error(f"Missing target_chat_id for user {user_id}")
+        await update.message.reply_text('Error: Could not find the original group. Please start the process again from the group chat.')
+        logging.error(f'Missing target_chat_id for user {user_id}')
         return ConversationHandler.END
 
     try:
-        success = await asyncio.to_thread(store_wallet, target_chat_id, user_id, username, wallet_address)
+        success = await asyncio.to_thread(store_wallet, target_chat_id, user_id, username, normalized_wallet)
         chat_info = await context.bot.get_chat(target_chat_id)
-        chat_name = chat_info.title or f"Group (ID: {target_chat_id})"
+        chat_name = chat_info.title or f'Group (ID: {target_chat_id})'
         if success:
-            await update.message.reply_text(f"✅ Wallet address `{wallet_address}` successfully submitted for *{escape_markdown(chat_name)}*\\.", parse_mode='MarkdownV2')
-            logging.info(f"Wallet successfully stored for user {user_id} in chat {target_chat_id}")
+            await update.message.reply_text(
+                f"✅ Wallet address `{normalized_wallet}` successfully submitted for *{escape_markdown(chat_name)}*\\.",
+                parse_mode='MarkdownV2',
+            )
+            logging.info(f'Wallet successfully stored for user {user_id} in chat {target_chat_id}')
         else:
-            await update.message.reply_text("❌ Error storing wallet address. Please try again.")
-            logging.error(f"Wallet storage failed for user {user_id}")
+            await update.message.reply_text('❌ Error storing wallet address. Please try again.')
+            logging.error(f'Wallet storage failed for user {user_id}')
     except Exception as e:
         logging.error(f"Error in wallet submission for '{username}' (ID: {user_id}): {e}")
-        await update.message.reply_text("❌ Error storing wallet address. Please try again.")
+        await update.message.reply_text('❌ Error storing wallet address. Please try again.')
+    finally:
+        _get_wallet_flows(context).pop(user_id, None)
 
-    context.user_data.pop('target_chat_id', None)
     return ConversationHandler.END
 
 
 async def handle_calendar_interaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query, data, chat_id = update.callback_query, update.callback_query.data, update.callback_query.message.chat_id
     user = query.from_user
-    chat_member = await context.bot.get_chat_member(chat_id, user.id)
-    if chat_member.status not in ['administrator', 'creator']:
-        await query.answer("❌ Only administrators can interact with the calendar.", show_alert=True)
+    if not await user_is_admin(context, chat_id, user.id):
+        await query.answer('❌ Only administrators can interact with the calendar.', show_alert=True)
         return SELECTING_ACTION
 
     await query.answer()
     try:
-        parts = data.split("_")
+        parts = data.split('_')
         action = parts[1]
 
-        if action == "nav":
+        if action == 'nav':
             _, _, year, month = parts
-            await query.edit_message_text(text="📅 <b>Event Calendar</b>\nClick a date to add or view an event.", reply_markup=generate_calendar_keyboard(int(year), int(month), chat_id), parse_mode=ParseMode.HTML)
+            await query.edit_message_text(
+                text="📅 <b>Event Calendar</b>\nClick a date to add or view an event.",
+                reply_markup=generate_calendar_keyboard(int(year), int(month), chat_id),
+                parse_mode=ParseMode.HTML,
+            )
             return SELECTING_ACTION
-        elif action == "day":
+        if action == 'day':
             _, _, year, month, day = parts
             selected_date = datetime.date(int(year), int(month), int(day))
             event_text = db.get(_get_event_key(chat_id, selected_date))
-            context.chat_data['selected_date'] = selected_date.isoformat()
-            keyboard = [[InlineKeyboardButton("Delete Event", callback_data=f"cal_delete_{selected_date.isoformat()}"), InlineKeyboardButton("Back to Calendar", callback_data="cal_back")]] if event_text else []
-            msg = f"🗓️ <b>Event on {selected_date:%B %d, %Y}</b>\n\n{event_text}\n\nReply to overwrite." if event_text else f"📝 No event for {selected_date:%B %d, %Y}. Reply with event text."
+            _get_calendar_sessions(context)[(chat_id, user.id)] = selected_date.isoformat()
+            keyboard = [[InlineKeyboardButton('Delete Event', callback_data=f'cal_delete_{selected_date.isoformat()}'), InlineKeyboardButton('Back to Calendar', callback_data='cal_back')]] if event_text else []
+            msg = (
+                f"🗓️ <b>Event on {selected_date:%B %d, %Y}</b>\n\n{event_text}\n\nReply to overwrite."
+                if event_text
+                else f"📝 No event for {selected_date:%B %d, %Y}. Reply with event text."
+            )
             await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None, parse_mode=ParseMode.HTML)
             return AWAITING_EVENT_TEXT
-        elif action == "delete":
+        if action == 'delete':
             date_str = parts[2]
             del db[_get_event_key(chat_id, datetime.date.fromisoformat(date_str))]
-            await query.answer("Event deleted!", show_alert=True)
-
-        elif action == "close":
+            await query.answer('Event deleted!', show_alert=True)
+        elif action == 'close':
             await query.message.delete()
             return ConversationHandler.END
 
         now = datetime.datetime.now()
-        await query.edit_message_text("📅 <b>Event Calendar</b>", reply_markup=generate_calendar_keyboard(now.year, now.month, chat_id), parse_mode=ParseMode.HTML)
+        await query.edit_message_text('📅 <b>Event Calendar</b>', reply_markup=generate_calendar_keyboard(now.year, now.month, chat_id), parse_mode=ParseMode.HTML)
         return SELECTING_ACTION
     except Exception as e:
         logging.error(f"Error in calendar interaction '{data}': {e}")
-        await query.answer("An error occurred.", show_alert=True)
+        await query.answer('An error occurred.', show_alert=True)
         return SELECTING_ACTION
+
 
 async def handle_event_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-    chat_member = await context.bot.get_chat_member(chat_id, user_id)
-    if chat_member.status not in ['administrator', 'creator']:
-        await update.message.reply_text("❌ Only administrators can add events.")
-        context.chat_data.pop('selected_date', None)
+    if not await user_is_admin(context, chat_id, user_id):
+        await update.message.reply_text('❌ Only administrators can add events.')
+        _get_calendar_sessions(context).pop((chat_id, user_id), None)
         return SELECTING_ACTION
 
-    selected_date_iso = context.chat_data.pop('selected_date', None)
+    selected_date_iso = _get_calendar_sessions(context).pop((chat_id, user_id), None)
     if not selected_date_iso:
-        await update.message.reply_text("Action timed out. Please select a date again.")
+        await update.message.reply_text('Action timed out. Please select a date again.')
         return ConversationHandler.END
     selected_date = datetime.date.fromisoformat(selected_date_iso)
+    _track_chat(chat_id)
     db[_get_event_key(chat_id, selected_date)] = update.message.text
-    await update.message.reply_text(f"✅ Event for {selected_date:%B %d, %Y} scheduled!")
+    await update.message.reply_text(f'✅ Event for {selected_date:%B %d, %Y} scheduled!')
     now = datetime.datetime.now()
-    await update.message.reply_text("📅 <b>Event Calendar</b>", reply_markup=generate_calendar_keyboard(now.year, now.month, chat_id), parse_mode=ParseMode.HTML)
+    await update.message.reply_text('📅 <b>Event Calendar</b>', reply_markup=generate_calendar_keyboard(now.year, now.month, chat_id), parse_mode=ParseMode.HTML)
     return SELECTING_ACTION
+
 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text('Action cancelled.')
-    context.user_data.pop('target_chat_id', None)
+    _get_wallet_flows(context).pop(update.effective_user.id, None)
+    _get_calendar_sessions(context).pop((update.effective_chat.id, update.effective_user.id), None)
     return ConversationHandler.END
+
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query, data, user_id = update.callback_query, update.callback_query.data, update.callback_query.from_user.id
     await query.answer()
 
-    if data.startswith("score_"):
-        if user_id != int(data.split("_")[-1]):
-            await query.answer("❌ Only the requester can use these buttons.", show_alert=True)
-            return
-        score_params = context.user_data.get('score_params')
+    if data.startswith('score_'):
+        token = data.rsplit('_', 1)[-1]
+        score_params = _get_score_requests(context).get(token)
         if not score_params:
-            await query.edit_message_text("❌ Session expired. Please run /score again.")
+            await query.edit_message_text('❌ Session expired. Please run /score again.')
             return
-        await query.edit_message_text("🔍 Generating leaderboard...")
+        if user_id != score_params['requester_id']:
+            await query.answer('❌ Only the requester can use these buttons.', show_alert=True)
+            return
+        await query.edit_message_text('🔍 Generating leaderboard...')
         try:
-            result, error = await generate_leaderboard(context, **score_params)
-            if error: await query.edit_message_text(f"❌ {error}"); return
+            result, error = await generate_leaderboard(
+                context,
+                score_params['chat_id'],
+                score_params['start_date'],
+                score_params['end_date'],
+                score_params['start_str'],
+                score_params['end_str'],
+                score_params['export'],
+            )
+            if error:
+                await query.edit_message_text(f'❌ {error}')
+                return
             leaderboard_text, csv_data, raw_data = result
-            context.user_data['leaderboard_data'] = (leaderboard_text, csv_data, raw_data)
-            is_private = data.startswith("score_private_")
+            _get_score_results(context)[token] = {
+                'requester_id': user_id,
+                'chat_id': score_params['chat_id'],
+                'csv_data': csv_data,
+                'raw_data': raw_data,
+            }
+            is_private = data.startswith('score_private_')
             target_chat_id = user_id if is_private else score_params['chat_id']
-            confirm_text = "✅ Leaderboard sent to your private chat!" if is_private else "✅ Leaderboard broadcasted!"
-            keyboard = [[InlineKeyboardButton("📄 Download CSV", callback_data=f"export_csv_{user_id}")]]
+            confirm_text = '✅ Leaderboard sent to your private chat!' if is_private else '✅ Leaderboard broadcasted!'
+            keyboard = [[InlineKeyboardButton('📄 Download CSV', callback_data=f'export_csv_{token}')]]
             sent_msg = await context.bot.send_message(target_chat_id, leaderboard_text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
-            # Store leaderboard data keyed by message ID so /airdrop can reference it via reply
             if not is_private:
-                if 'leaderboard_messages' not in context.chat_data:
-                    context.chat_data['leaderboard_messages'] = {}
-                context.chat_data['leaderboard_messages'][sent_msg.message_id] = raw_data
+                _get_leaderboard_messages(context)[(target_chat_id, sent_msg.message_id)] = raw_data
             if csv_data and score_params['export']:
-                await context.bot.send_document(target_chat_id, document=io.BytesIO(csv_data), filename="leaderboard.csv")
+                await context.bot.send_document(target_chat_id, document=io.BytesIO(csv_data), filename='leaderboard.csv')
+            _get_score_requests(context).pop(token, None)
             await query.edit_message_text(confirm_text)
         except Exception as e:
-            logging.error(f"Error in leaderboard generation: {e}")
-            await query.edit_message_text("⚠️ An error occurred during generation.")
+            logging.error(f'Error in leaderboard generation: {e}')
+            await query.edit_message_text('⚠️ An error occurred during generation.')
 
-    elif data.startswith("export_csv_"):
-        if user_id != int(data.split("_")[-1]):
-            await query.answer("❌ Only the requester can download the CSV.", show_alert=True)
-            return
-
-        leaderboard_data = context.user_data.get('leaderboard_data')
+    elif data.startswith('export_csv_'):
+        token = data.rsplit('_', 1)[-1]
+        leaderboard_data = _get_score_results(context).get(token)
         if not leaderboard_data:
-            await query.answer("❌ Leaderboard data has expired. Please run /score again.", show_alert=True)
+            await query.answer('❌ Leaderboard data has expired. Please run /score again.', show_alert=True)
+            return
+        if user_id != leaderboard_data['requester_id']:
+            await query.answer('❌ Only the requester can download the CSV.', show_alert=True)
             return
 
-        _, csv_data, raw_data = leaderboard_data
-
+        csv_data = leaderboard_data['csv_data']
+        raw_data = leaderboard_data['raw_data']
         if not csv_data:
-            score_params = context.user_data.get('score_params', {})
-            chat_id = score_params.get('chat_id', query.message.chat.id)
-            csv_data = await generate_csv_from_leaderboard(raw_data, chat_id)
+            csv_data = await generate_csv_from_leaderboard(raw_data, leaderboard_data['chat_id'])
+            leaderboard_data['csv_data'] = csv_data
 
         if csv_data:
-            await context.bot.send_document(chat_id=user_id, document=io.BytesIO(csv_data), filename="leaderboard_export.csv", caption="Here is your leaderboard CSV export.")
-            await query.answer("✅ CSV sent to your private chat.", show_alert=True)
+            await context.bot.send_document(chat_id=user_id, document=io.BytesIO(csv_data), filename='leaderboard_export.csv', caption='Here is your leaderboard CSV export.')
+            await query.answer('✅ CSV sent to your private chat.', show_alert=True)
         else:
-            await query.answer("❌ Could not generate CSV data.", show_alert=True)
+            await query.answer('❌ Could not generate CSV data.', show_alert=True)
+
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logging.error("Exception while handling an update:", exc_info=context.error)
@@ -1918,6 +1710,10 @@ async def setup_bot_commands(application):
         BotCommand("cancel", "Cancel current operation")
     ]
     await application.bot.set_my_commands(commands)
+
+async def shutdown_services(application):
+    await close_shared_async_client()
+
 
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -1980,6 +1776,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_message))
     application.add_error_handler(error_handler)
     application.post_init = setup_bot_commands
+    application.post_shutdown = shutdown_services
 
     def handle_signal(signum, frame):
         logging.info("Shutdown signal received, stopping bot.")
