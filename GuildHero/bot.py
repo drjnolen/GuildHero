@@ -830,7 +830,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         try:
             target_chat_id = int(context.args[0].split('_')[1])
-            logging.info(f"Wallet flow initiated for user {user_id} and chat {target_chat_id}")
+            logging.info(f"Wallet flow requested for user {user_id} and chat {target_chat_id}")
         except (IndexError, ValueError) as e:
             logging.error(f"Invalid wallet start link from user {user_id}: {e}")
             await update.message.reply_text("Invalid start link. Please use the button from a group chat.")
