@@ -830,7 +830,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         try:
             target_chat_id = int(context.args[0].split('_')[1])
-            _get_wallet_flows(context)[user_id] = target_chat_id
             logging.info(f"Wallet flow initiated for user {user_id} and chat {target_chat_id}")
         except (IndexError, ValueError) as e:
             logging.error(f"Invalid wallet start link from user {user_id}: {e}")
@@ -843,6 +842,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_name = chat_info.title or f"Group (ID: {target_chat_id})"
 
             if wallet_data:
+                _get_wallet_flows(context)[user_id] = target_chat_id
                 await update.message.reply_text(
                     f"You have a wallet submitted for *{escape_markdown(chat_name)}*:\n\n"
                     f"`{wallet_data['wallet_address']}`\n\n"
@@ -851,6 +851,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 logging.info(f"Existing wallet found for user {user_id} in chat {target_chat_id}")
             else:
+                _get_wallet_flows(context)[user_id] = target_chat_id
                 await update.message.reply_text(
                     f"Please reply to this message with your SUI wallet address to submit it for the group: *{escape_markdown(chat_name)}*",
                     parse_mode='MarkdownV2'

@@ -23,10 +23,10 @@ class TelegramUtilsTests(unittest.TestCase):
 
     def test_sanitize_html_for_telegram_strips_unsupported_tags_and_unsafe_links(self):
         text = '<div>Hello</div><script>alert(1)</script><a href="javascript:alert(1)">bad</a><a href="https://example.com">ok</a>'
-        self.assertEqual(
-            sanitize_html_for_telegram(text),
-            'Helloalert(1)bad<a href="https://example.com">ok</a>',
-        )
+        result = sanitize_html_for_telegram(text)
+        self.assertEqual(result, 'Helloalert(1)bad<a href="https://example.com">ok</a>')
+        self.assertIn('bad', result)
+        self.assertNotIn('javascript:', result)
 
 
 if __name__ == "__main__":

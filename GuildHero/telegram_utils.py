@@ -107,4 +107,5 @@ def normalize_wallet_address(wallet_address: str) -> str | None:
     candidate = (wallet_address or "").strip()
     if not _SUI_ADDRESS_REGEX.fullmatch(candidate):
         return None
-    return f"0x{candidate.removeprefix('0x').lower()}"
+    hex_portion = candidate[2:] if candidate.startswith("0x") else candidate
+    return f"0x{hex_portion.lower()}"
