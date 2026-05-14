@@ -109,14 +109,21 @@ To enable airdrops:
 
 ## Architecture
 
-The bot is a single-file Python application using:
+The bot uses a small modular Python layout:
+- `main.py` — repository-root entrypoint
+- `GuildHero/bot.py` — Telegram command handlers and bot wiring
+- `GuildHero/ai_services.py` — OpenAI-powered scoring, summaries, vibe checks, and copypasta generation
+- `GuildHero/telegram_utils.py` — shared help text, admin checks, HTML sanitization, and wallet validation
+- `GuildHero/db.py` — PostgreSQL-backed key-value storage plus normalized message storage
+
+Core integrations:
 - **python-telegram-bot** — Telegram Bot API framework
 - **OpenAI GPT-3.5** — AI-powered chat analysis and content generation
-- **PostgreSQL** — Persistent key-value storage (via `psycopg2`)
+- **PostgreSQL** — Persistent bot state plus normalized message history storage
 - **CoinGecko API** — Real-time cryptocurrency price data
 - **SUI JSON-RPC** — Blockchain token transfers for airdrops
 - **PyNaCl** — Ed25519 signing for SUI transactions
-- **httpx** — Async HTTP client for API calls
+- **httpx** — Async HTTP client for external API calls
 
 ## License
 
