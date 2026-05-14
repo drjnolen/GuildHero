@@ -82,14 +82,32 @@ BADGES = {
 # --- CoinGecko API ---
 COINGECKO_API_URL = "https://api.coingecko.com/api/v3"
 SUI_PRICE_ALIASES = {
+    "afsui": "aftermath-staked-sui",
+    "blub": "blub",
+    "buck": "bucket-protocol",
+    "cetus": "cetus-protocol",
     "sui": "sui",
     "deep": "deepbook-protocol",
     "deepbook": "deepbook-protocol",
+    "fud": "fud-the-pug",
+    "hasui": "haedal-staked-sui",
+    "hippo": "sudeng",
+    "navx": "navi-protocol",
     "wal": "walrus-2",
     "walrus": "walrus-2",
-    "ns": "sui-name-service",
-    "suins": "sui-name-service",
-    "suinameservice": "sui-name-service",
+    "ns": "ns-protocol",
+    "sca": "scallop-2",
+    "sol": "solana",
+    "sudeng": "sudeng",
+    "suins": "ns-protocol",
+    "turbos": "turbos-finance",
+    "usdc": "usd-coin",
+    "usdt": "tether",
+    "vsui": "volo-staked-sui",
+    "wbtc": "wrapped-bitcoin",
+    "weth": "ethereum",
+    "wusdc": "usd-coin",
+    "wusdt": "tether",
 }
 
 # --- SUI Blockchain ---
