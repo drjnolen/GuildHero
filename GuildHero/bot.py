@@ -81,6 +81,45 @@ BADGES = {
 
 # --- CoinGecko API ---
 COINGECKO_API_URL = "https://api.coingecko.com/api/v3"
+COINGECKO_CANDIDATE_FALLBACK_RANK = 10_000
+COINGECKO_SCORE_PREFERRED_ALIAS = 1000
+COINGECKO_SCORE_EXACT_SYMBOL_MATCH = 500
+COINGECKO_SCORE_EXACT_NAME_MATCH = 450
+COINGECKO_SCORE_EXACT_ID_MATCH = 400
+COINGECKO_SCORE_SUI_PLATFORM_MATCH = 300
+COINGECKO_SCORE_PARTIAL_SYMBOL_MATCH = 100
+COINGECKO_SCORE_PARTIAL_NAME_MATCH = 75
+COINGECKO_SCORE_PARTIAL_ID_MATCH = 50
+COINGECKO_SCORE_SEARCH_ORDER_BONUS = 20
+COINGECKO_SCORE_MARKET_CAP_BONUS = 125
+SUI_PRICE_ALIASES = {
+    "afsui": "aftermath-staked-sui",
+    "blub": "blub",
+    "buck": "bucket-protocol",
+    "cetus": "cetus-protocol",
+    "sui": "sui",
+    "deep": "deepbook-protocol",
+    "deepbook": "deepbook-protocol",
+    "fud": "fud-the-pug",
+    "hasui": "haedal-staked-sui",
+    "hippo": "sudeng",
+    "navx": "navi-protocol",
+    "wal": "walrus-2",
+    "walrus": "walrus-2",
+    "ns": "ns-protocol",
+    "sca": "scallop-2",
+    "sol": "solana",
+    "sudeng": "sudeng",
+    "suins": "ns-protocol",
+    "turbos": "turbos-finance",
+    "usdc": "usd-coin",
+    "usdt": "tether",
+    "vsui": "volo-staked-sui",
+    "wbtc": "wrapped-bitcoin",
+    "weth": "ethereum",
+    "wusdc": "usd-coin",
+    "wusdt": "tether",
+}
 
 # --- SUI Blockchain ---
 SUI_RPC_URL = os.environ.get("SUI_RPC_URL", "https://fullnode.mainnet.sui.io:443")
@@ -504,6 +543,9 @@ async def fetch_crypto_price(symbol: str) -> dict | None:
     """Fetches cryptocurrency price data from CoinGecko free API."""
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
+            normalized_query = re.sub(r"[^a-z0-9]+", "", symbol.lower())
+            preferred_coin_id = SUI_PRICE_ALIASES.get(normalized_query)
+
             # First search for the coin by symbol
             search_resp = await client.get(
                 f"{COINGECKO_API_URL}/search",
@@ -512,13 +554,109 @@ async def fetch_crypto_price(symbol: str) -> dict | None:
             search_resp.raise_for_status()
             coins = search_resp.json().get("coins", [])
 
-            if not coins:
+            if not coins and not preferred_coin_id:
                 return None
 
-            # Use the first match
-            coin_id = coins[0]["id"]
-            coin_name = coins[0]["name"]
-            coin_symbol = coins[0]["symbol"].upper()
+            candidates = []
+            seen_coin_ids = set()
+
+            def _add_unique_candidate(coin_id: str | None, search_coin: dict | None = None, search_index: int | None = None):
+                if not coin_id or coin_id in seen_coin_ids:
+                    return
+                seen_coin_ids.add(coin_id)
+                candidates.append({
+                    "id": coin_id,
+                    "search_coin": search_coin or {},
+                    "search_index": search_index,
+                })
+
+            _add_unique_candidate(preferred_coin_id)
+            for index, coin in enumerate(coins[:10]):
+                _add_unique_candidate(coin.get("id"), coin, index)
+
+            async def _load_coin_details(candidate: dict) -> dict:
+                try:
+                    details_resp = await client.get(
+                        f"{COINGECKO_API_URL}/coins/{candidate['id']}",
+                        params={
+                            "localization": "false",
+                            "tickers": "false",
+                            "market_data": "false",
+                            "community_data": "false",
+                            "developer_data": "false",
+                            "sparkline": "false",
+                        }
+                    )
+                    details_resp.raise_for_status()
+                    candidate["details"] = details_resp.json()
+                except Exception:
+                    candidate["details"] = {}
+                return candidate
+
+            candidates = await asyncio.gather(*(_load_coin_details(candidate) for candidate in candidates))
+
+            def _normalize_coin_text(value: str | None) -> str:
+                return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
+
+            def _is_sui_coin(details: dict) -> bool:
+                if not details:
+                    return False
+                asset_platform_id = (details.get("asset_platform_id") or "").lower()
+                platforms = details.get("platforms") or {}
+                platform_names = {str(name).lower() for name in platforms.keys()}
+                return asset_platform_id == "sui" or "sui" in platform_names
+
+            def _calculate_market_cap_score(market_cap_rank: int | None) -> int:
+                if not isinstance(market_cap_rank, int) or market_cap_rank <= 0:
+                    return 0
+                return max(0, COINGECKO_SCORE_MARKET_CAP_BONUS - min(market_cap_rank, COINGECKO_SCORE_MARKET_CAP_BONUS))
+
+            def _candidate_sort_key(candidate: dict) -> tuple:
+                details = candidate.get("details") or {}
+                search_coin = candidate.get("search_coin") or {}
+                candidate_id = candidate["id"]
+                coin_symbol = details.get("symbol") or search_coin.get("symbol") or ""
+                coin_name = details.get("name") or search_coin.get("name") or ""
+                market_cap_rank = search_coin.get("market_cap_rank") or details.get("market_cap_rank")
+                search_index = candidate.get("search_index")
+
+                score = 0
+                if preferred_coin_id and candidate_id == preferred_coin_id:
+                    score += COINGECKO_SCORE_PREFERRED_ALIAS
+                if _normalize_coin_text(coin_symbol) == normalized_query:
+                    score += COINGECKO_SCORE_EXACT_SYMBOL_MATCH
+                if _normalize_coin_text(coin_name) == normalized_query:
+                    score += COINGECKO_SCORE_EXACT_NAME_MATCH
+                if _normalize_coin_text(candidate_id) == normalized_query:
+                    score += COINGECKO_SCORE_EXACT_ID_MATCH
+                if _is_sui_coin(details):
+                    score += COINGECKO_SCORE_SUI_PLATFORM_MATCH
+                if normalized_query and normalized_query in _normalize_coin_text(coin_symbol):
+                    score += COINGECKO_SCORE_PARTIAL_SYMBOL_MATCH
+                if normalized_query and normalized_query in _normalize_coin_text(coin_name):
+                    score += COINGECKO_SCORE_PARTIAL_NAME_MATCH
+                if normalized_query and normalized_query in _normalize_coin_text(candidate_id):
+                    score += COINGECKO_SCORE_PARTIAL_ID_MATCH
+                if search_index is not None:
+                    score += max(0, COINGECKO_SCORE_SEARCH_ORDER_BONUS - search_index)
+                score += _calculate_market_cap_score(market_cap_rank)
+
+                return (
+                    score,
+                    isinstance(market_cap_rank, int),
+                    -(market_cap_rank or COINGECKO_CANDIDATE_FALLBACK_RANK),
+                    -(COINGECKO_SCORE_SEARCH_ORDER_BONUS - search_index if search_index is not None else 0),
+                )
+
+            best_candidate = max(candidates, key=_candidate_sort_key, default=None)
+            if not best_candidate:
+                return None
+
+            best_details = best_candidate.get("details") or {}
+            best_search_coin = best_candidate.get("search_coin") or {}
+            coin_id = best_candidate["id"]
+            coin_name = best_details.get("name") or best_search_coin.get("name") or coin_id
+            coin_symbol = (best_details.get("symbol") or best_search_coin.get("symbol") or symbol).upper()
 
             # Fetch price data
             price_resp = await client.get(
@@ -933,7 +1071,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/allbadges - See all available badges.\n"
         "/copypasta - Create a copypasta based on your message history.\n\n"
         "<b>💰 Crypto</b>\n"
-        "/price &lt;symbol&gt; - Look up a cryptocurrency price.\n"
+        "/price &lt;symbol&gt; - Look up a cryptocurrency price (including SUI ecosystem tokens like SUI, DEEP, WAL, NS).\n"
         "/airdrop &lt;count&gt; &lt;amount&gt; - Airdrop tokens to top scorers (admin, reply to /score).\n"
         "/settoken &lt;coin_type&gt; - Set the airdrop token for this group (admin).\n\n"
         "<b>🗓️ Group Management</b>\n"
@@ -1356,7 +1494,7 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
             "Usage: /price &lt;symbol&gt;\n"
-            "Example: /price BTC or /price ethereum",
+            "Example: /price BTC, /price SUI, or /price DEEP",
             parse_mode=ParseMode.HTML
         )
         return
@@ -1369,7 +1507,7 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not price_data:
         await update.message.reply_text(
             f"❌ Could not find price data for <b>{html.escape(symbol.upper())}</b>. "
-            "Try the full name (e.g., 'bitcoin') or symbol (e.g., 'BTC').",
+            "Try the full name (e.g., 'bitcoin') or symbol (e.g., 'BTC', 'SUI', 'DEEP', 'WAL', 'NS').",
             parse_mode=ParseMode.HTML
         )
         return
@@ -1407,7 +1545,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/allbadges - See all available badges.\n"
         "/copypasta - Create a copypasta based on your message history.\n\n"
         "<b>💰 Crypto</b>\n"
-        "/price &lt;symbol&gt; - Look up a cryptocurrency price.\n"
+        "/price &lt;symbol&gt; - Look up a cryptocurrency price (including SUI ecosystem tokens like SUI, DEEP, WAL, NS).\n"
         "/airdrop &lt;count&gt; &lt;amount&gt; - Airdrop tokens to top scorers (admin, reply to /score).\n"
         "/settoken &lt;coin_type&gt; - Set the airdrop token for this group (admin).\n\n"
         "<b>🗓️ Group Management</b>\n"

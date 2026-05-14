@@ -10,7 +10,7 @@ An all-in-one Telegram community management and engagement bot built for crypto-
 - **/vibecheck** `<#>` `[topic]` — Sentiment analysis with bullish/bearish classification
 
 ### 💰 Crypto Tools
-- **/price** `<symbol>` — Live cryptocurrency price lookup with 24h change, market cap, and volume
+- **/price** `<symbol>` — Live cryptocurrency price lookup with 24h change, market cap, and volume, including SUI ecosystem tickers like SUI, DEEP, WAL, and NS
 - **/airdrop** `<count>` `<amount>` — Airdrop SUI tokens to top scorers by replying to a `/score` leaderboard (admin only)
 - **/settoken** `<coin_type>` — Set the airdrop token type for the group (admin only, default: `0x2::sui::SUI`)
 
