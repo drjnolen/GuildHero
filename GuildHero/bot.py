@@ -12,6 +12,7 @@ import csv
 import signal
 import sys
 import html
+import time
 from collections import defaultdict
 import pytz
 import httpx
@@ -92,6 +93,9 @@ COINGECKO_SCORE_PARTIAL_NAME_MATCH = 75
 COINGECKO_SCORE_PARTIAL_ID_MATCH = 50
 COINGECKO_SCORE_SEARCH_ORDER_BONUS = 20
 COINGECKO_SCORE_MARKET_CAP_BONUS = 125
+PRICE_CACHE_TTL = 60  # seconds – avoid repeated API hits for the same symbol
+_price_cache: dict[str, tuple[dict, float]] = {}
+
 SUI_PRICE_ALIASES = {
     "afsui": "aftermath-staked-sui",
     "blub": "blub",
@@ -540,106 +544,97 @@ async def sui_transfer_token(recipient: str, amount: int, coin_type: str) -> dic
 
 # --- Price Lookup ---
 async def fetch_crypto_price(symbol: str) -> dict | None:
-    """Fetches cryptocurrency price data from CoinGecko free API."""
+    """Fetches cryptocurrency price data from CoinGecko free API.
+
+    Optimised to use at most 2 API calls per unique symbol (1 for known SUI
+    aliases) and a 60-second in-memory cache to avoid 429 rate-limit errors
+    on the free CoinGecko tier.
+    """
+    cache_key = symbol.lower().strip()
+    cached = _price_cache.get(cache_key)
+    if cached:
+        result, ts = cached
+        if time.monotonic() - ts < PRICE_CACHE_TTL:
+            return result
+
+    result = None
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             normalized_query = re.sub(r"[^a-z0-9]+", "", symbol.lower())
             preferred_coin_id = SUI_PRICE_ALIASES.get(normalized_query)
 
-            # First search for the coin by symbol
-            search_resp = await client.get(
-                f"{COINGECKO_API_URL}/search",
-                params={"query": symbol}
-            )
-            search_resp.raise_for_status()
-            coins = search_resp.json().get("coins", [])
+            search_coin_map: dict[str, tuple[dict, int]] = {}
 
-            if not coins and not preferred_coin_id:
+            if preferred_coin_id:
+                # Known alias – skip the search entirely
+                coin_ids = [preferred_coin_id]
+            else:
+                # Search for the coin by symbol/name
+                search_resp = await client.get(
+                    f"{COINGECKO_API_URL}/search",
+                    params={"query": symbol}
+                )
+                search_resp.raise_for_status()
+                coins = search_resp.json().get("coins", [])
+
+                if not coins:
+                    return None
+
+                coin_ids = [coin["id"] for coin in coins[:10]]
+                search_coin_map = {coin["id"]: (coin, i) for i, coin in enumerate(coins[:10])}
+
+            # Single batch call replaces N×/coins/{id} + /simple/price
+            markets_resp = await client.get(
+                f"{COINGECKO_API_URL}/coins/markets",
+                params={
+                    "vs_currency": "usd",
+                    "ids": ",".join(coin_ids),
+                    "price_change_percentage": "24h",
+                    "order": "market_cap_desc",
+                    "per_page": str(len(coin_ids)),
+                    "page": "1",
+                }
+            )
+            markets_resp.raise_for_status()
+            markets: list[dict] = markets_resp.json()
+
+            if not markets:
                 return None
 
-            candidates = []
-            seen_coin_ids = set()
+            def _normalize(v: str | None) -> str:
+                return re.sub(r"[^a-z0-9]+", "", (v or "").lower())
 
-            def _add_unique_candidate(coin_id: str | None, search_coin: dict | None = None, search_index: int | None = None):
-                if not coin_id or coin_id in seen_coin_ids:
-                    return
-                seen_coin_ids.add(coin_id)
-                candidates.append({
-                    "id": coin_id,
-                    "search_coin": search_coin or {},
-                    "search_index": search_index,
-                })
+            # Known SUI ecosystem coin IDs (for scoring, replaces platform API calls)
+            _sui_coin_ids = set(SUI_PRICE_ALIASES.values())
 
-            _add_unique_candidate(preferred_coin_id)
-            for index, coin in enumerate(coins[:10]):
-                _add_unique_candidate(coin.get("id"), coin, index)
-
-            async def _load_coin_details(candidate: dict) -> dict:
-                try:
-                    details_resp = await client.get(
-                        f"{COINGECKO_API_URL}/coins/{candidate['id']}",
-                        params={
-                            "localization": "false",
-                            "tickers": "false",
-                            "market_data": "false",
-                            "community_data": "false",
-                            "developer_data": "false",
-                            "sparkline": "false",
-                        }
-                    )
-                    details_resp.raise_for_status()
-                    candidate["details"] = details_resp.json()
-                except Exception:
-                    candidate["details"] = {}
-                return candidate
-
-            candidates = await asyncio.gather(*(_load_coin_details(candidate) for candidate in candidates))
-
-            def _normalize_coin_text(value: str | None) -> str:
-                return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
-
-            def _is_sui_coin(details: dict) -> bool:
-                if not details:
-                    return False
-                asset_platform_id = (details.get("asset_platform_id") or "").lower()
-                platforms = details.get("platforms") or {}
-                platform_names = {str(name).lower() for name in platforms.keys()}
-                return asset_platform_id == "sui" or "sui" in platform_names
-
-            def _calculate_market_cap_score(market_cap_rank: int | None) -> int:
-                if not isinstance(market_cap_rank, int) or market_cap_rank <= 0:
-                    return 0
-                return max(0, COINGECKO_SCORE_MARKET_CAP_BONUS - min(market_cap_rank, COINGECKO_SCORE_MARKET_CAP_BONUS))
-
-            def _candidate_sort_key(candidate: dict) -> tuple:
-                details = candidate.get("details") or {}
-                search_coin = candidate.get("search_coin") or {}
-                candidate_id = candidate["id"]
-                coin_symbol = details.get("symbol") or search_coin.get("symbol") or ""
-                coin_name = details.get("name") or search_coin.get("name") or ""
-                market_cap_rank = search_coin.get("market_cap_rank") or details.get("market_cap_rank")
-                search_index = candidate.get("search_index")
+            def _score(market: dict) -> tuple:
+                coin_id = market["id"]
+                coin_symbol = market.get("symbol") or ""
+                coin_name = market.get("name") or ""
+                market_cap_rank = market.get("market_cap_rank")
+                search_coin, search_index = search_coin_map.get(coin_id, ({}, None))
 
                 score = 0
-                if preferred_coin_id and candidate_id == preferred_coin_id:
+                if preferred_coin_id and coin_id == preferred_coin_id:
                     score += COINGECKO_SCORE_PREFERRED_ALIAS
-                if _normalize_coin_text(coin_symbol) == normalized_query:
+                if _normalize(coin_symbol) == normalized_query:
                     score += COINGECKO_SCORE_EXACT_SYMBOL_MATCH
-                if _normalize_coin_text(coin_name) == normalized_query:
+                if _normalize(coin_name) == normalized_query:
                     score += COINGECKO_SCORE_EXACT_NAME_MATCH
-                if _normalize_coin_text(candidate_id) == normalized_query:
+                if _normalize(coin_id) == normalized_query:
                     score += COINGECKO_SCORE_EXACT_ID_MATCH
-                if _is_sui_coin(details):
+                if coin_id in _sui_coin_ids:
                     score += COINGECKO_SCORE_SUI_PLATFORM_MATCH
-                if normalized_query and normalized_query in _normalize_coin_text(coin_symbol):
+                if normalized_query and normalized_query in _normalize(coin_symbol):
                     score += COINGECKO_SCORE_PARTIAL_SYMBOL_MATCH
-                if normalized_query and normalized_query in _normalize_coin_text(coin_name):
+                if normalized_query and normalized_query in _normalize(coin_name):
                     score += COINGECKO_SCORE_PARTIAL_NAME_MATCH
-                if normalized_query and normalized_query in _normalize_coin_text(candidate_id):
+                if normalized_query and normalized_query in _normalize(coin_id):
                     score += COINGECKO_SCORE_PARTIAL_ID_MATCH
                 if search_index is not None:
                     score += max(0, COINGECKO_SCORE_SEARCH_ORDER_BONUS - search_index)
-                score += _calculate_market_cap_score(market_cap_rank)
+                if isinstance(market_cap_rank, int) and market_cap_rank > 0:
+                    score += max(0, COINGECKO_SCORE_MARKET_CAP_BONUS - min(market_cap_rank, COINGECKO_SCORE_MARKET_CAP_BONUS))
 
                 return (
                     score,
@@ -648,44 +643,24 @@ async def fetch_crypto_price(symbol: str) -> dict | None:
                     -(COINGECKO_SCORE_SEARCH_ORDER_BONUS - search_index if search_index is not None else 0),
                 )
 
-            best_candidate = max(candidates, key=_candidate_sort_key, default=None)
-            if not best_candidate:
+            best = max(markets, key=_score, default=None)
+            if not best:
                 return None
 
-            best_details = best_candidate.get("details") or {}
-            best_search_coin = best_candidate.get("search_coin") or {}
-            coin_id = best_candidate["id"]
-            coin_name = best_details.get("name") or best_search_coin.get("name") or coin_id
-            coin_symbol = (best_details.get("symbol") or best_search_coin.get("symbol") or symbol).upper()
-
-            # Fetch price data
-            price_resp = await client.get(
-                f"{COINGECKO_API_URL}/simple/price",
-                params={
-                    "ids": coin_id,
-                    "vs_currencies": "usd",
-                    "include_24hr_change": "true",
-                    "include_market_cap": "true",
-                    "include_24hr_vol": "true"
-                }
-            )
-            price_resp.raise_for_status()
-            price_data = price_resp.json().get(coin_id, {})
-
-            if not price_data:
-                return None
-
-            return {
-                "name": coin_name,
-                "symbol": coin_symbol,
-                "price": price_data.get("usd", 0),
-                "change_24h": price_data.get("usd_24h_change", 0),
-                "market_cap": price_data.get("usd_market_cap", 0),
-                "volume_24h": price_data.get("usd_24h_vol", 0),
+            result = {
+                "name": best.get("name") or symbol,
+                "symbol": (best.get("symbol") or symbol).upper(),
+                "price": best.get("current_price") or 0,
+                "change_24h": best.get("price_change_percentage_24h") or 0,
+                "market_cap": best.get("market_cap") or 0,
+                "volume_24h": best.get("total_volume") or 0,
             }
     except Exception as e:
         logging.error(f"Error fetching price for {symbol}: {e}")
-        return None
+
+    if result is not None:
+        _price_cache[cache_key] = (result, time.monotonic())
+    return result
 
 
 def format_large_number(num):
