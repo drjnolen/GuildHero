@@ -512,7 +512,7 @@ async def sui_get_coins(owner: str, coin_type: str = None) -> dict:
     params = [owner]
     if coin_type:
         params.append(coin_type)
-    return await sui_rpc_call("suix_getCoins", params)
+    return await sui_rpc_call("suix_getCoins", params) or {}
 
 
 async def sui_get_total_balance(owner: str, coin_type: str) -> int:
