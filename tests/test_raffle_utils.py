@@ -24,7 +24,7 @@ class FakeRandom:
 
 
 class RaffleUtilsTests(unittest.TestCase):
-    def test_raffle_weights_favor_higher_ranks_without_excluding_lower_ranks(self):
+    def test_raffle_weights_decrease_with_rank(self):
         self.assertGreater(get_raffle_rank_weight(1), get_raffle_rank_weight(10))
         self.assertGreater(get_raffle_rank_weight(10), get_raffle_rank_weight(20))
         self.assertGreater(get_raffle_rank_weight(20), 0)

@@ -26,6 +26,9 @@ def select_weighted_raffle_winner(
         return None
 
     chooser = rng or random
-    weights = [get_raffle_rank_weight(candidate["rank"], max_rank=max_rank) for candidate in candidates]
+    try:
+        weights = [get_raffle_rank_weight(candidate["rank"], max_rank=max_rank) for candidate in candidates]
+    except KeyError as exc:
+        raise KeyError("Each raffle candidate must include a 'rank' value.") from exc
     winners = chooser.choices(candidates, weights=weights, k=1)
     return winners[0] if winners else None
