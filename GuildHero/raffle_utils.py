@@ -16,7 +16,7 @@ def select_weighted_raffle_winner(
     *,
     rng: random.Random | None = None,
     max_rank: int = RAFFLE_MAX_RANK,
-):
+) -> Mapping[str, object] | None:
     """Pick one candidate using rank-based weights.
 
     Each candidate must provide a ``rank`` key. Lower rank numbers receive a

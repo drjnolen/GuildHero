@@ -20,6 +20,8 @@ class FakeRandom:
         self.population = population
         self.weights = weights
         self.k = k
+        if not population:
+            return []
         return [population[1] if len(population) > 1 else population[0]]
 
 
