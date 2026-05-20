@@ -12,6 +12,7 @@ An all-in-one Telegram community management and engagement bot built for crypto-
 ### 💰 Crypto Tools
 - **/price** `<symbol>` — Live cryptocurrency price lookup with 24h change, market cap, and volume, including SUI ecosystem tickers like SUI, DEEP, WAL, and NS
 - **/airdrop** `<count>` `<amount>` — Airdrop SUI tokens to top scorers by replying to a `/score` leaderboard (admin only)
+- **/raffle** `<amount>` — Pick a weighted winner from the top 20 ranked wallets in a replied `/score` leaderboard and airdrop the prize (admin only)
 - **/setairdropwallet** — Configure an encrypted, per-group airdrop wallet in DM (admin only)
 - **/settoken** `<coin_type>` — Set the airdrop token type for the group (admin only, default: `0x2::sui::SUI`)
 
@@ -110,6 +111,10 @@ To enable airdrops:
    → Sends 1 SUI (1,000,000,000 MIST) to each of the top 10 users who have registered wallets.
    → Runs a preflight balance/gas check before sending.
    → Users without wallets are gracefully skipped.
+5. Admin can also reply with: /raffle 1000000000
+   → Selects one winner from the top 20 ranked users with registered wallets.
+   → Applies a slight weighting toward higher leaderboard ranks.
+   → Sends the configured token prize to the winner's wallet after preflight checks.
 ```
 
 ## Architecture
