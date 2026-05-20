@@ -734,6 +734,10 @@ def format_large_number(num):
     return f"${num:.2f}"
 
 
+def format_token_amount(amount: int) -> str:
+    return f"{amount:,}"
+
+
 # --- Calendar Feature Functions ---
 def generate_calendar_keyboard(year, month, chat_id):
     keyboard = []
@@ -1433,11 +1437,11 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     preflight_lines = [
         f"🪂 Starting airdrop of <code>{html.escape(coin_type)}</code> to {len(recipients_with_wallets)} users.",
         f"Sender: <code>{html.escape(_short_address(sender_config['wallet_address']))}</code> ({html.escape(sender_config['source'])})",
-        f"Preflight: SUI {preflight['available_sui_balance']} MIST available / {preflight['required_sui_balance']} MIST required",
+        f"Preflight: SUI {format_token_amount(preflight['available_sui_balance'])} MIST available / {format_token_amount(preflight['required_sui_balance'])} MIST required",
     ]
     if coin_type != DEFAULT_SUI_COIN_TYPE:
         preflight_lines.append(
-            f"Token preflight: {preflight['available_token_balance']} available / {preflight['required_token_balance']} required"
+            f"Token preflight: {format_token_amount(preflight['available_token_balance'])} available / {format_token_amount(preflight['required_token_balance'])} required"
         )
     await update.message.reply_text("\n".join(preflight_lines), parse_mode=ParseMode.HTML)
 
@@ -1691,7 +1695,7 @@ async def receive_airdrop_private_key(update: Update, context: ContextTypes.DEFA
     user_id = update.effective_user.id
     target_chat_id = _get_airdrop_wallet_flows(context).get(user_id)
     # Keep the DM flow active when validation/storage fails so the admin can retry without restarting from the group.
-    clear_flow = True
+    should_clear_flow = True
 
     if not target_chat_id:
         await update.message.reply_text('Error: Could not find the original group. Please start the process again from the group chat.')
@@ -1717,7 +1721,7 @@ async def receive_airdrop_private_key(update: Update, context: ContextTypes.DEFA
 
         normalized_private_key = normalize_sui_private_key(submitted_value)
         if not normalized_private_key:
-            clear_flow = False
+            should_clear_flow = False
             await update.message.reply_text(
                 '❌ Please send a valid SUI private key (64 hexadecimal characters, optionally prefixed with 0x), send <code>remove</code>, or type /cancel.',
                 parse_mode=ParseMode.HTML,
@@ -1734,12 +1738,12 @@ async def receive_airdrop_private_key(update: Update, context: ContextTypes.DEFA
         )
         logging.info(f'Configured airdrop wallet for chat {target_chat_id} by user {user_id}')
     except Exception as e:
-        clear_flow = False
+        should_clear_flow = False
         logging.error(f'Error storing airdrop wallet for chat {target_chat_id}: {e}')
         await update.message.reply_text(f'❌ Error storing the airdrop wallet: {html.escape(str(e))}', parse_mode=ParseMode.HTML)
         return AWAITING_AIRDROP_PRIVATE_KEY
     finally:
-        if clear_flow:
+        if should_clear_flow:
             _get_airdrop_wallet_flows(context).pop(user_id, None)
 
     return ConversationHandler.END
