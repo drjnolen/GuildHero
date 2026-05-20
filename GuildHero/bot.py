@@ -11,6 +11,7 @@ import csv
 import signal
 import sys
 import html
+import hashlib
 import time
 import uuid
 from collections import defaultdict
@@ -18,6 +19,16 @@ import pytz
 from ai_services import analyze_user_messages, summarize_chat_history, get_best_of_messages, get_vibe_check, generate_copypasta
 from db import db
 from http_clients import close_shared_async_client, get_shared_async_client
+from sui_utils import (
+    DEFAULT_SUI_COIN_TYPE as SUI_DEFAULT_COIN_TYPE,
+    build_airdrop_balance_requirements,
+    ENCRYPTION_KEY_ENV,
+    derive_sui_address,
+    encrypt_private_key,
+    get_sui_signing_key,
+    normalize_sui_private_key,
+    resolve_airdrop_sender_config,
+)
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -39,7 +50,7 @@ logging.basicConfig(
 )
 
 # Conversation states
-SELECTING_ACTION, AWAITING_EVENT_TEXT, AWAITING_WALLET = range(3)
+SELECTING_ACTION, AWAITING_EVENT_TEXT, AWAITING_WALLET, AWAITING_AIRDROP_PRIVATE_KEY = range(4)
 
 
 # --- Constants ---
@@ -108,7 +119,7 @@ SUI_PRICE_ALIASES = {
 
 # --- SUI Blockchain ---
 SUI_RPC_URL = os.environ.get("SUI_RPC_URL", "https://fullnode.mainnet.sui.io:443")
-DEFAULT_SUI_COIN_TYPE = "0x2::sui::SUI"
+DEFAULT_SUI_COIN_TYPE = SUI_DEFAULT_COIN_TYPE
 SUI_GAS_BUDGET = "50000000"  # 0.05 SUI
 
 
@@ -222,6 +233,11 @@ def _get_airdrop_token_key(chat_id):
     return f"airdrop_token:{chat_id}"
 
 
+def _get_airdrop_wallet_key(chat_id):
+    """Returns the database key for the group's encrypted airdrop wallet config."""
+    return f"airdrop_wallet:{chat_id}"
+
+
 def _track_chat(chat_id):
     db.enroll_chat(int(chat_id))
 
@@ -267,8 +283,18 @@ def _get_wallet_flows(context):
     return context.application.bot_data.setdefault('wallet_flows', {})
 
 
+def _get_airdrop_wallet_flows(context):
+    return context.application.bot_data.setdefault('airdrop_wallet_flows', {})
+
+
 def _get_leaderboard_messages(context):
     return context.application.bot_data.setdefault('leaderboard_messages', {})
+
+
+def _short_address(address: str | None) -> str:
+    if not address:
+        return "unknown"
+    return f"{address[:10]}...{address[-6:]}"
 
 def get_events_for_month(chat_id, year, month):
     event_dates = set()
@@ -365,6 +391,39 @@ def store_wallet_private(user_id, username, wallet_address):
     if not db.get(wallet_key): raise Exception("Failed to verify global wallet storage")
     return True
 
+
+def store_airdrop_wallet(chat_id, configured_by_user_id, private_key_hex):
+    normalized_private_key = normalize_sui_private_key(private_key_hex)
+    if not normalized_private_key:
+        raise ValueError("Please send a valid SUI private key (64 hexadecimal characters, optionally prefixed with 0x).")
+
+    wallet_address = derive_sui_address(normalized_private_key)
+    wallet_key = _get_airdrop_wallet_key(chat_id)
+    wallet_data = {
+        "wallet_address": wallet_address,
+        "encrypted_private_key": encrypt_private_key(normalized_private_key),
+        "configured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "configured_by_user_id": str(configured_by_user_id),
+    }
+    db[wallet_key] = wallet_data
+    if not db.get(wallet_key):
+        raise Exception("Failed to verify airdrop wallet storage")
+    return wallet_data
+
+
+def get_airdrop_wallet(chat_id):
+    return db.get(_get_airdrop_wallet_key(chat_id))
+
+
+def delete_airdrop_wallet(chat_id):
+    wallet_key = _get_airdrop_wallet_key(chat_id)
+    if wallet_key in db:
+        del db[wallet_key]
+
+
+def resolve_airdrop_sender(chat_id):
+    return resolve_airdrop_sender_config(get_airdrop_wallet(chat_id), os.environ.get("SUI_PRIVATE_KEY"))
+
 def get_messages_by_date_range(chat_id, start_date, end_date):
     """Get messages from normalized storage, lazily migrating legacy chat blobs."""
     _ensure_messages_migrated(chat_id)
@@ -434,35 +493,50 @@ async def sui_get_coins(owner: str, coin_type: str = None) -> dict:
     params = [owner]
     if coin_type:
         params.append(coin_type)
-    return await sui_rpc_call("suix_getCoins", params)
+    return await sui_rpc_call("suix_getCoins", params) or {}
 
 
-async def sui_transfer_token(recipient: str, amount: int, coin_type: str) -> dict | None:
+async def sui_get_total_balance(owner: str, coin_type: str) -> int:
+    coins_result = await sui_get_coins(owner, coin_type)
+    return sum(int(coin.get("balance", 0)) for coin in coins_result.get("data", []))
+
+
+async def preflight_airdrop(sender_address: str, recipient_count: int, amount: int, coin_type: str) -> dict:
+    requirements = build_airdrop_balance_requirements(recipient_count, amount, coin_type, int(SUI_GAS_BUDGET))
+    required_token_balance = requirements["required_token_balance"]
+    required_sui_balance = requirements["required_sui_balance"]
+
+    available_sui_balance = await sui_get_total_balance(sender_address, DEFAULT_SUI_COIN_TYPE)
+    available_token_balance = available_sui_balance if coin_type == DEFAULT_SUI_COIN_TYPE else await sui_get_total_balance(sender_address, coin_type)
+
+    if available_token_balance < required_token_balance:
+        raise ValueError(
+            f"Insufficient token balance in sender wallet. Need {required_token_balance}, have {available_token_balance}."
+        )
+    if available_sui_balance < required_sui_balance:
+        raise ValueError(
+            f"Insufficient SUI balance for transfers and gas. Need {required_sui_balance}, have {available_sui_balance}."
+        )
+
+    return {
+        "available_sui_balance": available_sui_balance,
+        "available_token_balance": available_token_balance,
+        "required_sui_balance": required_sui_balance,
+        "required_token_balance": required_token_balance,
+    }
+
+
+async def sui_transfer_token(recipient: str, amount: int, coin_type: str, sender_private_key_hex: str) -> dict | None:
     """Builds, signs, and executes a SUI token transfer.
 
     Uses the SUI `unsafe_paySui` (for native SUI) or `unsafe_pay` (for other coins)
     RPC methods to build a transaction, then signs and executes it.
-
-    Requires SUI_PRIVATE_KEY environment variable (hex-encoded Ed25519 private key).
     """
-    import hashlib
-    from nacl.signing import SigningKey
     import base64
 
-    private_key_hex = os.environ.get("SUI_PRIVATE_KEY")
-    if not private_key_hex:
-        raise ValueError("SUI_PRIVATE_KEY environment variable not set")
-
-    # Derive the sender address from the private key
-    try:
-        signing_key = SigningKey(bytes.fromhex(private_key_hex))
-    except (ValueError, Exception) as e:
-        raise ValueError("Invalid SUI_PRIVATE_KEY format. Expected 64 hex characters (32-byte Ed25519 key).") from e
+    signing_key = get_sui_signing_key(sender_private_key_hex)
     public_key = signing_key.verify_key.encode()
-
-    # SUI address = blake2b(flag_byte + pubkey)[0:32], hex-encoded with 0x prefix
-    addr_hash = hashlib.blake2b(b'\x00' + public_key, digest_size=32).digest()
-    sender_address = "0x" + addr_hash.hex()
+    sender_address = derive_sui_address(sender_private_key_hex)
 
     is_sui = coin_type == "0x2::sui::SUI"
 
@@ -660,6 +734,10 @@ def format_large_number(num):
     return f"${num:.2f}"
 
 
+def format_token_amount(amount: int) -> str:
+    return f"{amount:,}"
+
+
 # --- Calendar Feature Functions ---
 def generate_calendar_keyboard(year, month, chat_id):
     keyboard = []
@@ -825,9 +903,10 @@ async def generate_csv_from_leaderboard(leaderboard_data, chat_id):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the /start command, used for deep-linking and showing help."""
     logging.info(f"Start command received from user {update.effective_user.id} with args: {context.args}")
+    # Shared across the wallet and airdrop-wallet deep-link flows below.
+    user_id = update.effective_user.id
 
     if context.args and context.args[0].startswith('wallet_'):
-        user_id = update.effective_user.id
         try:
             target_chat_id = int(context.args[0].split('_')[1])
             logging.info(f"Wallet flow requested for user {user_id} and chat {target_chat_id}")
@@ -860,6 +939,49 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return AWAITING_WALLET
         except Exception as e:
             logging.error(f"Error in wallet flow for user {user_id}: {e}")
+            await update.message.reply_text("There was an error accessing the group information. Please try again from the group chat.")
+            return ConversationHandler.END
+
+    if context.args and context.args[0].startswith('airdropwallet_'):
+        try:
+            target_chat_id = int(context.args[0].split('_')[1])
+            logging.info(f"Airdrop wallet flow requested for user {user_id} and chat {target_chat_id}")
+        except (IndexError, ValueError) as e:
+            logging.error(f"Invalid airdrop wallet start link from user {user_id}: {e}")
+            await update.message.reply_text("Invalid start link. Please use the button from your group chat.")
+            return ConversationHandler.END
+
+        try:
+            if not await user_is_admin(context, target_chat_id, user_id):
+                await update.message.reply_text("❌ Only group administrators can configure that group's airdrop wallet.")
+                return ConversationHandler.END
+
+            wallet_data = await asyncio.to_thread(get_airdrop_wallet, target_chat_id)
+            chat_info = await context.bot.get_chat(target_chat_id)
+            chat_name = chat_info.title or f"Group (ID: {target_chat_id})"
+            _get_airdrop_wallet_flows(context)[user_id] = target_chat_id
+
+            if wallet_data:
+                await update.message.reply_text(
+                    (
+                        f"🔐 <b>{html.escape(chat_name)}</b> already has an airdrop wallet configured.\n\n"
+                        f"Current sender address: <code>{html.escape(wallet_data.get('wallet_address', 'unknown'))}</code>\n\n"
+                        "Reply with a new SUI private key to replace it, or send <code>remove</code> to delete it."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await update.message.reply_text(
+                    (
+                        f"🔐 Send the SUI private key for <b>{html.escape(chat_name)}</b> in this DM.\n\n"
+                        "The key will be encrypted before it is stored, and only decrypted in memory when signing airdrops.\n"
+                        "Send <code>remove</code> if you want to clear an existing group wallet instead."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            return AWAITING_AIRDROP_PRIVATE_KEY
+        except Exception as e:
+            logging.error(f"Error in airdrop wallet flow for user {user_id}: {e}")
             await update.message.reply_text("There was an error accessing the group information. Please try again from the group chat.")
             return ConversationHandler.END
 
@@ -1172,6 +1294,51 @@ async def settoken_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def setairdropwallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allows admins to configure an encrypted, per-group airdrop wallet in DM."""
+    if not await require_admin(update, context):
+        return
+
+    _track_chat(update.effective_chat.id)
+    existing_wallet = await asyncio.to_thread(get_airdrop_wallet, update.effective_chat.id)
+    existing_wallet_text = (
+        f"Current group sender: <code>{html.escape(existing_wallet['wallet_address'])}</code>\n\n"
+        if existing_wallet and existing_wallet.get("wallet_address")
+        else ""
+    )
+
+    if not os.environ.get(ENCRYPTION_KEY_ENV):
+        await update.message.reply_text(
+            (
+                "❌ Secure per-group airdrop wallets are not enabled yet.\n\n"
+                f"The bot operator must set <code>{html.escape(ENCRYPTION_KEY_ENV)}</code> to a 32-byte hex key first."
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        bot_username = context.bot.username
+        if not bot_username:
+            bot_info = await context.bot.get_me()
+            bot_username = bot_info.username
+
+        chat_id = update.effective_chat.id
+        keyboard = [[InlineKeyboardButton('🔐 Configure Group Airdrop Wallet', url=f'https://t.me/{bot_username}?start=airdropwallet_{chat_id}')]]
+        await update.message.reply_text(
+            (
+                f"{existing_wallet_text}"
+                "To protect the private key, continue in a private chat with me.\n"
+                "Only group admins can set or replace the group's airdrop wallet."
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    except Exception as e:
+        logging.error(f'Error starting airdrop wallet flow for chat {update.effective_chat.id}: {e}')
+        await update.message.reply_text('There was an error generating the secure setup link. Please try again.')
+
+
 async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Airdrops tokens to top users from a /score leaderboard via SUI blockchain.
 
@@ -1224,25 +1391,15 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('❌ The replied message is not a recognized leaderboard. Please reply to a leaderboard broadcasted by /score.')
         return
 
-    if not os.environ.get('SUI_PRIVATE_KEY'):
-        await update.message.reply_text('❌ SUI airdrop is not configured. The bot operator must set the SUI_PRIVATE_KEY environment variable.')
-        return
-
     coin_type = db.get(_get_airdrop_token_key(chat_id), DEFAULT_SUI_COIN_TYPE)
     top_entries = leaderboard[:count]
     if not top_entries:
         await update.message.reply_text('❌ No eligible users found in the leaderboard.')
         return
 
-    await update.message.reply_text(
-        f"🪂 Starting airdrop of <code>{html.escape(coin_type)}</code> to the top {len(top_entries)} users from the leaderboard...",
-        parse_mode=ParseMode.HTML,
-    )
-
     results = []
-    success_count = 0
+    recipients_with_wallets = []
     skip_count = 0
-    fail_count = 0
 
     for username, _metrics, _message_count, user_id_str in top_entries:
         safe_username = html.escape(username)
@@ -1251,10 +1408,50 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             results.append(f'⏭️ @{safe_username}: No wallet registered — skipped')
             skip_count += 1
             continue
+        recipients_with_wallets.append((username, wallet_data['wallet_address']))
 
-        wallet_address = wallet_data['wallet_address']
+    if not recipients_with_wallets:
+        await update.message.reply_text('❌ None of the selected leaderboard users have wallets registered.')
+        return
+
+    try:
+        sender_config = await asyncio.to_thread(resolve_airdrop_sender, chat_id)
+    except Exception as e:
+        logging.error(f'Failed to resolve airdrop sender for chat {chat_id}: {e}')
+        await update.message.reply_text(f'❌ {html.escape(str(e))}', parse_mode=ParseMode.HTML)
+        return
+
+    if not sender_config:
+        await update.message.reply_text(
+            '❌ No airdrop wallet is configured for this group. Use /setairdropwallet, or configure the legacy SUI_PRIVATE_KEY fallback.',
+        )
+        return
+
+    try:
+        preflight = await preflight_airdrop(sender_config['wallet_address'], len(recipients_with_wallets), amount, coin_type)
+    except Exception as e:
+        logging.error(f'Airdrop preflight failed for chat {chat_id}: {e}')
+        await update.message.reply_text(f'❌ Airdrop preflight failed: {html.escape(str(e))}', parse_mode=ParseMode.HTML)
+        return
+
+    preflight_lines = [
+        f"🪂 Starting airdrop of <code>{html.escape(coin_type)}</code> to {len(recipients_with_wallets)} users.",
+        f"Sender: <code>{html.escape(_short_address(sender_config['wallet_address']))}</code> ({html.escape(sender_config['source'])})",
+        f"Preflight: SUI {format_token_amount(preflight['available_sui_balance'])} MIST available / {format_token_amount(preflight['required_sui_balance'])} MIST required",
+    ]
+    if coin_type != DEFAULT_SUI_COIN_TYPE:
+        preflight_lines.append(
+            f"Token preflight: {format_token_amount(preflight['available_token_balance'])} available / {format_token_amount(preflight['required_token_balance'])} required"
+        )
+    await update.message.reply_text("\n".join(preflight_lines), parse_mode=ParseMode.HTML)
+
+    success_count = 0
+    fail_count = 0
+
+    for username, wallet_address in recipients_with_wallets:
+        safe_username = html.escape(username)
         try:
-            tx_result = await sui_transfer_token(wallet_address, amount, coin_type)
+            tx_result = await sui_transfer_token(wallet_address, amount, coin_type, sender_config['private_key_hex'])
             tx_digest = tx_result.get('digest', 'unknown')
             results.append(f'✅ @{safe_username}: <code>{tx_digest}</code>')
             success_count += 1
@@ -1492,6 +1689,66 @@ async def wallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('There was an error generating the wallet submission link. Please try again.')
 
 
+async def receive_airdrop_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receives, encrypts, and stores the group's airdrop private key."""
+    submitted_value = update.message.text.strip()
+    user_id = update.effective_user.id
+    target_chat_id = _get_airdrop_wallet_flows(context).get(user_id)
+    # Keep the DM flow active when validation/storage fails so the admin can retry without restarting from the group.
+    should_clear_flow = True
+
+    if not target_chat_id:
+        await update.message.reply_text('Error: Could not find the original group. Please start the process again from the group chat.')
+        logging.error(f'Missing airdrop target_chat_id for user {user_id}')
+        return ConversationHandler.END
+
+    try:
+        chat_info = await context.bot.get_chat(target_chat_id)
+        chat_name = chat_info.title or f'Group (ID: {target_chat_id})'
+        try:
+            await update.message.delete()
+        except Exception:
+            logging.warning('Could not delete private key submission message for user %s', user_id)
+
+        if submitted_value.lower() == 'remove':
+            await asyncio.to_thread(delete_airdrop_wallet, target_chat_id)
+            await update.message.reply_text(
+                f"🗑️ Removed the stored airdrop wallet for <b>{html.escape(chat_name)}</b>.",
+                parse_mode=ParseMode.HTML,
+            )
+            logging.info(f'Removed airdrop wallet for chat {target_chat_id} by user {user_id}')
+            return ConversationHandler.END
+
+        normalized_private_key = normalize_sui_private_key(submitted_value)
+        if not normalized_private_key:
+            should_clear_flow = False
+            await update.message.reply_text(
+                '❌ Please send a valid SUI private key (64 hexadecimal characters, optionally prefixed with 0x), send <code>remove</code>, or type /cancel.',
+                parse_mode=ParseMode.HTML,
+            )
+            return AWAITING_AIRDROP_PRIVATE_KEY
+
+        wallet_data = await asyncio.to_thread(store_airdrop_wallet, target_chat_id, user_id, normalized_private_key)
+        await update.message.reply_text(
+            (
+                f"✅ Stored an encrypted airdrop wallet for <b>{html.escape(chat_name)}</b>.\n\n"
+                f"Derived sender address: <code>{html.escape(wallet_data['wallet_address'])}</code>"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        logging.info(f'Configured airdrop wallet for chat {target_chat_id} by user {user_id}')
+    except Exception as e:
+        should_clear_flow = False
+        logging.error(f'Error storing airdrop wallet for chat {target_chat_id}: {e}')
+        await update.message.reply_text(f'❌ Error storing the airdrop wallet: {html.escape(str(e))}', parse_mode=ParseMode.HTML)
+        return AWAITING_AIRDROP_PRIVATE_KEY
+    finally:
+        if should_clear_flow:
+            _get_airdrop_wallet_flows(context).pop(user_id, None)
+
+    return ConversationHandler.END
+
+
 async def receive_wallet_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Receives and validates the wallet address from the user."""
     submitted_wallet = update.message.text.strip()
@@ -1607,6 +1864,7 @@ async def handle_event_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text('Action cancelled.')
     _get_wallet_flows(context).pop(update.effective_user.id, None)
+    _get_airdrop_wallet_flows(context).pop(update.effective_user.id, None)
     _get_calendar_sessions(context).pop((update.effective_chat.id, update.effective_user.id), None)
     return ConversationHandler.END
 
@@ -1698,6 +1956,7 @@ async def setup_bot_commands(application):
         BotCommand("copypasta", "Generate a copypasta of your history"),
         BotCommand("price", "Crypto price: /price <symbol>"),
         BotCommand("airdrop", "Airdrop tokens: reply to /score with /airdrop <count> <amount>"),
+        BotCommand("setairdropwallet", "Set this group's encrypted airdrop wallet (admin)"),
         BotCommand("settoken", "Set airdrop token (admin)"),
         BotCommand("mybadges", "View your earned badges"),
         BotCommand("allbadges", "See all available badges"),
@@ -1745,6 +2004,7 @@ def main():
         entry_points=[CommandHandler('start', start_command)],
         states={
             AWAITING_WALLET: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_wallet_address)],
+            AWAITING_AIRDROP_PRIVATE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_airdrop_private_key)],
         },
         fallbacks=[CommandHandler('cancel', cancel_conversation)],
         per_message=False,
@@ -1762,6 +2022,7 @@ def main():
     application.add_handler(CommandHandler("copypasta", copypasta_command))
     application.add_handler(CommandHandler("price", price_command))
     application.add_handler(CommandHandler("airdrop", airdrop_command))
+    application.add_handler(CommandHandler("setairdropwallet", setairdropwallet_command))
     application.add_handler(CommandHandler("settoken", settoken_command))
     application.add_handler(CommandHandler("setwelcome", setwelcome_command))
     application.add_handler(CommandHandler("help", help_command))
