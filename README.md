@@ -12,6 +12,7 @@ An all-in-one Telegram community management and engagement bot built for crypto-
 ### 💰 Crypto Tools
 - **/price** `<symbol>` — Live cryptocurrency price lookup with 24h change, market cap, and volume, including SUI ecosystem tickers like SUI, DEEP, WAL, and NS
 - **/airdrop** `<count>` `<amount>` — Airdrop SUI tokens to top scorers by replying to a `/score` leaderboard (admin only)
+- **/setairdropwallet** — Configure an encrypted, per-group airdrop wallet in DM (admin only)
 - **/settoken** `<coin_type>` — Set the airdrop token type for the group (admin only, default: `0x2::sui::SUI`)
 
 ### 📊 Leaderboards & Stats
@@ -68,7 +69,8 @@ pip install -r requirements.txt
 | `DATABASE_URL` | Yes | PostgreSQL connection string (set automatically by Railway when you add a Postgres plugin) |
 | `TELEGRAM_BOT_TOKEN` | Yes | Your Telegram bot token from BotFather |
 | `OPENAI_API_KEY` | Yes | Your OpenAI API key |
-| `SUI_PRIVATE_KEY` | No | Hex-encoded 32-byte Ed25519 private key (64 hex characters) for the bot's SUI wallet (required for `/airdrop`) |
+| `SUI_PRIVATE_KEY` | No | Legacy global fallback airdrop key shared by all groups |
+| `AIRDROP_ENCRYPTION_KEY` | No | 32-byte hex key used to encrypt per-group airdrop private keys at rest (required for `/setairdropwallet`) |
 | `SUI_RPC_URL` | No | SUI JSON-RPC endpoint (defaults to `https://fullnode.mainnet.sui.io:443`) |
 
 ### Running Locally
@@ -84,7 +86,7 @@ python main.py
 
 1. **Create a new project** on [Railway](https://railway.app/) and connect this repository.
 2. **Add a PostgreSQL plugin** — Railway will automatically set the `DATABASE_URL` variable. The bot creates its database table on first start.
-3. **Set environment variables** — In the Railway service settings, add `TELEGRAM_BOT_TOKEN` and `OPENAI_API_KEY` (and optionally `SUI_PRIVATE_KEY`).
+3. **Set environment variables** — In the Railway service settings, add `TELEGRAM_BOT_TOKEN` and `OPENAI_API_KEY`. Add `AIRDROP_ENCRYPTION_KEY` if you want each group to manage its own encrypted airdrop wallet, and optionally `SUI_PRIVATE_KEY` as a legacy global fallback.
 4. **Deploy** — Railway can start the bot through the repository root `main.py`, and the included `Dockerfile` uses the same entrypoint for container-based deploys.
 
 ### SUI Airdrop Setup
@@ -94,16 +96,19 @@ The `/airdrop` command uses standard SUI JSON-RPC methods (`unsafe_paySui`, `uns
 To enable airdrops:
 
 1. **Generate an Ed25519 keypair** — you can use the [SUI CLI](https://docs.sui.io/build/install) (`sui keytool generate ed25519`) or any Ed25519 key generator. You need the raw 32-byte private key as 64 hex characters.
-2. **Fund the wallet** — send SUI (or your custom token) to the bot's derived address. The bot derives its address automatically from the private key on each transfer.
-3. **Set `SUI_PRIVATE_KEY`** — add the hex-encoded private key to your environment variables.
-4. **(Optional) Set a custom token** — use `/settoken <coin_type>` in your group to airdrop a token other than native SUI.
+2. **Set `AIRDROP_ENCRYPTION_KEY`** — generate a random 32-byte hex secret (for example `python -c "import secrets; print(secrets.token_hex(32))"`) and add it to your deployment environment. This key encrypts per-group airdrop private keys before they are stored in PostgreSQL.
+3. **Fund each group's wallet** — after an admin configures a group wallet with `/setairdropwallet`, fund that wallet's derived SUI address with enough tokens and gas.
+4. **(Optional) Set `SUI_PRIVATE_KEY`** — if you still want one global fallback wallet for groups that have not configured their own sender, add it as an environment variable.
+5. **(Optional) Set a custom token** — use `/settoken <coin_type>` in your group to airdrop a token other than native SUI.
 
 **Airdrop workflow:**
 ```
 1. Admin runs:  /score 30 days
 2. Admin clicks: "📢 Broadcast in Group"
-3. Admin replies to the leaderboard message with:  /airdrop 10 1000000000
+3. Admin configures the group's sender with: /setairdropwallet
+4. Admin replies to the leaderboard message with:  /airdrop 10 1000000000
    → Sends 1 SUI (1,000,000,000 MIST) to each of the top 10 users who have registered wallets.
+   → Runs a preflight balance/gas check before sending.
    → Users without wallets are gracefully skipped.
 ```
 
