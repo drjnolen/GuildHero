@@ -2135,7 +2135,6 @@ async def setup_bot_commands(application):
         BotCommand("cancel", "Cancel current operation"),
     ]
     await asyncio.gather(
-        application.bot.set_my_commands(commands),
         application.bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats()),
         application.bot.set_my_commands(private_commands, scope=BotCommandScopeAllPrivateChats()),
     )
