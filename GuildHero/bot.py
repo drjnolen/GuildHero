@@ -1393,7 +1393,7 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     results = []
-    eligible_entries = []
+    recipients_with_wallets = []
     skip_count = 0
 
     for username, _metrics, _message_count, user_id_str in top_entries:
@@ -1403,9 +1403,9 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             results.append(f'⏭️ @{safe_username}: No wallet registered — skipped')
             skip_count += 1
             continue
-        eligible_entries.append((username, wallet_data['wallet_address']))
+        recipients_with_wallets.append((username, wallet_data['wallet_address']))
 
-    if not eligible_entries:
+    if not recipients_with_wallets:
         await update.message.reply_text('❌ None of the selected leaderboard users have wallets registered.')
         return
 
@@ -1423,7 +1423,7 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        preflight = await preflight_airdrop(sender_config['wallet_address'], len(eligible_entries), amount, coin_type)
+        preflight = await preflight_airdrop(sender_config['wallet_address'], len(recipients_with_wallets), amount, coin_type)
     except Exception as e:
         logging.error(f'Airdrop preflight failed for chat {chat_id}: {e}')
         await update.message.reply_text(f'❌ Airdrop preflight failed: {html.escape(str(e))}', parse_mode=ParseMode.HTML)
@@ -1431,7 +1431,7 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         (
-            f"🪂 Starting airdrop of <code>{html.escape(coin_type)}</code> to {len(eligible_entries)} users.\n"
+            f"🪂 Starting airdrop of <code>{html.escape(coin_type)}</code> to {len(recipients_with_wallets)} users.\n"
             f"Sender: <code>{html.escape(_short_address(sender_config['wallet_address']))}</code> ({html.escape(sender_config['source'])})\n"
             f"Preflight: SUI {preflight['available_sui_balance']} available / {preflight['required_sui_balance']} required"
         ),
@@ -1441,7 +1441,7 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     success_count = 0
     fail_count = 0
 
-    for username, wallet_address in eligible_entries:
+    for username, wallet_address in recipients_with_wallets:
         safe_username = html.escape(username)
         try:
             tx_result = await sui_transfer_token(wallet_address, amount, coin_type, sender_config['private_key_hex'])
@@ -1687,6 +1687,7 @@ async def receive_airdrop_private_key(update: Update, context: ContextTypes.DEFA
     submitted_value = update.message.text.strip()
     user_id = update.effective_user.id
     target_chat_id = _get_airdrop_wallet_flows(context).get(user_id)
+    # Keep the DM flow active when validation/storage fails so the admin can retry without restarting from the group.
     clear_flow = True
 
     if not target_chat_id:
