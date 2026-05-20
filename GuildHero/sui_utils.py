@@ -7,6 +7,7 @@ from nacl.secret import SecretBox
 from nacl.signing import SigningKey
 
 _HEX_32_BYTE_REGEX = re.compile(r"^(?:0x)?[0-9a-fA-F]{64}$")
+DEFAULT_SUI_COIN_TYPE = "0x2::sui::SUI"
 ENCRYPTION_KEY_ENV = "AIRDROP_ENCRYPTION_KEY"
 
 
@@ -54,3 +55,40 @@ def decrypt_private_key(encrypted_private_key: str, encryption_key: str | None =
     box = SecretBox(_load_encryption_key(encryption_key))
     decrypted = box.decrypt(base64.b64decode(encrypted_private_key))
     return decrypted.hex()
+
+
+def build_airdrop_balance_requirements(recipient_count: int, amount: int, coin_type: str, gas_budget: int) -> dict:
+    required_token_balance = amount * recipient_count
+    required_sui_balance = gas_budget * recipient_count
+
+    if coin_type == DEFAULT_SUI_COIN_TYPE:
+        required_sui_balance += required_token_balance
+        required_token_balance = 0
+
+    return {
+        "required_sui_balance": required_sui_balance,
+        "required_token_balance": required_token_balance,
+    }
+
+
+def resolve_airdrop_sender_config(group_wallet: dict | None, env_private_key: str | None = None) -> dict | None:
+    if group_wallet and group_wallet.get("encrypted_private_key"):
+        private_key_hex = decrypt_private_key(group_wallet["encrypted_private_key"])
+        return {
+            "private_key_hex": private_key_hex,
+            "wallet_address": group_wallet.get("wallet_address") or derive_sui_address(private_key_hex),
+            "source": "group",
+        }
+
+    if not env_private_key:
+        return None
+
+    normalized_private_key = normalize_sui_private_key(env_private_key)
+    if not normalized_private_key:
+        raise ValueError("Invalid SUI_PRIVATE_KEY format. Expected 64 hex characters (32-byte Ed25519 key).")
+
+    return {
+        "private_key_hex": normalized_private_key,
+        "wallet_address": derive_sui_address(normalized_private_key),
+        "source": "environment",
+    }

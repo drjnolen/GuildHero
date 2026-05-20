@@ -8,7 +8,14 @@ BOT_DIR = PROJECT_ROOT / "GuildHero"
 if str(BOT_DIR) not in sys.path:
     sys.path.insert(0, str(BOT_DIR))
 
-from sui_utils import decrypt_private_key, derive_sui_address, encrypt_private_key, normalize_sui_private_key
+from sui_utils import (
+    build_airdrop_balance_requirements,
+    decrypt_private_key,
+    derive_sui_address,
+    encrypt_private_key,
+    normalize_sui_private_key,
+    resolve_airdrop_sender_config,
+)
 
 
 class SuiUtilsTests(unittest.TestCase):
@@ -44,6 +51,39 @@ class SuiUtilsTests(unittest.TestCase):
             self.assertEqual(decrypt_private_key(encrypted), private_key)
         finally:
             os.environ.pop("AIRDROP_ENCRYPTION_KEY", None)
+
+    def test_build_airdrop_balance_requirements_for_native_sui(self):
+        requirements = build_airdrop_balance_requirements(3, 100, "0x2::sui::SUI", 5)
+        self.assertEqual(requirements["required_sui_balance"], 315)
+        self.assertEqual(requirements["required_token_balance"], 0)
+
+    def test_build_airdrop_balance_requirements_for_custom_token(self):
+        requirements = build_airdrop_balance_requirements(3, 100, "0xcustom::coin::TOKEN", 5)
+        self.assertEqual(requirements["required_sui_balance"], 15)
+        self.assertEqual(requirements["required_token_balance"], 300)
+
+    def test_resolve_airdrop_sender_config_prefers_group_wallet(self):
+        os.environ["AIRDROP_ENCRYPTION_KEY"] = "7" * 64
+        try:
+            group_private_key = "8" * 64
+            resolved = resolve_airdrop_sender_config(
+                {
+                    "wallet_address": derive_sui_address(group_private_key),
+                    "encrypted_private_key": encrypt_private_key(group_private_key),
+                },
+                env_private_key="9" * 64,
+            )
+            self.assertEqual(resolved["source"], "group")
+            self.assertEqual(resolved["private_key_hex"], group_private_key)
+        finally:
+            os.environ.pop("AIRDROP_ENCRYPTION_KEY", None)
+
+    def test_resolve_airdrop_sender_config_falls_back_to_environment(self):
+        env_private_key = "a" * 64
+        resolved = resolve_airdrop_sender_config(None, env_private_key=env_private_key)
+        self.assertEqual(resolved["source"], "environment")
+        self.assertEqual(resolved["private_key_hex"], env_private_key)
+        self.assertEqual(resolved["wallet_address"], derive_sui_address(env_private_key))
 
 
 if __name__ == "__main__":

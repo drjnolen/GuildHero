@@ -20,12 +20,14 @@ from ai_services import analyze_user_messages, summarize_chat_history, get_best_
 from db import db
 from http_clients import close_shared_async_client, get_shared_async_client
 from sui_utils import (
+    DEFAULT_SUI_COIN_TYPE as SUI_DEFAULT_COIN_TYPE,
+    build_airdrop_balance_requirements,
     ENCRYPTION_KEY_ENV,
-    decrypt_private_key,
     derive_sui_address,
     encrypt_private_key,
     get_sui_signing_key,
     normalize_sui_private_key,
+    resolve_airdrop_sender_config,
 )
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ParseMode
@@ -117,7 +119,7 @@ SUI_PRICE_ALIASES = {
 
 # --- SUI Blockchain ---
 SUI_RPC_URL = os.environ.get("SUI_RPC_URL", "https://fullnode.mainnet.sui.io:443")
-DEFAULT_SUI_COIN_TYPE = "0x2::sui::SUI"
+DEFAULT_SUI_COIN_TYPE = SUI_DEFAULT_COIN_TYPE
 SUI_GAS_BUDGET = "50000000"  # 0.05 SUI
 
 
@@ -420,28 +422,7 @@ def delete_airdrop_wallet(chat_id):
 
 
 def resolve_airdrop_sender(chat_id):
-    group_wallet = get_airdrop_wallet(chat_id)
-    if group_wallet and group_wallet.get("encrypted_private_key"):
-        private_key_hex = decrypt_private_key(group_wallet["encrypted_private_key"])
-        return {
-            "private_key_hex": private_key_hex,
-            "wallet_address": group_wallet.get("wallet_address") or derive_sui_address(private_key_hex),
-            "source": "group",
-        }
-
-    private_key_hex = os.environ.get("SUI_PRIVATE_KEY")
-    if not private_key_hex:
-        return None
-
-    normalized_private_key = normalize_sui_private_key(private_key_hex)
-    if not normalized_private_key:
-        raise ValueError("Invalid SUI_PRIVATE_KEY format. Expected 64 hex characters (32-byte Ed25519 key).")
-
-    return {
-        "private_key_hex": normalized_private_key,
-        "wallet_address": derive_sui_address(normalized_private_key),
-        "source": "environment",
-    }
+    return resolve_airdrop_sender_config(get_airdrop_wallet(chat_id), os.environ.get("SUI_PRIVATE_KEY"))
 
 def get_messages_by_date_range(chat_id, start_date, end_date):
     """Get messages from normalized storage, lazily migrating legacy chat blobs."""
@@ -521,13 +502,9 @@ async def sui_get_total_balance(owner: str, coin_type: str) -> int:
 
 
 async def preflight_airdrop(sender_address: str, recipient_count: int, amount: int, coin_type: str) -> dict:
-    gas_budget = int(SUI_GAS_BUDGET)
-    required_token_balance = amount * recipient_count
-    required_sui_balance = gas_budget * recipient_count
-
-    if coin_type == DEFAULT_SUI_COIN_TYPE:
-        required_sui_balance += required_token_balance
-        required_token_balance = 0
+    requirements = build_airdrop_balance_requirements(recipient_count, amount, coin_type, int(SUI_GAS_BUDGET))
+    required_token_balance = requirements["required_token_balance"]
+    required_sui_balance = requirements["required_sui_balance"]
 
     available_sui_balance = await sui_get_total_balance(sender_address, DEFAULT_SUI_COIN_TYPE)
     available_token_balance = available_sui_balance if coin_type == DEFAULT_SUI_COIN_TYPE else await sui_get_total_balance(sender_address, coin_type)
@@ -1734,8 +1711,8 @@ async def receive_airdrop_private_key(update: Update, context: ContextTypes.DEFA
         if not normalized_private_key:
             clear_flow = False
             await update.message.reply_text(
-                '❌ Please send a valid SUI private key (64 hexadecimal characters, optionally prefixed with 0x), send `remove`, or type /cancel.',
-                parse_mode=ParseMode.MARKDOWN,
+                '❌ Please send a valid SUI private key (64 hexadecimal characters, optionally prefixed with 0x), send <code>remove</code>, or type /cancel.',
+                parse_mode=ParseMode.HTML,
             )
             return AWAITING_AIRDROP_PRIVATE_KEY
 
