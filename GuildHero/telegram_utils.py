@@ -22,6 +22,7 @@ HELP_TEXT = (
     "<b>💰 Crypto</b>\n"
     "/price &lt;symbol&gt; - Look up a cryptocurrency price (including SUI ecosystem tokens like SUI, DEEP, WAL, NS).\n"
     "/airdrop &lt;count&gt; &lt;amount&gt; - Airdrop tokens to top scorers (admin, reply to /score).\n"
+    "/raffle &lt;amount&gt; - Pick a weighted winner from the replied leaderboard and airdrop the prize (admin).\n"
     "/setairdropwallet - Set this group's encrypted airdrop wallet (admin).\n"
     "/settoken &lt;coin_type&gt; - Set the airdrop token for this group (admin).\n\n"
     "<b>🗓️ Group Management</b>\n"

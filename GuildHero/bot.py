@@ -29,8 +29,16 @@ from sui_utils import (
     normalize_sui_private_key,
     resolve_airdrop_sender_config,
 )
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.constants import ParseMode
+from raffle_utils import RAFFLE_MAX_RANK, select_weighted_raffle_winner
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
+)
+from telegram.constants import ChatType, ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -1296,6 +1304,19 @@ async def settoken_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def setairdropwallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Allows admins to configure an encrypted, per-group airdrop wallet in DM."""
+    if update.effective_chat.type == ChatType.PRIVATE:
+        active_chat_id = _get_airdrop_wallet_flows(context).get(update.effective_user.id)
+        if active_chat_id:
+            await update.message.reply_text(
+                'You already have a secure airdrop wallet setup in progress here. Send the private key for a dedicated airdrop hot wallet, type <code>remove</code> to clear it, or use <code>/cancel</code> to abort.',
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await update.message.reply_text(
+                'Use /setairdropwallet in the group where you want to configure the sender wallet, and I will give you a secure DM link.',
+            )
+        return
+
     if not await require_admin(update, context):
         return
 
@@ -1467,6 +1488,138 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Amount per user: {amount}\n"
         f"✅ Sent: {success_count} | ⏭️ Skipped (no wallet): {skip_count} | ❌ Failed: {fail_count}\n\n"
         f"<b>Details:</b>\n{results_text}"
+    )
+    await update.message.reply_text(summary + FOOTER_HTML, parse_mode=ParseMode.HTML)
+
+
+async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Picks a weighted winner from a replied leaderboard and airdrops the prize."""
+    if not await require_admin(update, context):
+        return
+
+    _track_chat(update.effective_chat.id)
+    if len(context.args) < 1:
+        await update.message.reply_text(
+            "Usage: Reply to a /score leaderboard message with:\n"
+            "/raffle &lt;amount&gt;\n\n"
+            "Example:\n"
+            "1. Run /score 30 days\n"
+            "2. Broadcast the leaderboard to the group\n"
+            "3. Reply to that leaderboard message with /raffle 1000000000\n\n"
+            "<i>The winner is selected from the top 20 ranked users with registered wallets, with slightly better odds for higher ranks.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        amount = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text('❌ Amount must be a whole number.')
+        return
+
+    if amount < 1:
+        await update.message.reply_text('❌ Amount must be a positive number.')
+        return
+
+    if not update.message.reply_to_message:
+        await update.message.reply_text(
+            "❌ Please reply to a /score leaderboard message to use /raffle.\n\n"
+            "1. Run /score (e.g. /score 30 days)\n"
+            "2. Broadcast the leaderboard to the group\n"
+            "3. Reply to that leaderboard message with /raffle &lt;amount&gt;",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    chat_id = update.effective_chat.id
+    replied_msg_id = update.message.reply_to_message.message_id
+    leaderboard = _get_leaderboard_messages(context).get((chat_id, replied_msg_id))
+
+    if not leaderboard:
+        await update.message.reply_text('❌ The replied message is not a recognized leaderboard. Please reply to a leaderboard broadcasted by /score.')
+        return
+
+    coin_type = db.get(_get_airdrop_token_key(chat_id), DEFAULT_SUI_COIN_TYPE)
+    weighted_candidates = []
+
+    for rank, (username, _metrics, _message_count, user_id_str) in enumerate(leaderboard[:RAFFLE_MAX_RANK], start=1):
+        wallet_data = await asyncio.to_thread(get_wallet, chat_id, int(user_id_str))
+        if not wallet_data or not wallet_data.get('wallet_address'):
+            continue
+        weighted_candidates.append(
+            {
+                'rank': rank,
+                'username': username or f'user_{user_id_str}',
+                'wallet_address': wallet_data['wallet_address'],
+            }
+        )
+
+    if not weighted_candidates:
+        await update.message.reply_text(f'❌ None of the top {RAFFLE_MAX_RANK} leaderboard users have wallets registered.')
+        return
+
+    winner = select_weighted_raffle_winner(weighted_candidates)
+    if not winner:
+        await update.message.reply_text('❌ Could not select a raffle winner.')
+        return
+
+    try:
+        sender_config = await asyncio.to_thread(resolve_airdrop_sender, chat_id)
+    except Exception as e:
+        logging.error(f'Failed to resolve raffle sender for chat {chat_id}: {e}')
+        await update.message.reply_text(f'❌ {html.escape(str(e))}', parse_mode=ParseMode.HTML)
+        return
+
+    if not sender_config:
+        await update.message.reply_text(
+            '❌ No airdrop wallet is configured for this group. Use /setairdropwallet, or configure the legacy SUI_PRIVATE_KEY fallback.',
+        )
+        return
+
+    try:
+        preflight = await preflight_airdrop(sender_config['wallet_address'], 1, amount, coin_type)
+    except Exception as e:
+        logging.error(f'Raffle preflight failed for chat {chat_id}: {e}')
+        await update.message.reply_text(f'❌ Raffle preflight failed: {html.escape(str(e))}', parse_mode=ParseMode.HTML)
+        return
+
+    preflight_lines = [
+        f"🎟️ Running a raffle for <code>{html.escape(coin_type)}</code> across {len(weighted_candidates)} registered wallets from the top {RAFFLE_MAX_RANK}.",
+        f"Winner odds are weighted slightly by leaderboard place.",
+        f"Sender: <code>{html.escape(_short_address(sender_config['wallet_address']))}</code> ({html.escape(sender_config['source'])})",
+        f"Preflight: SUI {format_token_amount(preflight['available_sui_balance'])} MIST available / {format_token_amount(preflight['required_sui_balance'])} MIST required",
+    ]
+    if coin_type != DEFAULT_SUI_COIN_TYPE:
+        preflight_lines.append(
+            f"Token preflight: {format_token_amount(preflight['available_token_balance'])} available / {format_token_amount(preflight['required_token_balance'])} required"
+        )
+    await update.message.reply_text("\n".join(preflight_lines), parse_mode=ParseMode.HTML)
+
+    safe_username = html.escape(winner['username'])
+    try:
+        tx_result = await sui_transfer_token(winner['wallet_address'], amount, coin_type, sender_config['private_key_hex'])
+    except Exception as e:
+        logging.error(f"Raffle transfer failed for {winner['username']} ({winner['wallet_address']}): {e}")
+        await update.message.reply_text(
+            (
+                "❌ <b>Raffle draw failed</b>\n\n"
+                f"Winner: #{winner['rank']} @{safe_username}\n"
+                f"Wallet: <code>{html.escape(winner['wallet_address'])}</code>\n"
+                f"Error: {html.escape(str(e))}"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    tx_digest = tx_result.get('digest', 'unknown')
+    summary = (
+        "🎉 <b>Raffle Complete</b>\n\n"
+        f"Token: <code>{html.escape(coin_type)}</code>\n"
+        f"Prize: {amount}\n"
+        f"Winner: #{winner['rank']} @{safe_username}\n"
+        f"Wallet: <code>{html.escape(winner['wallet_address'])}</code>\n"
+        f"Eligible wallets: {len(weighted_candidates)} / {RAFFLE_MAX_RANK}\n"
+        f"Transaction: <code>{html.escape(tx_digest)}</code>"
     )
     await update.message.reply_text(summary + FOOTER_HTML, parse_mode=ParseMode.HTML)
 
@@ -1956,6 +2109,7 @@ async def setup_bot_commands(application):
         BotCommand("copypasta", "Generate a copypasta of your history"),
         BotCommand("price", "Crypto price: /price <symbol>"),
         BotCommand("airdrop", "Airdrop tokens: reply to /score with /airdrop <count> <amount>"),
+        BotCommand("raffle", "Raffle prize: reply to /score with /raffle <amount>"),
         BotCommand("setairdropwallet", "Set this group's encrypted airdrop wallet (admin)"),
         BotCommand("settoken", "Set airdrop token (admin)"),
         BotCommand("mybadges", "View your earned badges"),
@@ -1969,7 +2123,21 @@ async def setup_bot_commands(application):
         BotCommand("wallet", "Submit or check your wallet address"),
         BotCommand("cancel", "Cancel current operation")
     ]
-    await application.bot.set_my_commands(commands)
+    private_commands = [
+        BotCommand("start", "Show help and command list"),
+        BotCommand("help", "Show help and command list"),
+        BotCommand("price", "Crypto price: /price <symbol>"),
+        BotCommand("wallet", "Submit or check your wallet address"),
+        BotCommand("mybadges", "View your earned badges"),
+        BotCommand("allbadges", "See all available badges"),
+        BotCommand("mystats", "View your personal stats"),
+        BotCommand("copypasta", "Generate a copypasta of your history"),
+        BotCommand("cancel", "Cancel current operation"),
+    ]
+    await asyncio.gather(
+        application.bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats()),
+        application.bot.set_my_commands(private_commands, scope=BotCommandScopeAllPrivateChats()),
+    )
 
 async def shutdown_services(application):
     await close_shared_async_client()
@@ -2022,6 +2190,7 @@ def main():
     application.add_handler(CommandHandler("copypasta", copypasta_command))
     application.add_handler(CommandHandler("price", price_command))
     application.add_handler(CommandHandler("airdrop", airdrop_command))
+    application.add_handler(CommandHandler("raffle", raffle_command))
     application.add_handler(CommandHandler("setairdropwallet", setairdropwallet_command))
     application.add_handler(CommandHandler("settoken", settoken_command))
     application.add_handler(CommandHandler("setwelcome", setwelcome_command))
