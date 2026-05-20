@@ -899,6 +899,7 @@ async def generate_csv_from_leaderboard(leaderboard_data, chat_id):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the /start command, used for deep-linking and showing help."""
     logging.info(f"Start command received from user {update.effective_user.id} with args: {context.args}")
+    # Shared across the wallet and airdrop-wallet deep-link flows below.
     user_id = update.effective_user.id
 
     if context.args and context.args[0].startswith('wallet_'):
@@ -1433,7 +1434,7 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         (
             f"🪂 Starting airdrop of <code>{html.escape(coin_type)}</code> to {len(recipients_with_wallets)} users.\n"
             f"Sender: <code>{html.escape(_short_address(sender_config['wallet_address']))}</code> ({html.escape(sender_config['source'])})\n"
-            f"Preflight: SUI {preflight['available_sui_balance']} available / {preflight['required_sui_balance']} required"
+            f"Preflight: SUI {preflight['available_sui_balance']} MIST available / {preflight['required_sui_balance']} MIST required"
         ),
         parse_mode=ParseMode.HTML,
     )
@@ -1698,6 +1699,10 @@ async def receive_airdrop_private_key(update: Update, context: ContextTypes.DEFA
     try:
         chat_info = await context.bot.get_chat(target_chat_id)
         chat_name = chat_info.title or f'Group (ID: {target_chat_id})'
+        try:
+            await update.message.delete()
+        except Exception:
+            logging.warning('Could not delete private key submission message for user %s', user_id)
 
         if submitted_value.lower() == 'remove':
             await asyncio.to_thread(delete_airdrop_wallet, target_chat_id)

@@ -11,7 +11,7 @@ DEFAULT_SUI_COIN_TYPE = "0x2::sui::SUI"
 ENCRYPTION_KEY_ENV = "AIRDROP_ENCRYPTION_KEY"
 
 
-def normalize_sui_private_key(private_key: str) -> str | None:
+def normalize_sui_private_key(private_key: str | None) -> str | None:
     candidate = (private_key or "").strip()
     if not _HEX_32_BYTE_REGEX.fullmatch(candidate):
         return None
