@@ -20,7 +20,7 @@ class FakeRandom:
         self.population = population
         self.weights = weights
         self.k = k
-        return [population[1]]
+        return [population[min(1, len(population) - 1)]]
 
 
 class RaffleUtilsTests(unittest.TestCase):

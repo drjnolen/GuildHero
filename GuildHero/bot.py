@@ -38,7 +38,7 @@ from telegram import (
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
 )
-from telegram.constants import ParseMode
+from telegram.constants import ChatType, ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -1304,7 +1304,7 @@ async def settoken_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def setairdropwallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Allows admins to configure an encrypted, per-group airdrop wallet in DM."""
-    if update.effective_chat.type == 'private':
+    if update.effective_chat.type == ChatType.PRIVATE:
         active_chat_id = _get_airdrop_wallet_flows(context).get(update.effective_user.id)
         if active_chat_id:
             await update.message.reply_text(

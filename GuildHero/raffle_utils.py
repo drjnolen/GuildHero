@@ -27,4 +27,4 @@ def select_weighted_raffle_winner(
 
     chooser = rng or random
     weights = [get_raffle_rank_weight(candidate["rank"], max_rank=max_rank) for candidate in candidates]
-    return chooser.choices(list(candidates), weights=weights, k=1)[0]
+    return chooser.choices(candidates, weights=weights, k=1)[0]
