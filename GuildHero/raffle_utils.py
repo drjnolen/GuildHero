@@ -6,6 +6,7 @@ RAFFLE_MAX_RANK = 20
 
 
 def get_raffle_rank_weight(rank: int, max_rank: int = RAFFLE_MAX_RANK) -> float:
+    """Return a slight linear rank bonus from 1.5x for rank 1 down to 1.0x for the last rank."""
     capped_rank = min(max(int(rank), 1), max_rank)
     return 1.0 + ((max_rank - capped_rank) / (max_rank * 2))
 
@@ -16,6 +17,11 @@ def select_weighted_raffle_winner(
     rng: random.Random | None = None,
     max_rank: int = RAFFLE_MAX_RANK,
 ):
+    """Pick one candidate using rank-based weights.
+
+    Each candidate must provide a ``rank`` key. Lower rank numbers receive a
+    slightly higher weight, while every candidate remains eligible.
+    """
     if not candidates:
         return None
 
