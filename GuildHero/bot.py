@@ -1308,7 +1308,7 @@ async def setairdropwallet_command(update: Update, context: ContextTypes.DEFAULT
         active_chat_id = _get_airdrop_wallet_flows(context).get(update.effective_user.id)
         if active_chat_id:
             await update.message.reply_text(
-                'You already have a secure airdrop wallet setup in progress here. Send the private key, send <code>remove</code> or type <code>/cancel</code>.',
+                'You already have a secure airdrop wallet setup in progress here. Send the private key, send <code>remove</code>, or type <code>/cancel</code>.',
                 parse_mode=ParseMode.HTML,
             )
         else:
