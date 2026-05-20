@@ -1430,14 +1430,16 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f'❌ Airdrop preflight failed: {html.escape(str(e))}', parse_mode=ParseMode.HTML)
         return
 
-    await update.message.reply_text(
-        (
-            f"🪂 Starting airdrop of <code>{html.escape(coin_type)}</code> to {len(recipients_with_wallets)} users.\n"
-            f"Sender: <code>{html.escape(_short_address(sender_config['wallet_address']))}</code> ({html.escape(sender_config['source'])})\n"
-            f"Preflight: SUI {preflight['available_sui_balance']} MIST available / {preflight['required_sui_balance']} MIST required"
-        ),
-        parse_mode=ParseMode.HTML,
-    )
+    preflight_lines = [
+        f"🪂 Starting airdrop of <code>{html.escape(coin_type)}</code> to {len(recipients_with_wallets)} users.",
+        f"Sender: <code>{html.escape(_short_address(sender_config['wallet_address']))}</code> ({html.escape(sender_config['source'])})",
+        f"Preflight: SUI {preflight['available_sui_balance']} MIST available / {preflight['required_sui_balance']} MIST required",
+    ]
+    if coin_type != DEFAULT_SUI_COIN_TYPE:
+        preflight_lines.append(
+            f"Token preflight: {preflight['available_token_balance']} available / {preflight['required_token_balance']} required"
+        )
+    await update.message.reply_text("\n".join(preflight_lines), parse_mode=ParseMode.HTML)
 
     success_count = 0
     fail_count = 0
