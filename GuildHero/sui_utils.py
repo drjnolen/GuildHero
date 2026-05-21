@@ -177,7 +177,7 @@ def parse_token_amount(amount_text: str, decimals: int = DEFAULT_SUI_COIN_DECIMA
     fractional_digits = len(normalized.partition(".")[2])
     if fractional_digits > decimals:
         raise ValueError(f"Amount supports up to {decimals} decimal places.")
-    scale = 10 ** decimals
+    scale = Decimal(10) ** decimals
     scaled_amount = int(value * scale)
     if scaled_amount < 1:
         raise ValueError("Amount must be greater than zero.")

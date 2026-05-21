@@ -1442,7 +1442,7 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         amount = parse_token_amount(context.args[1], coin_amount_config['decimals'])
     except ValueError as e:
-        await update.message.reply_text(f"❌ {html.escape(str(e))}", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"❌ Invalid amount per user: {html.escape(str(e))}", parse_mode=ParseMode.HTML)
         return
     top_entries = leaderboard[:count]
     if not top_entries:
@@ -1548,7 +1548,7 @@ async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         amount = parse_token_amount(context.args[0], coin_amount_config['decimals'])
     except ValueError as e:
-        await update.message.reply_text(f"❌ {html.escape(str(e))}", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"❌ Invalid raffle prize amount: {html.escape(str(e))}", parse_mode=ParseMode.HTML)
         return
 
     if not update.message.reply_to_message:
