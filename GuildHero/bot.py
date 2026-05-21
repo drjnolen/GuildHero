@@ -1542,8 +1542,10 @@ async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    chat_id = update.effective_chat.id
+    coin_type = db.get(_get_airdrop_token_key(chat_id), DEFAULT_SUI_COIN_TYPE)
+    coin_amount_config = await get_coin_amount_config(coin_type)
     try:
-        coin_amount_config = await get_coin_amount_config(db.get(_get_airdrop_token_key(update.effective_chat.id), DEFAULT_SUI_COIN_TYPE))
         amount = parse_token_amount(context.args[0], coin_amount_config['decimals'])
     except ValueError as e:
         await update.message.reply_text(f"❌ {html.escape(str(e))}", parse_mode=ParseMode.HTML)
@@ -1559,7 +1561,6 @@ async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    chat_id = update.effective_chat.id
     replied_msg_id = update.message.reply_to_message.message_id
     leaderboard = _get_leaderboard_messages(context).get((chat_id, replied_msg_id))
 
@@ -1567,8 +1568,6 @@ async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('❌ The replied message is not a recognized leaderboard. Please reply to a leaderboard broadcasted by /score.')
         return
 
-    coin_type = db.get(_get_airdrop_token_key(chat_id), DEFAULT_SUI_COIN_TYPE)
-    coin_amount_config = await get_coin_amount_config(coin_type)
     weighted_candidates = []
 
     for rank, (username, _metrics, _message_count, user_id_str) in enumerate(leaderboard[:RAFFLE_MAX_RANK], start=1):
