@@ -403,7 +403,7 @@ def store_wallet_private(user_id, username, wallet_address):
 def store_airdrop_wallet(chat_id, configured_by_user_id, private_key_hex):
     normalized_private_key = normalize_sui_private_key(private_key_hex)
     if not normalized_private_key:
-        raise ValueError("Please send a valid SUI private key (64 hexadecimal characters, optionally prefixed with 0x).")
+        raise ValueError("Please send a valid SUI private key (suiprivkey1... or 64 hexadecimal characters, optionally prefixed with 0x).")
 
     wallet_address = derive_sui_address(normalized_private_key)
     wallet_key = _get_airdrop_wallet_key(chat_id)
@@ -974,17 +974,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     (
                         f"🔐 <b>{html.escape(chat_name)}</b> already has an airdrop wallet configured.\n\n"
                         f"Current sender address: <code>{html.escape(wallet_data.get('wallet_address', 'unknown'))}</code>\n\n"
-                        "Reply with a new SUI private key to replace it, or send <code>remove</code> to delete it."
+                        "Reply with a new SUI private key (<code>suiprivkey1...</code> or 64 hex characters) to replace it, or send <code>remove</code> to delete it."
                     ),
                     parse_mode=ParseMode.HTML,
                 )
             else:
                 await update.message.reply_text(
-                    (
-                        f"🔐 Send the SUI private key for <b>{html.escape(chat_name)}</b> in this DM.\n\n"
-                        "The key will be encrypted before it is stored, and only decrypted in memory when signing airdrops.\n"
-                        "Send <code>remove</code> if you want to clear an existing group wallet instead."
-                    ),
+                        (
+                            f"🔐 Send the SUI private key for <b>{html.escape(chat_name)}</b> in this DM.\n\n"
+                            "Send the wallet export in <code>suiprivkey1...</code> format (preferred) or as 64 hexadecimal characters.\n"
+                            "The key will be encrypted before it is stored, and only decrypted in memory when signing airdrops.\n"
+                            "Send <code>remove</code> if you want to clear an existing group wallet instead."
+                        ),
                     parse_mode=ParseMode.HTML,
                 )
             return AWAITING_AIRDROP_PRIVATE_KEY
@@ -1876,7 +1877,7 @@ async def receive_airdrop_private_key(update: Update, context: ContextTypes.DEFA
         if not normalized_private_key:
             should_clear_flow = False
             await update.message.reply_text(
-                '❌ Please send a valid SUI private key (64 hexadecimal characters, optionally prefixed with 0x), send <code>remove</code>, or type /cancel.',
+                '❌ Please send a valid SUI private key (<code>suiprivkey1...</code> or 64 hexadecimal characters, optionally prefixed with <code>0x</code>), send <code>remove</code>, or type /cancel.',
                 parse_mode=ParseMode.HTML,
             )
             return AWAITING_AIRDROP_PRIVATE_KEY

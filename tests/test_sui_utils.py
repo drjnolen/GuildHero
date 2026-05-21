@@ -24,10 +24,17 @@ class SuiUtilsTests(unittest.TestCase):
         self.assertEqual(normalize_sui_private_key(raw), "a" * 64)
         self.assertEqual(normalize_sui_private_key("0x" + raw), "a" * 64)
 
+    def test_normalize_sui_private_key_accepts_valid_suiprivkey(self):
+        self.assertEqual(
+            normalize_sui_private_key("suiprivkey1qzyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zqq8zk3d"),
+            "11" * 32,
+        )
+
     def test_normalize_sui_private_key_rejects_invalid_values(self):
         self.assertIsNone(normalize_sui_private_key(""))
         self.assertIsNone(normalize_sui_private_key("0x1234"))
         self.assertIsNone(normalize_sui_private_key("z" * 64))
+        self.assertIsNone(normalize_sui_private_key("suiprivkey1invalid"))
 
     def test_derive_sui_address_is_stable(self):
         private_key = "1" * 64
