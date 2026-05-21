@@ -26,7 +26,7 @@ class SuiUtilsTests(unittest.TestCase):
 
     def test_normalize_sui_private_key_accepts_valid_suiprivkey(self):
         self.assertEqual(
-            normalize_sui_private_key("suiprivkey1qzyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zqq8zk3d"),
+            normalize_sui_private_key("suiprivkey1qqg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3z45rflc"),
             "11" * 32,
         )
 
