@@ -169,11 +169,11 @@ def build_airdrop_balance_requirements(recipient_count: int, amount: int, coin_t
 def parse_token_amount(amount_text: str, decimals: int = DEFAULT_SUI_COIN_DECIMALS) -> int:
     normalized = (amount_text or "").strip()
     if not _TOKEN_AMOUNT_REGEX.fullmatch(normalized):
-        raise ValueError("Amount must be a positive number.")
+        raise ValueError("Amount must be a valid number.")
     try:
         value = Decimal(normalized)
     except InvalidOperation as exc:
-        raise ValueError("Amount must be a positive number.") from exc
+        raise ValueError("Amount must be a valid number.") from exc
     fractional_digits = len(normalized.partition(".")[2])
     if fractional_digits > decimals:
         raise ValueError(f"Amount supports up to {decimals} decimal places.")

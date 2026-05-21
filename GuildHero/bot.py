@@ -1440,7 +1440,7 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     coin_type = db.get(_get_airdrop_token_key(chat_id), DEFAULT_SUI_COIN_TYPE)
     coin_amount_config = await get_coin_amount_config(coin_type)
     try:
-        amount = parse_token_amount(context.args[1], coin_amount_config['decimals'])
+        amount = parse_token_amount(context.args[1], coin_amount_config.get('decimals', DEFAULT_SUI_COIN_DECIMALS))
     except ValueError as e:
         await update.message.reply_text(f"❌ Invalid amount per user: {html.escape(str(e))}", parse_mode=ParseMode.HTML)
         return
@@ -1546,7 +1546,7 @@ async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     coin_type = db.get(_get_airdrop_token_key(chat_id), DEFAULT_SUI_COIN_TYPE)
     coin_amount_config = await get_coin_amount_config(coin_type)
     try:
-        amount = parse_token_amount(context.args[0], coin_amount_config['decimals'])
+        amount = parse_token_amount(context.args[0], coin_amount_config.get('decimals', DEFAULT_SUI_COIN_DECIMALS))
     except ValueError as e:
         await update.message.reply_text(f"❌ Invalid raffle prize amount: {html.escape(str(e))}", parse_mode=ParseMode.HTML)
         return
