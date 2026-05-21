@@ -96,7 +96,7 @@ The `/airdrop` command uses standard SUI JSON-RPC methods (`unsafe_paySui`, `uns
 
 To enable airdrops:
 
-1. **Generate an Ed25519 keypair** — you can use the [SUI CLI](https://docs.sui.io/build/install) (`sui keytool generate ed25519`) or any Ed25519 key generator. You need the raw 32-byte private key as 64 hex characters.
+1. **Generate an Ed25519 keypair** — you can use the [SUI CLI](https://docs.sui.io/build/install) (`sui keytool generate ed25519`) or any Ed25519 key generator. The bot accepts the standard SUI wallet export format (`suiprivkey1...`) and also supports the legacy raw 32-byte private key as 64 hex characters.
 2. **Set `AIRDROP_ENCRYPTION_KEY`** — generate a random 32-byte secret encoded as 64 hex characters (for example `python -c "import secrets; print(secrets.token_hex(32))"`) and add it to your deployment environment. This key encrypts per-group airdrop private keys before they are stored in PostgreSQL.
 3. **Fund each group's wallet** — after an admin configures a group wallet with `/setairdropwallet`, fund that wallet's derived SUI address with enough tokens and gas.
 4. **(Optional) Set `SUI_PRIVATE_KEY`** — if you still want one global fallback wallet for groups that have not configured their own sender, add it as an environment variable.
