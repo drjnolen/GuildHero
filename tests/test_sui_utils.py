@@ -9,11 +9,14 @@ if str(BOT_DIR) not in sys.path:
     sys.path.insert(0, str(BOT_DIR))
 
 from sui_utils import (
+    DEFAULT_SUI_COIN_DECIMALS,
     build_airdrop_balance_requirements,
     decrypt_private_key,
     derive_sui_address,
     encrypt_private_key,
+    format_token_amount,
     normalize_sui_private_key,
+    parse_token_amount,
     resolve_airdrop_sender_config,
 )
 
@@ -68,6 +71,22 @@ class SuiUtilsTests(unittest.TestCase):
         requirements = build_airdrop_balance_requirements(3, 100, "0xcustom::coin::TOKEN", 5)
         self.assertEqual(requirements["required_sui_balance"], 15)
         self.assertEqual(requirements["required_token_balance"], 300)
+
+    def test_parse_token_amount_uses_sui_style_decimals(self):
+        self.assertEqual(parse_token_amount("500"), 500 * (10 ** DEFAULT_SUI_COIN_DECIMALS))
+        self.assertEqual(parse_token_amount("1.25"), 1_250_000_000)
+
+    def test_parse_token_amount_rejects_excess_precision(self):
+        with self.assertRaises(ValueError):
+            parse_token_amount("0.0000000001")
+
+    def test_parse_token_amount_rejects_zero(self):
+        with self.assertRaises(ValueError):
+            parse_token_amount("0")
+
+    def test_format_token_amount_renders_decimal_display(self):
+        self.assertEqual(format_token_amount(500 * (10 ** DEFAULT_SUI_COIN_DECIMALS)), "500")
+        self.assertEqual(format_token_amount(1_250_000_000), "1.25")
 
     def test_resolve_airdrop_sender_config_prefers_group_wallet(self):
         os.environ["AIRDROP_ENCRYPTION_KEY"] = "7" * 64

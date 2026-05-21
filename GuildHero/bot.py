@@ -20,13 +20,16 @@ from ai_services import analyze_user_messages, summarize_chat_history, get_best_
 from db import db
 from http_clients import close_shared_async_client, get_shared_async_client
 from sui_utils import (
+    DEFAULT_SUI_COIN_DECIMALS,
     DEFAULT_SUI_COIN_TYPE as SUI_DEFAULT_COIN_TYPE,
     build_airdrop_balance_requirements,
     ENCRYPTION_KEY_ENV,
     derive_sui_address,
     encrypt_private_key,
+    format_token_amount,
     get_sui_signing_key,
     normalize_sui_private_key,
+    parse_token_amount,
     resolve_airdrop_sender_config,
 )
 from raffle_utils import RAFFLE_MAX_RANK, select_weighted_raffle_winner
@@ -95,6 +98,7 @@ COINGECKO_SCORE_SEARCH_ORDER_BONUS = 20
 COINGECKO_SCORE_MARKET_CAP_BONUS = 125
 PRICE_CACHE_TTL = 60  # seconds – avoid repeated API hits for the same symbol
 _price_cache: dict[str, tuple[dict, float]] = {}
+_coin_metadata_cache: dict[str, dict | None] = {}
 
 SUI_PRICE_ALIASES = {
     "afsui": "aftermath-staked-sui",
@@ -509,6 +513,31 @@ async def sui_get_total_balance(owner: str, coin_type: str) -> int:
     return sum(int(coin.get("balance", 0)) for coin in coins_result.get("data", []))
 
 
+async def sui_get_coin_metadata(coin_type: str) -> dict | None:
+    if coin_type in _coin_metadata_cache:
+        return _coin_metadata_cache[coin_type]
+
+    try:
+        metadata = await sui_rpc_call("suix_getCoinMetadata", [coin_type])
+    except Exception as exc:
+        logging.warning(f"Failed to fetch coin metadata for {coin_type}: {exc}")
+        metadata = None
+
+    _coin_metadata_cache[coin_type] = metadata
+    return metadata
+
+
+async def get_coin_amount_config(coin_type: str) -> dict:
+    metadata = await sui_get_coin_metadata(coin_type)
+    decimals = metadata.get("decimals") if isinstance(metadata, dict) else None
+    symbol = metadata.get("symbol") if isinstance(metadata, dict) else None
+    if not isinstance(decimals, int):
+        decimals = DEFAULT_SUI_COIN_DECIMALS
+    if not symbol:
+        symbol = coin_type.split("::")[-1]
+    return {"decimals": decimals, "symbol": str(symbol).upper()}
+
+
 async def preflight_airdrop(sender_address: str, recipient_count: int, amount: int, coin_type: str) -> dict:
     requirements = build_airdrop_balance_requirements(recipient_count, amount, coin_type, int(SUI_GAS_BUDGET))
     required_token_balance = requirements["required_token_balance"]
@@ -740,10 +769,6 @@ def format_large_number(num):
     if num >= 1_000:
         return f"${num / 1_000:.2f}K"
     return f"${num:.2f}"
-
-
-def format_token_amount(amount: int) -> str:
-    return f"{amount:,}"
 
 
 # --- Calendar Feature Functions ---
@@ -1377,22 +1402,21 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Example:\n"
             "1. Run /score 30 days\n"
             "2. Broadcast the leaderboard to the group\n"
-            "3. Reply to that leaderboard message with /airdrop 10 1000000000\n\n"
+            "3. Reply to that leaderboard message with /airdrop 10 500\n\n"
             "<i>Count = number of top leaderboard users to receive tokens.\n"
-            "Amount = token amount per user in smallest unit (e.g. 1000000000 MIST = 1 SUI).</i>",
+            "Amount = token amount per user. Decimals are read from coin metadata when available; most Sui coins use 9 decimals.</i>",
             parse_mode=ParseMode.HTML,
         )
         return
 
     try:
         count = int(context.args[0])
-        amount = int(context.args[1])
     except ValueError:
-        await update.message.reply_text('❌ Both count and amount must be whole numbers.')
+        await update.message.reply_text('❌ Count must be a whole number.')
         return
 
-    if count < 1 or amount < 1:
-        await update.message.reply_text('❌ Count and amount must be positive numbers.')
+    if count < 1:
+        await update.message.reply_text('❌ Count must be a positive number.')
         return
 
     if not update.message.reply_to_message:
@@ -1414,6 +1438,12 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     coin_type = db.get(_get_airdrop_token_key(chat_id), DEFAULT_SUI_COIN_TYPE)
+    coin_amount_config = await get_coin_amount_config(coin_type)
+    try:
+        amount = parse_token_amount(context.args[1], coin_amount_config.get('decimals', DEFAULT_SUI_COIN_DECIMALS))
+    except ValueError as e:
+        await update.message.reply_text(f"❌ Invalid amount per user: {html.escape(str(e))}", parse_mode=ParseMode.HTML)
+        return
     top_entries = leaderboard[:count]
     if not top_entries:
         await update.message.reply_text('❌ No eligible users found in the leaderboard.')
@@ -1459,11 +1489,11 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     preflight_lines = [
         f"🪂 Starting airdrop of <code>{html.escape(coin_type)}</code> to {len(recipients_with_wallets)} users.",
         f"Sender: <code>{html.escape(_short_address(sender_config['wallet_address']))}</code> ({html.escape(sender_config['source'])})",
-        f"Preflight: SUI {format_token_amount(preflight['available_sui_balance'])} MIST available / {format_token_amount(preflight['required_sui_balance'])} MIST required",
+        f"Preflight: {format_token_amount(preflight['available_sui_balance'], DEFAULT_SUI_COIN_DECIMALS)} SUI available / {format_token_amount(preflight['required_sui_balance'], DEFAULT_SUI_COIN_DECIMALS)} SUI required",
     ]
     if coin_type != DEFAULT_SUI_COIN_TYPE:
         preflight_lines.append(
-            f"Token preflight: {format_token_amount(preflight['available_token_balance'])} available / {format_token_amount(preflight['required_token_balance'])} required"
+            f"Token preflight: {format_token_amount(preflight['available_token_balance'], coin_amount_config['decimals'])} {html.escape(coin_amount_config['symbol'])} available / {format_token_amount(preflight['required_token_balance'], coin_amount_config['decimals'])} {html.escape(coin_amount_config['symbol'])} required"
         )
     await update.message.reply_text("\n".join(preflight_lines), parse_mode=ParseMode.HTML)
 
@@ -1486,7 +1516,7 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     summary = (
         f"🪂 <b>Airdrop Complete</b>\n\n"
         f"Token: <code>{html.escape(coin_type)}</code>\n"
-        f"Amount per user: {amount}\n"
+        f"Amount per user: {format_token_amount(amount, coin_amount_config['decimals'])} {html.escape(coin_amount_config['symbol'])}\n"
         f"✅ Sent: {success_count} | ⏭️ Skipped (no wallet): {skip_count} | ❌ Failed: {fail_count}\n\n"
         f"<b>Details:</b>\n{results_text}"
     )
@@ -1506,20 +1536,19 @@ async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Example:\n"
             "1. Run /score 30 days\n"
             "2. Broadcast the leaderboard to the group\n"
-            "3. Reply to that leaderboard message with /raffle 1000000000\n\n"
+            "3. Reply to that leaderboard message with /raffle 500\n\n"
             "<i>The winner is selected from the top 20 ranked users with registered wallets, with slightly better odds for higher ranks.</i>",
             parse_mode=ParseMode.HTML,
         )
         return
 
+    chat_id = update.effective_chat.id
+    coin_type = db.get(_get_airdrop_token_key(chat_id), DEFAULT_SUI_COIN_TYPE)
+    coin_amount_config = await get_coin_amount_config(coin_type)
     try:
-        amount = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text('❌ Amount must be a whole number.')
-        return
-
-    if amount < 1:
-        await update.message.reply_text('❌ Amount must be a positive number.')
+        amount = parse_token_amount(context.args[0], coin_amount_config.get('decimals', DEFAULT_SUI_COIN_DECIMALS))
+    except ValueError as e:
+        await update.message.reply_text(f"❌ Invalid raffle prize amount: {html.escape(str(e))}", parse_mode=ParseMode.HTML)
         return
 
     if not update.message.reply_to_message:
@@ -1532,7 +1561,6 @@ async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    chat_id = update.effective_chat.id
     replied_msg_id = update.message.reply_to_message.message_id
     leaderboard = _get_leaderboard_messages(context).get((chat_id, replied_msg_id))
 
@@ -1540,7 +1568,6 @@ async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('❌ The replied message is not a recognized leaderboard. Please reply to a leaderboard broadcasted by /score.')
         return
 
-    coin_type = db.get(_get_airdrop_token_key(chat_id), DEFAULT_SUI_COIN_TYPE)
     weighted_candidates = []
 
     for rank, (username, _metrics, _message_count, user_id_str) in enumerate(leaderboard[:RAFFLE_MAX_RANK], start=1):
@@ -1588,11 +1615,11 @@ async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎟️ Running a raffle for <code>{html.escape(coin_type)}</code> across {len(weighted_candidates)} registered wallets from the top {RAFFLE_MAX_RANK}.",
         f"Winner odds are weighted slightly by leaderboard place.",
         f"Sender: <code>{html.escape(_short_address(sender_config['wallet_address']))}</code> ({html.escape(sender_config['source'])})",
-        f"Preflight: SUI {format_token_amount(preflight['available_sui_balance'])} MIST available / {format_token_amount(preflight['required_sui_balance'])} MIST required",
+        f"Preflight: {format_token_amount(preflight['available_sui_balance'], DEFAULT_SUI_COIN_DECIMALS)} SUI available / {format_token_amount(preflight['required_sui_balance'], DEFAULT_SUI_COIN_DECIMALS)} SUI required",
     ]
     if coin_type != DEFAULT_SUI_COIN_TYPE:
         preflight_lines.append(
-            f"Token preflight: {format_token_amount(preflight['available_token_balance'])} available / {format_token_amount(preflight['required_token_balance'])} required"
+            f"Token preflight: {format_token_amount(preflight['available_token_balance'], coin_amount_config['decimals'])} {html.escape(coin_amount_config['symbol'])} available / {format_token_amount(preflight['required_token_balance'], coin_amount_config['decimals'])} {html.escape(coin_amount_config['symbol'])} required"
         )
     await update.message.reply_text("\n".join(preflight_lines), parse_mode=ParseMode.HTML)
 
@@ -1616,7 +1643,7 @@ async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     summary = (
         "🎉 <b>Raffle Complete</b>\n\n"
         f"Token: <code>{html.escape(coin_type)}</code>\n"
-        f"Prize: {amount}\n"
+        f"Prize: {format_token_amount(amount, coin_amount_config['decimals'])} {html.escape(coin_amount_config['symbol'])}\n"
         f"Winner: #{winner['rank']} @{safe_username}\n"
         f"Wallet: <code>{html.escape(winner['wallet_address'])}</code>\n"
         f"Eligible wallets: {len(weighted_candidates)} / {RAFFLE_MAX_RANK}\n"

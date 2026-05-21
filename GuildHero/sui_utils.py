@@ -2,6 +2,7 @@ import base64
 import hashlib
 import os
 import re
+from decimal import Decimal, InvalidOperation
 
 from nacl.secret import SecretBox
 from nacl.signing import SigningKey
@@ -14,7 +15,9 @@ _BECH32_CONST = 1
 _SUI_PRIVATE_KEY_HRP = "suiprivkey"
 _ED25519_SUI_KEY_SCHEME = 0x00
 DEFAULT_SUI_COIN_TYPE = "0x2::sui::SUI"
+DEFAULT_SUI_COIN_DECIMALS = 9
 ENCRYPTION_KEY_ENV = "AIRDROP_ENCRYPTION_KEY"
+_TOKEN_AMOUNT_REGEX = re.compile(r"^\d+(?:\.\d+)?$")
 
 
 def _normalize_hex_32_byte(value: str | None) -> str | None:
@@ -161,6 +164,41 @@ def build_airdrop_balance_requirements(recipient_count: int, amount: int, coin_t
         "required_sui_balance": required_sui_balance,
         "required_token_balance": required_token_balance,
     }
+
+
+def parse_token_amount(amount_text: str, decimals: int = DEFAULT_SUI_COIN_DECIMALS) -> int:
+    normalized = (amount_text or "").strip()
+    if not _TOKEN_AMOUNT_REGEX.fullmatch(normalized):
+        raise ValueError("Amount must be a valid number.")
+    try:
+        value = Decimal(normalized)
+    except InvalidOperation as exc:
+        raise ValueError("Amount must be a valid number.") from exc
+    fractional_digits = len(normalized.partition(".")[2])
+    if fractional_digits > decimals:
+        raise ValueError(f"Amount supports up to {decimals} decimal places.")
+    scale = Decimal(10) ** decimals
+    scaled_amount = int(value * scale)
+    if scaled_amount < 1:
+        raise ValueError("Amount must be greater than zero.")
+    return scaled_amount
+
+
+def format_token_amount(amount: int, decimals: int = DEFAULT_SUI_COIN_DECIMALS) -> str:
+    if decimals <= 0:
+        return f"{amount:,}"
+
+    sign = "-" if amount < 0 else ""
+    absolute_amount = abs(amount)
+    scale = 10 ** decimals
+    whole = absolute_amount // scale
+    fraction = absolute_amount % scale
+
+    if fraction == 0:
+        return f"{sign}{whole:,}"
+
+    fraction_text = str(fraction).zfill(decimals).rstrip("0")
+    return f"{sign}{whole:,}.{fraction_text}"
 
 
 def resolve_airdrop_sender_config(group_wallet: dict | None, env_private_key: str | None = None) -> dict | None:
