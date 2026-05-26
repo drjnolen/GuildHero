@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-from functools import lru_cache
 
 from openai import OpenAI
 
@@ -23,31 +22,27 @@ def get_openai_client():
     return _openai_client
 
 
-@lru_cache(maxsize=128)
-def _cached_analysis_response(username: str, message_count: int, messages_text: str) -> str:
+def analyze_user_messages(username: str, message_count: int, messages_text: str) -> dict:
+    """Score a user's messages on quality, tone, helpfulness, and humor (0–20 each)."""
     prompt = (
         f"User {username} posted {message_count} messages. "
         "Evaluate contributions on quality, tone, helpfulness, humor (0-20). "
         'Return valid JSON with keys: "quality", "tone", "helpfulness", "humor". '
         f"Messages:\n\n{messages_text}"
     )
-    client = get_openai_client()
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "You are an analytical assistant."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.1,
-        max_tokens=100,
-        timeout=30.0,
-    )
-    return response.choices[0].message.content.strip()
-
-
-def analyze_user_messages(username: str, message_count: int, messages_text: str) -> dict:
     try:
-        return json.loads(_cached_analysis_response(username, message_count, messages_text))
+        client = get_openai_client()
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are an analytical assistant."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+            max_tokens=100,
+            timeout=30.0,
+        )
+        return json.loads(response.choices[0].message.content.strip())
     except Exception as exc:
         logger.error("Error analyzing messages for %s: %s", username, exc)
         return {"quality": 8, "tone": 10, "helpfulness": 8, "humor": 8}

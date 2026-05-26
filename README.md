@@ -51,7 +51,7 @@ An all-in-one Telegram community management and engagement bot built for crypto-
 ## Setup
 
 ### Requirements
-- Python 3.10+
+- Python 3.12+
 - A [Telegram Bot Token](https://core.telegram.org/bots#botfather)
 - An [OpenAI API Key](https://platform.openai.com/api-keys)
 - A PostgreSQL database (provided automatically by Railway)
