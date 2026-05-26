@@ -12,10 +12,11 @@ HELP_TEXT = (
     "/bestof &lt;number&gt; - See the best messages from the last number of posts.\n"
     "/vibecheck &lt;number&gt; - Check the group's vibe on the last number of messages.\n"
     "<i>You can add a topic to any of the above, like /summarize 500 bitcoin</i>\n\n"
-    "<b>📊 Stats & Fun</b>\n"
+    "<b>📊 Stats &amp; Fun</b>\n"
     "/score - Get a detailed, AI-integrated contribution leaderboard (admin).\n"
     "/publicscore - Show a simple leaderboard in the chat (admin).\n"
     "/mystats - See your personal stats for this group.\n"
+    "/stats - Show overall group statistics.\n"
     "/mybadges - View the badges you've earned.\n"
     "/allbadges - See all available badges.\n"
     "/copypasta - Create a copypasta based on your message history.\n\n"
@@ -29,8 +30,12 @@ HELP_TEXT = (
     "/calendar - Manage the group's event calendar (admin).\n"
     "/events - List all upcoming events.\n"
     "/wallet - Submit or check your wallet address.\n"
+    "/removewallet - Remove your registered wallet from this group.\n"
     "/setwelcome on|off - Toggle welcome messages (admin).\n"
-    "/settimezone - Set the timezone for event announcements (admin).\n"
+    "/settimezone - Set the timezone for event announcements (admin).\n\n"
+    "<b>ℹ️ Other</b>\n"
+    "/help - Show this help message.\n"
+    "/cancel - Cancel any active operation (e.g., wallet submission).\n"
 )
 
 _ALLOWED_TAGS = {"b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "code", "pre", "a", "blockquote"}

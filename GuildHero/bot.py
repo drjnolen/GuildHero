@@ -8,8 +8,6 @@ import asyncio
 import logging
 import io
 import csv
-import signal
-import sys
 import html
 import hashlib
 import time
@@ -69,6 +67,8 @@ FOOTER_HTML = "\n\n<i>Product of Alpha City (<a href=\"https://app.nexa.xyz/trad
 MAX_MESSAGES_FOR_SUMMARY = 1000
 # Set a safe upper limit for messages to load into memory at once to prevent crashes.
 MAX_MESSAGES_TO_PROCESS = 1500
+# Maximum message count a user may request for AI commands.
+MAX_MESSAGES_INPUT_LIMIT = 5000
 INVALID_FORMAT_MESSAGE = "Invalid format. Usage: /command #, or /command # topic. For example /command 100 or /command 500 Bitcoin"
 
 
@@ -98,6 +98,31 @@ COINGECKO_SCORE_SEARCH_ORDER_BONUS = 20
 COINGECKO_SCORE_MARKET_CAP_BONUS = 125
 PRICE_CACHE_TTL = 60  # seconds – avoid repeated API hits for the same symbol
 _price_cache: dict[str, tuple[dict, float]] = {}
+
+# --- AI Rate Limiting ---
+# One AI command per user per group per 60 seconds to prevent API cost abuse.
+AI_COOLDOWN_SECONDS = 60
+_ai_cooldowns: dict[tuple[int, int], float] = {}  # (user_id, chat_id) -> last_call_monotonic
+_AI_RATE_LIMIT_MESSAGE = "⏳ Please wait {remaining:.0f}s before using AI commands again."
+
+# How often (in transfer count) to edit the airdrop progress message.
+_AIRDROP_PROGRESS_UPDATE_INTERVAL = 3
+
+
+def _check_ai_rate_limit(user_id: int, chat_id: int) -> float:
+    """Return seconds remaining in cooldown, or 0.0 if the user may proceed."""
+    last = _ai_cooldowns.get((user_id, chat_id), 0.0)
+    remaining = AI_COOLDOWN_SECONDS - (time.monotonic() - last)
+    return max(0.0, remaining)
+
+
+def _record_ai_rate_limit(user_id: int, chat_id: int) -> None:
+    _ai_cooldowns[(user_id, chat_id)] = time.monotonic()
+
+
+# In-memory set of chat IDs whose messages have already been migrated from the
+# legacy blob format.  Avoids a DB round-trip on every stored message.
+_migrated_chats: set[int] = set()
 _coin_metadata_cache: dict[str, dict | None] = {}
 
 SUI_PRICE_ALIASES = {
@@ -256,13 +281,17 @@ def _track_chat(chat_id):
 
 def _ensure_messages_migrated(chat_id):
     chat_id_int = int(chat_id)
+    if chat_id_int in _migrated_chats:
+        return
     if db.has_messages(chat_id_int):
         db.enroll_chat(chat_id_int)
+        _migrated_chats.add(chat_id_int)
         return
     legacy_messages = db.get(_get_messages_key(chat_id_int), [])
     if legacy_messages:
         db.migrate_legacy_messages(chat_id_int, legacy_messages)
     db.enroll_chat(chat_id_int)
+    _migrated_chats.add(chat_id_int)
 
 
 def _get_recent_messages(chat_id, limit):
@@ -868,7 +897,6 @@ async def _parse_date_range(args):
     # Handle /command 7days format
     date_range_str = args[0].lower()
     if date_range_str.endswith(('day', 'days')):
-        import re
         match = re.match(r'^(\d+)days?$', date_range_str)
         if match: 
             days = int(match.group(1))
@@ -1117,14 +1145,22 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(INVALID_FORMAT_MESSAGE)
         return
 
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    remaining = _check_ai_rate_limit(user_id, chat_id)
+    if remaining > 0:
+        await update.message.reply_text(_AI_RATE_LIMIT_MESSAGE.format(remaining=remaining))
+        return
+
     try:
-        count = int(context.args[0])
+        count = min(int(context.args[0]), MAX_MESSAGES_INPUT_LIMIT)
         topic = " ".join(context.args[1:]) if len(context.args) > 1 else None
 
         await update.message.reply_text("Summarizing conversation, this may take a moment...")
+        _record_ai_rate_limit(user_id, chat_id)
 
-        _track_chat(update.effective_chat.id)
-        messages = await asyncio.to_thread(_get_recent_messages, update.effective_chat.id, count)
+        _track_chat(chat_id)
+        messages = await asyncio.to_thread(_get_recent_messages, chat_id, count)
 
         if not messages:
             await update.message.reply_text("No messages found to summarize.")
@@ -1168,13 +1204,21 @@ async def bestof_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(INVALID_FORMAT_MESSAGE)
         return
 
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    remaining = _check_ai_rate_limit(user_id, chat_id)
+    if remaining > 0:
+        await update.message.reply_text(_AI_RATE_LIMIT_MESSAGE.format(remaining=remaining))
+        return
+
     try:
-        count = int(context.args[0])
+        count = min(int(context.args[0]), MAX_MESSAGES_INPUT_LIMIT)
 
         await update.message.reply_text("Curating the best messages, please wait...")
+        _record_ai_rate_limit(user_id, chat_id)
 
-        _track_chat(update.effective_chat.id)
-        messages = await asyncio.to_thread(_get_recent_messages, update.effective_chat.id, count)
+        _track_chat(chat_id)
+        messages = await asyncio.to_thread(_get_recent_messages, chat_id, count)
 
         if not messages:
             await update.message.reply_text("No messages found to create a digest from.")
@@ -1212,14 +1256,22 @@ async def vibecheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(INVALID_FORMAT_MESSAGE)
         return
 
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    remaining = _check_ai_rate_limit(user_id, chat_id)
+    if remaining > 0:
+        await update.message.reply_text(_AI_RATE_LIMIT_MESSAGE.format(remaining=remaining))
+        return
+
     try:
-        count = int(context.args[0])
+        count = min(int(context.args[0]), MAX_MESSAGES_INPUT_LIMIT)
         topic = " ".join(context.args[1:]) if len(context.args) > 1 else None
 
         await update.message.reply_text("Checking the vibe, please wait...")
+        _record_ai_rate_limit(user_id, chat_id)
 
-        _track_chat(update.effective_chat.id)
-        messages = await asyncio.to_thread(_get_recent_messages, update.effective_chat.id, count)
+        _track_chat(chat_id)
+        messages = await asyncio.to_thread(_get_recent_messages, chat_id, count)
 
         if not messages:
             await update.message.reply_text("No messages found to analyze.")
@@ -1273,7 +1325,13 @@ async def copypasta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
+    remaining = _check_ai_rate_limit(user_id, chat_id)
+    if remaining > 0:
+        await update.message.reply_text(_AI_RATE_LIMIT_MESSAGE.format(remaining=remaining))
+        return
+
     await update.message.reply_text("Digging through your post history to get your essence...")
+    _record_ai_rate_limit(user_id, chat_id)
 
     _track_chat(chat_id)
     user_messages = await asyncio.to_thread(_get_recent_user_messages, chat_id, user_id, 200)
@@ -1499,8 +1557,16 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     success_count = 0
     fail_count = 0
+    total_recipients = len(recipients_with_wallets)
 
-    for username, wallet_address in recipients_with_wallets:
+    # Send a live progress message for larger airdrops so the group knows it's working.
+    progress_msg = None
+    if total_recipients > 3:
+        progress_msg = await update.message.reply_text(
+            f"⏳ Sending transfers... (0 / {total_recipients})", parse_mode=ParseMode.HTML
+        )
+
+    for idx, (username, wallet_address) in enumerate(recipients_with_wallets, start=1):
         safe_username = html.escape(username)
         try:
             tx_result = await sui_transfer_token(wallet_address, amount, coin_type, sender_config['private_key_hex'])
@@ -1511,6 +1577,20 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logging.error(f'Airdrop transfer failed for {username} ({wallet_address}): {e}')
             results.append(f'❌ @{safe_username}: {html.escape(str(e)[:60])}')
             fail_count += 1
+
+        if progress_msg and idx % _AIRDROP_PROGRESS_UPDATE_INTERVAL == 0 and idx < total_recipients:
+            try:
+                await progress_msg.edit_text(
+                    f"⏳ Sending transfers... ({idx} / {total_recipients})", parse_mode=ParseMode.HTML
+                )
+            except Exception:
+                pass
+
+    if progress_msg:
+        try:
+            await progress_msg.delete()
+        except Exception:
+            pass
 
     results_text = "\n".join(results)
     summary = (
@@ -1747,13 +1827,12 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(stats_text + top_users_text + FOOTER_HTML, parse_mode=ParseMode.HTML)
 
 async def mystats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sends the user their personal stats in a private message."""
+    """Sends the user their personal stats as a reply in the current chat."""
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
 
     _track_chat(chat_id)
     await asyncio.to_thread(_ensure_messages_migrated, chat_id)
-    await update.message.reply_text("Checking your stats... I'll send them to you in a private message.")
     rank_row = await asyncio.to_thread(db.get_user_rank, chat_id, user_id)
     if rank_row:
         rank, user_message_count = rank_row
@@ -1774,11 +1853,7 @@ async def mystats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{badge_text}"
     )
 
-    try:
-        await context.bot.send_message(chat_id=user_id, text=stats_message + FOOTER_HTML, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        logging.error(f'Failed to send private stats to {user_id}: {e}')
-        await update.message.reply_text("I couldn't send you a private message. Please start a chat with me first!")
+    await update.message.reply_text(stats_message + FOOTER_HTML, parse_mode=ParseMode.HTML)
 
 
 async def calendar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1868,6 +1943,35 @@ async def wallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f'Error in wallet command for user {user_id} in chat {chat_id}: {e}')
         await update.message.reply_text('There was an error generating the wallet submission link. Please try again.')
+
+
+async def removewallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Removes the user's registered wallet for the current group."""
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text('Please use this command in a group chat to remove your wallet for that group.')
+        return
+
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    chat_id_str = str(chat_id)
+    user_id_str = str(user_id)
+
+    wallet_key = _get_wallet_key(chat_id_str, user_id_str)
+    old_wallet_key = f"{chat_id_str}:wallet:{user_id_str}"
+
+    removed = False
+    if wallet_key in db:
+        del db[wallet_key]
+        removed = True
+    if old_wallet_key in db:
+        del db[old_wallet_key]
+        removed = True
+
+    if removed:
+        await update.message.reply_text('✅ Your wallet has been removed for this group. You will be skipped in future airdrops.')
+        logging.info(f'Wallet removed for user {user_id} in chat {chat_id}')
+    else:
+        await update.message.reply_text("You don't have a wallet registered for this group.")
 
 
 async def receive_airdrop_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2035,8 +2139,13 @@ async def handle_event_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return ConversationHandler.END
     selected_date = datetime.date.fromisoformat(selected_date_iso)
     _track_chat(chat_id)
-    db[_get_event_key(chat_id, selected_date)] = update.message.text
-    await update.message.reply_text(f'✅ Event for {selected_date:%B %d, %Y} scheduled!')
+    event_text = update.message.text
+    db[_get_event_key(chat_id, selected_date)] = event_text
+    await update.message.reply_text(
+        f'✅ Event for {selected_date:%B %d, %Y} scheduled!\n\n'
+        f'<blockquote>{html.escape(event_text)}</blockquote>',
+        parse_mode=ParseMode.HTML,
+    )
     now = datetime.datetime.now()
     await update.message.reply_text('📅 <b>Event Calendar</b>', reply_markup=generate_calendar_keyboard(now.year, now.month, chat_id), parse_mode=ParseMode.HTML)
     return SELECTING_ACTION
@@ -2149,6 +2258,7 @@ async def setup_bot_commands(application):
         BotCommand("setwelcome", "Toggle welcome messages (admin)"),
         BotCommand("stats", "Show chat statistics"),
         BotCommand("wallet", "Submit or check your wallet address"),
+        BotCommand("removewallet", "Remove your registered wallet from this group"),
         BotCommand("cancel", "Cancel current operation")
     ]
     private_commands = [
@@ -2156,6 +2266,7 @@ async def setup_bot_commands(application):
         BotCommand("help", "Show help and command list"),
         BotCommand("price", "Crypto price: /price <symbol>"),
         BotCommand("wallet", "Submit or check your wallet address"),
+        BotCommand("removewallet", "Remove your registered wallet from this group"),
         BotCommand("mybadges", "View your earned badges"),
         BotCommand("allbadges", "See all available badges"),
         BotCommand("mystats", "View your personal stats"),
@@ -2230,19 +2341,13 @@ def main():
     application.add_handler(CommandHandler("events", events_command))
     application.add_handler(CommandHandler("settimezone", set_timezone_command))
     application.add_handler(CommandHandler("wallet", wallet_command))
+    application.add_handler(CommandHandler("removewallet", removewallet_command))
     application.add_handler(CallbackQueryHandler(button_callback, pattern="^(score_|export_csv_)"))
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_message))
     application.add_error_handler(error_handler)
     application.post_init = setup_bot_commands
     application.post_shutdown = shutdown_services
-
-    def handle_signal(signum, frame):
-        logging.info("Shutdown signal received, stopping bot.")
-        application.stop()
-        sys.exit(0)
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
