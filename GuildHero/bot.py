@@ -103,6 +103,10 @@ _price_cache: dict[str, tuple[dict, float]] = {}
 # One AI command per user per group per 60 seconds to prevent API cost abuse.
 AI_COOLDOWN_SECONDS = 60
 _ai_cooldowns: dict[tuple[int, int], float] = {}  # (user_id, chat_id) -> last_call_monotonic
+_AI_RATE_LIMIT_MESSAGE = "⏳ Please wait {remaining:.0f}s before using AI commands again."
+
+# How often (in transfer count) to edit the airdrop progress message.
+_AIRDROP_PROGRESS_UPDATE_INTERVAL = 3
 
 
 def _check_ai_rate_limit(user_id: int, chat_id: int) -> float:
@@ -1145,7 +1149,7 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     remaining = _check_ai_rate_limit(user_id, chat_id)
     if remaining > 0:
-        await update.message.reply_text(f"⏳ Please wait {remaining:.0f}s before using AI commands again.")
+        await update.message.reply_text(_AI_RATE_LIMIT_MESSAGE.format(remaining=remaining))
         return
 
     try:
@@ -1204,7 +1208,7 @@ async def bestof_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     remaining = _check_ai_rate_limit(user_id, chat_id)
     if remaining > 0:
-        await update.message.reply_text(f"⏳ Please wait {remaining:.0f}s before using AI commands again.")
+        await update.message.reply_text(_AI_RATE_LIMIT_MESSAGE.format(remaining=remaining))
         return
 
     try:
@@ -1256,7 +1260,7 @@ async def vibecheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     remaining = _check_ai_rate_limit(user_id, chat_id)
     if remaining > 0:
-        await update.message.reply_text(f"⏳ Please wait {remaining:.0f}s before using AI commands again.")
+        await update.message.reply_text(_AI_RATE_LIMIT_MESSAGE.format(remaining=remaining))
         return
 
     try:
@@ -1323,7 +1327,7 @@ async def copypasta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     remaining = _check_ai_rate_limit(user_id, chat_id)
     if remaining > 0:
-        await update.message.reply_text(f"⏳ Please wait {remaining:.0f}s before using AI commands again.")
+        await update.message.reply_text(_AI_RATE_LIMIT_MESSAGE.format(remaining=remaining))
         return
 
     await update.message.reply_text("Digging through your post history to get your essence...")
@@ -1574,7 +1578,7 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             results.append(f'❌ @{safe_username}: {html.escape(str(e)[:60])}')
             fail_count += 1
 
-        if progress_msg and idx % 3 == 0 and idx < total_recipients:
+        if progress_msg and idx % _AIRDROP_PROGRESS_UPDATE_INTERVAL == 0 and idx < total_recipients:
             try:
                 await progress_msg.edit_text(
                     f"⏳ Sending transfers... ({idx} / {total_recipients})", parse_mode=ParseMode.HTML

@@ -52,8 +52,8 @@ import bot  # noqa: E402  (must come after sys.modules setup)
 # After bot.py is imported, remove the mocks for modules that have their own
 # test files (or that those test files depend on) so that alphabetically-later
 # test runners see the real modules instead of MagicMocks.
-for _cleanup in ("sui_utils", "raffle_utils", "nacl", "nacl.signing", "nacl.secret"):
-    sys.modules.pop(_cleanup, None)
+for _mod_name in ("sui_utils", "raffle_utils", "nacl", "nacl.signing", "nacl.secret"):
+    sys.modules.pop(_mod_name, None)
 
 from bot import (  # noqa: E402
     format_large_number,

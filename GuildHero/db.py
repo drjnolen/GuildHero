@@ -275,7 +275,7 @@ class PostgresKV:
                     """,
                     (chat_id, limit),
                 )
-                rows = list(cur.fetchall())
+                rows = cur.fetchall()
             rows.reverse()
             return [
                 {
@@ -303,7 +303,7 @@ class PostgresKV:
                     """,
                     (chat_id, user_id, limit),
                 )
-                rows = list(cur.fetchall())
+                rows = cur.fetchall()
             rows.reverse()
             return [
                 {
