@@ -1,5 +1,5 @@
 """
-PostgreSQL-backed storage for GuildHero data.
+PostgreSQL-backed storage for CityLedger data.
 
 Provides a key-value API for existing bot state plus normalized tables for
 messages and enrolled chats.

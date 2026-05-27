@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-BOT_DIR = PROJECT_ROOT / "GuildHero"
+BOT_DIR = PROJECT_ROOT / "CityLedger"
 if str(BOT_DIR) not in sys.path:
     sys.path.insert(0, str(BOT_DIR))
 
