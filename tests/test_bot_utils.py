@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-BOT_DIR = PROJECT_ROOT / "GuildHero"
+BOT_DIR = PROJECT_ROOT / "CityLedger"
 
 # Provide a dummy DATABASE_URL so the db module doesn't raise on import.
 os.environ.setdefault("DATABASE_URL", "postgresql://localhost/test")

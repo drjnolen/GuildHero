@@ -1,4 +1,4 @@
-# GuildHero Bot
+# CityLedger Bot
 
 An all-in-one Telegram community management and engagement bot built for crypto-related group chats. Powered by AI analysis, gamification, real-time crypto data, and SUI blockchain airdrops.
 
@@ -77,7 +77,7 @@ pip install -r requirements.txt
 ### Running Locally
 
 ```bash
-export DATABASE_URL="postgresql://user:password@localhost:5432/guildhero"
+export DATABASE_URL="postgresql://user:password@localhost:5432/cityledger"
 export TELEGRAM_BOT_TOKEN="your-token"
 export OPENAI_API_KEY="your-key"
 python main.py
@@ -121,10 +121,10 @@ To enable airdrops:
 
 The bot uses a small modular Python layout:
 - `main.py` — repository-root entrypoint
-- `GuildHero/bot.py` — Telegram command handlers and bot wiring
-- `GuildHero/ai_services.py` — OpenAI-powered scoring, summaries, vibe checks, and copypasta generation
-- `GuildHero/telegram_utils.py` — shared help text, admin checks, HTML sanitization, and wallet validation
-- `GuildHero/db.py` — PostgreSQL-backed key-value storage plus normalized message storage
+- `CityLedger/bot.py` — Telegram command handlers and bot wiring
+- `CityLedger/ai_services.py` — OpenAI-powered scoring, summaries, vibe checks, and copypasta generation
+- `CityLedger/telegram_utils.py` — shared help text, admin checks, HTML sanitization, and wallet validation
+- `CityLedger/db.py` — PostgreSQL-backed key-value storage plus normalized message storage
 
 Core integrations:
 - **python-telegram-bot** — Telegram Bot API framework

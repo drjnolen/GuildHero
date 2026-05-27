@@ -1,4 +1,4 @@
-# Contributing to GuildHero
+# Contributing to CityLedger
 
 Thanks for your interest in contributing!  This guide covers how to set up the project, run tests, and add new commands.
 
@@ -56,13 +56,13 @@ Tests live in the `tests/` directory.  They mock all external services (database
 ## Project Structure
 
 ```
-GuildHero/
+CityLedger/
 ├── main.py                 # Repository entrypoint
 ├── requirements.txt        # Python dependencies
 ├── Dockerfile              # Container build (used by Railway)
 ├── railway.toml            # Railway deploy config
 ├── .env.example            # Environment variable template
-├── GuildHero/              # Bot source code
+├── CityLedger/             # Bot source code
 │   ├── bot.py              # Telegram command handlers and bot wiring
 │   ├── ai_services.py      # OpenAI-powered analysis functions
 │   ├── db.py               # PostgreSQL-backed key-value + message storage
@@ -81,7 +81,7 @@ GuildHero/
 
 ## Adding a New Command
 
-1. **Write the handler** in `GuildHero/bot.py`, following the existing pattern:
+1. **Write the handler** in `CityLedger/bot.py`, following the existing pattern:
 
    ```python
    async def mycommand_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -101,7 +101,7 @@ GuildHero/
    BotCommand("mycommand", "Brief description shown in the Telegram command menu"),
    ```
 
-4. **Update the help text** in `GuildHero/telegram_utils.py` under the relevant section.
+4. **Update the help text** in `CityLedger/telegram_utils.py` under the relevant section.
 
 5. **Write tests** for any pure logic functions in `tests/`.
 
