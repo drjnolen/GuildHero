@@ -38,6 +38,7 @@ from telegram import (
     BotCommand,
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
+    BotCommandScopeDefault,
 )
 from telegram.constants import ChatType, ParseMode
 from telegram.ext import (
@@ -2274,6 +2275,7 @@ async def setup_bot_commands(application):
         BotCommand("cancel", "Cancel current operation"),
     ]
     await asyncio.gather(
+        application.bot.set_my_commands(commands, scope=BotCommandScopeDefault()),
         application.bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats()),
         application.bot.set_my_commands(private_commands, scope=BotCommandScopeAllPrivateChats()),
     )
