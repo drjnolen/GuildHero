@@ -32,6 +32,7 @@ HELP_TEXT = (
     "/wallet - Submit or check your wallet address.\n"
     "/removewallet - Remove your registered wallet from this group.\n"
     "/setwelcome on|off - Toggle welcome messages (admin).\n"
+    "/setachievements on|off - Toggle achievement tracking (admin).\n"
     "/settimezone - Set the timezone for event announcements (admin).\n\n"
     "<b>ℹ️ Other</b>\n"
     "/help - Show this help message.\n"

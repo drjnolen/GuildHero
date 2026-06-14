@@ -78,9 +78,6 @@ BADGES = {
     'contributor_100': {'name': 'Contributor', 'emoji': '✍️', 'description': 'Sent over 100 messages.'},
     'hero_500': {'name': 'Hero', 'emoji': '🦸', 'description': 'Sent over 500 messages.'},
     'godlike_1000': {'name': 'God-like', 'emoji': '⚡️', 'description': 'Sent over 1,000 messages.'},
-    'weekly_champ': {'name': 'Weekly Champion', 'emoji': '👑', 'description': 'Finished #1 in a weekly leaderboard.'},
-    'high_quality': {'name': 'High Quality', 'emoji': '✨', 'description': 'Achieved an average quality score of 18+.'},
-    'helping_hand': {'name': 'Helping Hand', 'emoji': '🙏', 'description': 'Achieved a helpfulness score of 18+.'},
     'diamond_hands': {'name': 'Diamond Hands', 'emoji': '💎', 'description': 'Active in the group for 30+ days.'},
 }
 
@@ -129,31 +126,139 @@ _coin_metadata_cache: dict[str, dict | None] = {}
 SUI_PRICE_ALIASES = {
     "afsui": "aftermath-staked-sui",
     "blub": "blub",
-    "buck": "bucket-protocol",
+    "buck": "bucket-protocol-buck-stablecoin",
     "cetus": "cetus-protocol",
     "sui": "sui",
-    "deep": "deepbook-protocol",
-    "deepbook": "deepbook-protocol",
+    "deep": "deep",
+    "deepbook": "deep",
     "fud": "fud-the-pug",
     "hasui": "haedal-staked-sui",
     "hippo": "sudeng",
-    "navx": "navi-protocol",
+    "navx": "navi",
     "wal": "walrus-2",
     "walrus": "walrus-2",
-    "ns": "ns-protocol",
+    "ns": "suins-token",
     "sca": "scallop-2",
-    "sol": "solana",
     "sudeng": "sudeng",
-    "suins": "ns-protocol",
+    "suins": "suins-token",
     "turbos": "turbos-finance",
+    "vsui": "volo-staked-sui",
+    "usdy": "ondo-us-dollar-yield",
+    "lbtc": "lombard-staked-btc",
+    "mbtc": "merlin-s-seal-btc",
+    "fdusd": "first-digital-usd",
+    "tbtc": "tbtc",
+    "enzobtc": "lorenzo-wrapped-bitcoin",
+    "ausd": "agora-dollar",
+    "xaum": "matrixdock-gold",
+    "magma": "magma-finance",
+    "bce": "bitcastle-token",
+    "xbtc": "okx-wrapped-btc",
+    "truth": "swarm-network",
+    "mmt": "momentum-3",
+    "stbtc": "lorenzo-stbtc",
+    "us": "talus",
+    "bluai": "bluwhale",
+    "suiusde": "esui-dollar",
+    "sbusdt": "sui-bridged-usdt-sui",
+    "ethird": "ember-third-eye",
+    "alpha": "alpha-fi",
+    "sweat": "sweatcoin",
+    "ssui": "spring-staked-sui",
+    "aia": "aia",
+    "blue": "bluefin",
+    "take": "overtake",
+    "ika": "ika",
+    "xagm": "matrixdock-silver",
+    "lofi": "lofi-2",
+    "esui": "ember-sui",
+    "send": "suilend",
+    "xmn": "xmoney-2",
+    "lwa": "onbuff",
+    "miu": "miu-2",
+    "tato": "pawtato",
+    "memefi": "memefi-2",
+    "eearn": "ember-earn",
+    "axol": "axol",
+    "pans": "pandasui-coin",
+    "attn": "attention",
+    "alkimi": "alkimi-2",
+    "warped": "warped-games",
+    "flx": "flowx-finance",
+    "but": "bucket-token",
+    "manifest": "manifest-3",
+    "usdz": "usdz",
+    "up": "doubleup",
+    "chirp": "chirp-token",
+    "aaa": "aaa-cat",
+    "suai": "suiai",
+    "xsui": "xsui",
+    "shr0": "sroomai-dao",
+    "musd": "meta-usd",
+    "seed": "seed-3",
+    "koban": "koban",
+    "artfi": "artfi",
+    "brat": "brat-2",
+    "suijak": "suijak",
+    "s": "agent-s",
+    "tardi": "tardi",
+    "suitrump": "sui-trump",
+    "toilet": "toilet-dust",
+    "pumpkin": "pumpkin-token",
+    "beeg": "beeg-blue-whale",
+    "hsui": "suicune-on-sui",
+    "suimon": "suimon",
+    "suiai": "sui-agents",
+    "pigu": "pigu",
+    "city": "alpha-city-2",
+    "typus": "typus",
+    "sonic": "sonic-snipe-bot",
+    "pstake": "pstake-finance",
+    "wav": "wave",
+    "victory": "victory-2",
+    "scb": "sacabam",
+    "skelsui": "skeleton",
+    "suiyan": "super-suiyan",
+    "culo": "culosui",
+    "pugwif": "pugwifhat",
+    "zen": "zenfrogs",
+    "sail": "full-sail",
+}
+
+GENERAL_PRICE_ALIASES = {
+    "btc": "bitcoin",
+    "eth": "ethereum",
+    "bnb": "binancecoin",
+    "sol": "solana",
+    "xrp": "ripple",
+    "ada": "cardano",
+    "doge": "dogecoin",
+    "dot": "polkadot",
+    "ltc": "litecoin",
+    "link": "chainlink",
+    "uni": "uniswap",
+    "near": "near",
+    "matic": "matic-network",
+    "pol": "polygon-ecosystem-token",
+    "pepe": "pepe",
+    "wif": "dogwifhat",
+    "bonk": "bonk",
+    "ton": "the-open-network",
+    "avax": "avalanche-2",
+    "shib": "shiba-inu",
+    "op": "optimism",
+    "arb": "arbitrum",
+    "rndr": "render-token",
+    "fet": "artificial-superintelligence-alliance",
     "usdc": "usd-coin",
     "usdt": "tether",
-    "vsui": "volo-staked-sui",
     "wbtc": "wrapped-bitcoin",
     "weth": "ethereum",
     "wusdc": "usd-coin",
     "wusdt": "tether",
 }
+
+ALL_PRICE_ALIASES = {**SUI_PRICE_ALIASES, **GENERAL_PRICE_ALIASES}
 
 # --- SUI Blockchain ---
 SUI_RPC_URL = os.environ.get("SUI_RPC_URL", "https://fullnode.mainnet.sui.io:443")
@@ -265,6 +370,10 @@ def _get_badges_key(chat_id, user_id):
 def _get_welcome_key(chat_id):
     """Returns the database key for the welcome message toggle."""
     return f"welcome:{chat_id}"
+
+def _get_achievements_enabled_key(chat_id):
+    """Returns the database key for the achievements enabled toggle."""
+    return f"achievements_enabled:{chat_id}"
 
 def _get_airdrop_token_key(chat_id):
     """Returns the database key for the group's airdrop token type."""
@@ -395,24 +504,25 @@ async def store_message_db(context: ContextTypes.DEFAULT_TYPE, chat_id, user_id,
         user_stats["message_count"] += 1
         db[stats_key] = user_stats
 
-        message_count = user_stats["message_count"]
-        if message_count == 100:
-            await award_badge(context, chat_id, user_id, 'contributor_100')
-        elif message_count == 500:
-            await award_badge(context, chat_id, user_id, 'hero_500')
-        elif message_count == 1000:
-            await award_badge(context, chat_id, user_id, 'godlike_1000')
+        if db.get(_get_achievements_enabled_key(chat_id), False):
+            message_count = user_stats["message_count"]
+            if message_count == 100:
+                await award_badge(context, chat_id, user_id, 'contributor_100')
+            elif message_count == 500:
+                await award_badge(context, chat_id, user_id, 'hero_500')
+            elif message_count == 1000:
+                await award_badge(context, chat_id, user_id, 'godlike_1000')
 
-        if "first_seen" not in user_stats:
-            user_stats["first_seen"] = date.isoformat()
-            db[stats_key] = user_stats
-        else:
-            first_seen = datetime.datetime.fromisoformat(user_stats["first_seen"])
-            if first_seen.tzinfo is None:
-                first_seen = first_seen.replace(tzinfo=datetime.timezone.utc)
-            now = date if date.tzinfo else date.replace(tzinfo=datetime.timezone.utc)
-            if (now - first_seen).days >= 30:
-                await award_badge(context, chat_id, user_id, 'diamond_hands')
+            if "first_seen" not in user_stats:
+                user_stats["first_seen"] = date.isoformat()
+                db[stats_key] = user_stats
+            else:
+                first_seen = datetime.datetime.fromisoformat(user_stats["first_seen"])
+                if first_seen.tzinfo is None:
+                    first_seen = first_seen.replace(tzinfo=datetime.timezone.utc)
+                now = date if date.tzinfo else date.replace(tzinfo=datetime.timezone.utc)
+                if (now - first_seen).days >= 30:
+                    await award_badge(context, chat_id, user_id, 'diamond_hands')
 
     except Exception as e:
         logging.error(f"Error storing message from {username} in chat {chat_id}: {e}")
@@ -689,7 +799,7 @@ async def fetch_crypto_price(symbol: str) -> dict | None:
     try:
         client = await get_shared_async_client()
         normalized_query = re.sub(r"[^a-z0-9]+", "", symbol.lower())
-        preferred_coin_id = SUI_PRICE_ALIASES.get(normalized_query)
+        preferred_coin_id = ALL_PRICE_ALIASES.get(normalized_query)
 
         search_coin_map: dict[str, tuple[dict, int]] = {}
 
@@ -1363,6 +1473,22 @@ async def setwelcome_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(f'Welcome messages have been {status}.')
 
 
+async def setachievements_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allows admins to toggle achievement tracking on or off."""
+    if not await require_admin(update, context):
+        return
+
+    _track_chat(update.effective_chat.id)
+    if not context.args or context.args[0].lower() not in ('on', 'off'):
+        await update.message.reply_text('Usage: /setachievements on or /setachievements off')
+        return
+
+    enabled = context.args[0].lower() == 'on'
+    db[_get_achievements_enabled_key(update.effective_chat.id)] = enabled
+    status = 'enabled ✅' if enabled else 'disabled ❌'
+    await update.message.reply_text(f'Achievement tracking has been {status}.')
+
+
 async def settoken_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Allows admins to set the airdrop token type for the group."""
     if not await require_admin(update, context):
@@ -1751,7 +1877,7 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not price_data:
         await update.message.reply_text(
             f"❌ Could not find price data for <b>{html.escape(symbol.upper())}</b>. "
-            "Try the full name (e.g., 'bitcoin') or symbol (e.g., 'BTC', 'SUI', 'DEEP', 'WAL', 'NS').",
+            "Try the full name (e.g., 'bitcoin') or symbol (e.g., 'BTC', 'SUI', 'DEEP', 'IKA', 'WAL', 'NS').",
             parse_mode=ParseMode.HTML
         )
         return
@@ -1780,6 +1906,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def mybadges_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Displays the user's earned badges."""
     chat_id = update.effective_chat.id
+    if update.effective_chat.type != ChatType.PRIVATE and not db.get(_get_achievements_enabled_key(chat_id), False):
+        await update.message.reply_text("Achievement tracking is currently disabled in this group. Admins can enable it using `/setachievements on`.")
+        return
+
     user_id = update.effective_user.id
     badges_key = _get_badges_key(chat_id, user_id)
     user_badges = db.get(badges_key, [])
@@ -1798,6 +1928,11 @@ async def mybadges_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def allbadges_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Displays all available badges."""
+    chat_id = update.effective_chat.id
+    if update.effective_chat.type != ChatType.PRIVATE and not db.get(_get_achievements_enabled_key(chat_id), False):
+        await update.message.reply_text("Achievement tracking is currently disabled in this group. Admins can enable it using `/setachievements on`.")
+        return
+
     message = "🏆 <b>All Available Badges</b>\n\n"
     for badge_id, badge in BADGES.items():
         message += f"{badge['emoji']} <b>{badge['name']}</b>: {badge['description']}\n"
@@ -2257,6 +2392,7 @@ async def setup_bot_commands(application):
         BotCommand("events", "List all upcoming events"),
         BotCommand("settimezone", "Set timezone for announcements (admin only)"),
         BotCommand("setwelcome", "Toggle welcome messages (admin)"),
+        BotCommand("setachievements", "Toggle achievement tracking (admin)"),
         BotCommand("stats", "Show chat statistics"),
         BotCommand("wallet", "Submit or check your wallet address"),
         BotCommand("removewallet", "Remove your registered wallet from this group"),
@@ -2335,6 +2471,7 @@ def main():
     application.add_handler(CommandHandler("setairdropwallet", setairdropwallet_command))
     application.add_handler(CommandHandler("settoken", settoken_command))
     application.add_handler(CommandHandler("setwelcome", setwelcome_command))
+    application.add_handler(CommandHandler("setachievements", setachievements_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("mybadges", mybadges_command))
     application.add_handler(CommandHandler("allbadges", allbadges_command))
