@@ -431,6 +431,10 @@ def _get_buybot_start_checkpoint_key(chat_id):
     return f"buybot_start_checkpoint:{chat_id}"
 
 
+def _get_buybot_media_key(chat_id):
+    return f"buybot_media:{chat_id}"
+
+
 def _get_buybot_checkpoint_key():
     return "buybot:checkpoint"
 
@@ -820,6 +824,44 @@ def _remember_buybot_digest(chat_id: int, digest: str) -> None:
         db[key] = seen[-_BUYBOT_SEEN_DIGEST_LIMIT:]
 
 
+def _buybot_media_from_message(message) -> dict[str, str] | None:
+    """Extract reusable Telegram media from a replied-to message."""
+
+    if message is None:
+        return None
+    animation = getattr(message, "animation", None)
+    animation_file_id = getattr(animation, "file_id", None)
+    if animation_file_id:
+        return {"type": "animation", "file_id": str(animation_file_id)}
+
+    photos = getattr(message, "photo", None) or []
+    photo_file_id = getattr(photos[-1], "file_id", None) if photos else None
+    if photo_file_id:
+        return {"type": "photo", "file_id": str(photo_file_id)}
+    return None
+
+
+def _get_buybot_media(chat_id: int) -> dict[str, str] | None:
+    media = db.get(_get_buybot_media_key(chat_id))
+    if not isinstance(media, dict):
+        return None
+    media_type = media.get("type")
+    file_id = media.get("file_id")
+    if (
+        media_type not in {"photo", "animation"}
+        or not isinstance(file_id, str)
+        or not file_id
+    ):
+        return None
+    return {"type": media_type, "file_id": file_id}
+
+
+def _clear_buybot_media(chat_id: int) -> None:
+    key = _get_buybot_media_key(chat_id)
+    if key in db:
+        del db[key]
+
+
 def _positive_decimal(value) -> Decimal | None:
     try:
         decimal_value = Decimal(str(value))
@@ -950,6 +992,52 @@ def _format_buy_announcement(
     return "\n".join(lines) + FOOTER_HTML
 
 
+async def _send_buy_announcement(context, chat_id: int, text: str) -> None:
+    """Send one text or media-caption announcement using group customization."""
+
+    media = await asyncio.to_thread(_get_buybot_media, chat_id)
+    if not media:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        return
+
+    try:
+        if media["type"] == "photo":
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=media["file_id"],
+                caption=text,
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await context.bot.send_animation(
+                chat_id=chat_id,
+                animation=media["file_id"],
+                caption=text,
+                parse_mode=ParseMode.HTML,
+            )
+    except Exception as exc:
+        if exc.__class__.__name__ != "BadRequest":
+            raise
+        logging.warning(
+            "Telegram rejected custom buy media for chat %s; clearing it and "
+            "falling back to text: %s",
+            chat_id,
+            exc,
+        )
+        await asyncio.to_thread(_clear_buybot_media, chat_id)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+
+
 async def _announce_checkpoint_buys(
     context,
     checkpoint,
@@ -979,12 +1067,7 @@ async def _announce_checkpoint_buys(
                 if await asyncio.to_thread(_buybot_digest_seen, chat_id, event.digest):
                     continue
                 try:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=text,
-                        parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True,
-                    )
+                    await _send_buy_announcement(context, chat_id, text)
                 except Exception as exc:
                     error_name = exc.__class__.__name__
                     logging.error(
@@ -1959,6 +2042,62 @@ async def setbuybot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Buy announcements are disabled.")
 
 
+async def setbuyimage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set, inspect, or remove a group's custom buy announcement media."""
+
+    if update.effective_chat.type == ChatType.PRIVATE:
+        await update.message.reply_text(
+            "Use /setbuyimage in the group whose buy announcements you want to customize."
+        )
+        return
+    if not await require_admin(update, context):
+        return
+
+    chat_id = update.effective_chat.id
+    _track_chat(chat_id)
+    args = [str(arg).lower() for arg in (context.args or [])]
+    if args:
+        if args == ["off"]:
+            _clear_buybot_media(chat_id)
+            await update.message.reply_text(
+                "✅ Custom buy announcement media has been removed."
+            )
+            return
+        await update.message.reply_text(
+            "Usage: Reply to a photo or GIF with /setbuyimage, or use "
+            "/setbuyimage off to remove it."
+        )
+        return
+
+    replied_message = update.message.reply_to_message
+    media = _buybot_media_from_message(replied_message)
+    if media:
+        db[_get_buybot_media_key(chat_id)] = media
+        media_label = "GIF" if media["type"] == "animation" else "image"
+        await update.message.reply_text(
+            f"✅ Custom buy announcement {media_label} saved for this group."
+        )
+        return
+
+    if replied_message is not None:
+        await update.message.reply_text(
+            "❌ That message does not contain a supported photo or GIF."
+        )
+        return
+
+    configured = _get_buybot_media(chat_id)
+    status = (
+        ("GIF ✅" if configured["type"] == "animation" else "image ✅")
+        if configured
+        else "not set"
+    )
+    await update.message.reply_text(
+        f"Custom buy media: {status}\n\n"
+        "Reply to a photo or GIF with /setbuyimage to use it in future buy "
+        "announcements. Use /setbuyimage off to return to text-only announcements."
+    )
+
+
 async def setairdropwallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Allows admins to configure an encrypted, per-group airdrop wallet in DM."""
     if update.effective_chat.type == ChatType.PRIVATE:
@@ -2832,6 +2971,7 @@ async def setup_bot_commands(application):
         BotCommand("setairdropwallet", "Set this group's encrypted airdrop wallet (admin)"),
         BotCommand("settoken", "Set airdrop token (admin)"),
         BotCommand("setbuybot", "Toggle selected-token buy announcements (admin)"),
+        BotCommand("setbuyimage", "Set a custom buy announcement image or GIF (admin)"),
         BotCommand("mybadges", "View your earned badges"),
         BotCommand("allbadges", "See all available badges"),
         BotCommand("mystats", "View your personal stats"),
@@ -2922,6 +3062,7 @@ def main():
     application.add_handler(CommandHandler("setairdropwallet", setairdropwallet_command))
     application.add_handler(CommandHandler("settoken", settoken_command))
     application.add_handler(CommandHandler("setbuybot", setbuybot_command))
+    application.add_handler(CommandHandler("setbuyimage", setbuyimage_command))
     application.add_handler(CommandHandler("setwelcome", setwelcome_command))
     application.add_handler(CommandHandler("setachievements", setachievements_command))
     application.add_handler(CommandHandler("help", help_command))

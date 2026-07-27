@@ -5,6 +5,7 @@ We mock them all at the sys.modules level before importing so that only the
 pure helper functions are exercised – no real network or database calls are made.
 """
 
+import asyncio
 import datetime
 import os
 import sys
@@ -12,7 +13,7 @@ import unittest
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BOT_DIR = PROJECT_ROOT / "CityLedger"
@@ -59,13 +60,16 @@ for _mod_name in ("sui_utils", "raffle_utils", "nacl", "nacl.signing", "nacl.sec
 
 from bot import (  # noqa: E402
     _buy_emoji_count,
+    _buybot_media_from_message,
     _buybot_checkpoint_batches,
     _calculate_buy_valuation,
     _format_buy_announcement,
     _initialize_buybot_start_checkpoints,
+    _send_buy_announcement,
     format_large_number,
     format_detailed_leaderboard,
     get_stable_proportional_sample,
+    setbuyimage_command,
 )
 
 
@@ -127,6 +131,174 @@ class TestBuyAnnouncementFormatting(unittest.TestCase):
         self.assertEqual(_buy_emoji_count(Decimal("4.99")), 1)
         self.assertEqual(_buy_emoji_count(Decimal("5")), 2)
         self.assertEqual(_buy_emoji_count(Decimal("10")), 3)
+
+
+# ---------------------------------------------------------------------------
+# Custom buy announcement media and command menu
+# ---------------------------------------------------------------------------
+
+class _FakeDB(dict):
+    def enroll_chat(self, _chat_id):
+        return None
+
+
+class TestBuyAnnouncementMedia(unittest.TestCase):
+    def test_extracts_largest_photo_or_animation_file_id(self):
+        photo_message = SimpleNamespace(
+            animation=None,
+            photo=[
+                SimpleNamespace(file_id="small-photo"),
+                SimpleNamespace(file_id="large-photo"),
+            ],
+        )
+        animation_message = SimpleNamespace(
+            animation=SimpleNamespace(file_id="animation-id"),
+            photo=[],
+        )
+
+        self.assertEqual(
+            _buybot_media_from_message(photo_message),
+            {"type": "photo", "file_id": "large-photo"},
+        )
+        self.assertEqual(
+            _buybot_media_from_message(animation_message),
+            {"type": "animation", "file_id": "animation-id"},
+        )
+
+    def test_sends_photo_with_announcement_as_caption(self):
+        async def exercise():
+            original_db = bot.db
+            bot.db = _FakeDB(
+                {"buybot_media:42": {"type": "photo", "file_id": "photo-id"}}
+            )
+            telegram_bot = SimpleNamespace(
+                send_photo=AsyncMock(),
+                send_animation=AsyncMock(),
+                send_message=AsyncMock(),
+            )
+            try:
+                await _send_buy_announcement(
+                    SimpleNamespace(bot=telegram_bot),
+                    42,
+                    "<b>CITY Buy!</b>",
+                )
+            finally:
+                bot.db = original_db
+
+            telegram_bot.send_photo.assert_awaited_once_with(
+                chat_id=42,
+                photo="photo-id",
+                caption="<b>CITY Buy!</b>",
+                parse_mode=bot.ParseMode.HTML,
+            )
+            telegram_bot.send_message.assert_not_awaited()
+
+        asyncio.run(exercise())
+
+    def test_sends_animation_with_announcement_as_caption(self):
+        async def exercise():
+            original_db = bot.db
+            bot.db = _FakeDB(
+                {
+                    "buybot_media:42": {
+                        "type": "animation",
+                        "file_id": "animation-id",
+                    }
+                }
+            )
+            telegram_bot = SimpleNamespace(
+                send_photo=AsyncMock(),
+                send_animation=AsyncMock(),
+                send_message=AsyncMock(),
+            )
+            try:
+                await _send_buy_announcement(
+                    SimpleNamespace(bot=telegram_bot),
+                    42,
+                    "<b>CITY Buy!</b>",
+                )
+            finally:
+                bot.db = original_db
+
+            telegram_bot.send_animation.assert_awaited_once_with(
+                chat_id=42,
+                animation="animation-id",
+                caption="<b>CITY Buy!</b>",
+                parse_mode=bot.ParseMode.HTML,
+            )
+            telegram_bot.send_message.assert_not_awaited()
+
+        asyncio.run(exercise())
+
+    def test_setbuyimage_saves_and_removes_group_media(self):
+        async def exercise():
+            original_db = bot.db
+            original_require_admin = bot.require_admin
+            fake_db = _FakeDB()
+            bot.db = fake_db
+            bot.require_admin = AsyncMock(return_value=True)
+            reply_text = AsyncMock()
+            message = SimpleNamespace(
+                reply_to_message=SimpleNamespace(
+                    animation=SimpleNamespace(file_id="animation-id"),
+                    photo=[],
+                ),
+                reply_text=reply_text,
+            )
+            update = SimpleNamespace(
+                effective_chat=SimpleNamespace(id=42, type="group"),
+                message=message,
+            )
+            try:
+                await setbuyimage_command(
+                    update,
+                    SimpleNamespace(args=[]),
+                )
+                self.assertEqual(
+                    fake_db["buybot_media:42"],
+                    {"type": "animation", "file_id": "animation-id"},
+                )
+
+                message.reply_to_message = None
+                await setbuyimage_command(
+                    update,
+                    SimpleNamespace(args=["off"]),
+                )
+                self.assertNotIn("buybot_media:42", fake_db)
+            finally:
+                bot.db = original_db
+                bot.require_admin = original_require_admin
+
+        asyncio.run(exercise())
+
+    def test_command_menu_includes_new_buy_commands(self):
+        async def exercise():
+            original_bot_command = bot.BotCommand
+            bot.BotCommand = lambda command, description: SimpleNamespace(
+                command=command,
+                description=description,
+            )
+            set_my_commands = AsyncMock()
+            try:
+                await bot.setup_bot_commands(
+                    SimpleNamespace(
+                        bot=SimpleNamespace(set_my_commands=set_my_commands)
+                    )
+                )
+            finally:
+                bot.BotCommand = original_bot_command
+
+            group_commands = set_my_commands.call_args_list[1].args[0]
+            private_commands = set_my_commands.call_args_list[2].args[0]
+            group_names = {command.command for command in group_commands}
+            private_names = {command.command for command in private_commands}
+
+            self.assertIn("setbuybot", group_names)
+            self.assertIn("setbuyimage", group_names)
+            self.assertNotIn("setbuybot", private_names)
+            self.assertNotIn("setbuyimage", private_names)
+
+        asyncio.run(exercise())
 
 
 # ---------------------------------------------------------------------------

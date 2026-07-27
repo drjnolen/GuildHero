@@ -16,6 +16,7 @@ An all-in-one Telegram community management and engagement bot built for crypto-
 - **/setairdropwallet** — Configure an encrypted, per-group airdrop wallet in DM (admin only)
 - **/settoken** `<coin_type|off>` — Set or clear the group's airdrop token (admin only; airdrops fall back to `0x2::sui::SUI`)
 - **/setbuybot** `on|off` — Toggle finalized DEX-buy announcements for the explicitly selected token (admin only)
+- **/setbuyimage** — Set custom buy announcement media by replying to a photo or GIF; use `off` to remove it (admin only)
 
 ### 📊 Leaderboards & Stats
 - **/score** — Detailed AI-integrated contribution leaderboard with quality, tone, helpfulness, and humor scoring (admin only)
@@ -127,12 +128,12 @@ To enable airdrops:
 
 ### Sui Buy Bot Setup
 
-The buy bot reads finalized Sui checkpoints over gRPC. A transaction is announced only when both conditions are true:
+The buy bot reads finalized Sui checkpoints over gRPC. A transaction is announced when:
 
-1. The selected token has a positive balance change for a wallet.
-2. The successful transaction contains a swap/trade/market-order Move call or event.
+1. The selected token has a positive balance change for a wallet; and
+2. The successful transaction contains swap evidence, or the recipient has a net outflow of another coin after SUI gas is removed.
 
-This deliberately excludes plain transfers, airdrops, failed transactions, and most liquidity operations. The announcement includes the token amount, full purchasing wallet, inferred exchange (when recognizable), transaction sender when different, and an explorer link.
+This deliberately excludes plain transfers, airdrops, failed transactions, claims, rewards, and most liquidity operations. The announcement includes the token amount, SUI and USD purchase values, a size-based flame scale, full purchasing wallet, inferred exchange (when recognizable), transaction sender when different, and an explorer link.
 
 To enable it in a group:
 
@@ -141,7 +142,11 @@ To enable it in a group:
 /setbuybot on
 ```
 
+Optionally, reply to a group photo or GIF with `/setbuyimage` to attach that media to future announcements. Telegram's reusable file ID is stored rather than the media itself. Use `/setbuyimage off` to return to text-only announcements.
+
 There is no implicit tracked token: if `/settoken off` is used, buy announcements are disabled even though airdrops continue to fall back to SUI. Enabling or changing the token starts at the current finalized checkpoint, so historical buys are not replayed.
+
+The bot registers `/settoken`, `/setbuybot`, `/setbuyimage`, and the other supported commands with Telegram at startup so they appear in group command suggestions.
 
 Exchange labels are inferred from known package/module names. Operators can add or update package labels without a release:
 
