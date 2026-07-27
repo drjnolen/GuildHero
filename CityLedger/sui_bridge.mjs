@@ -25,7 +25,10 @@ const CHECKPOINT_READ_MASK = {
 };
 
 const CHECKPOINT_BATCH_LIMIT = 50;
-const CHECKPOINT_BATCH_CONCURRENCY = 10;
+const CHECKPOINT_BATCH_CONCURRENCY = 5;
+const CHECKPOINT_REQUEST_TIMEOUT_MS = 10_000;
+const CHECKPOINT_REQUEST_ATTEMPTS = 3;
+const CHECKPOINT_RETRY_DELAY_MS = 250;
 
 function requiredString(value, name) {
   if (typeof value !== 'string' || value.trim() === '') {
@@ -66,6 +69,35 @@ async function mapWithConcurrency(values, concurrency, callback) {
     ),
   );
   return results;
+}
+
+async function getCheckpointWithRetry(client, sequenceNumber) {
+  let lastError;
+  for (let attempt = 1; attempt <= CHECKPOINT_REQUEST_ATTEMPTS; attempt += 1) {
+    try {
+      const { response } = await client.ledgerService.getCheckpoint(
+        {
+          checkpointId: {
+            oneofKind: 'sequenceNumber',
+            sequenceNumber,
+          },
+          readMask: CHECKPOINT_READ_MASK,
+        },
+        { timeout: CHECKPOINT_REQUEST_TIMEOUT_MS },
+      );
+      return mapCheckpoint(response.checkpoint);
+    } catch (error) {
+      lastError = error;
+      if (attempt < CHECKPOINT_REQUEST_ATTEMPTS) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, CHECKPOINT_RETRY_DELAY_MS * attempt),
+        );
+      }
+    }
+  }
+  throw new Error(
+    `Checkpoint ${sequenceNumber} failed after ${CHECKPOINT_REQUEST_ATTEMPTS} attempts: ${sanitizeError(lastError)}`,
+  );
 }
 
 export function sanitizeError(error) {
@@ -222,16 +254,7 @@ export async function handleRequest(request, client) {
       const checkpoints = await mapWithConcurrency(
         sequenceNumbers,
         CHECKPOINT_BATCH_CONCURRENCY,
-        async (sequenceNumber) => {
-          const { response } = await client.ledgerService.getCheckpoint({
-            checkpointId: {
-              oneofKind: 'sequenceNumber',
-              sequenceNumber,
-            },
-            readMask: CHECKPOINT_READ_MASK,
-          });
-          return mapCheckpoint(response.checkpoint);
-        },
+        (sequenceNumber) => getCheckpointWithRetry(client, sequenceNumber),
       );
       return { checkpoints };
     }

@@ -13,6 +13,7 @@ from typing import Any
 
 DEFAULT_SUI_GRPC_URL = "https://fullnode.mainnet.sui.io:443"
 _DEFAULT_REQUEST_TIMEOUT = 45.0
+_BRIDGE_STREAM_LIMIT = 16 * 1024 * 1024
 _BRIDGE_PATH = Path(__file__).with_name("sui_bridge.mjs")
 
 
@@ -66,6 +67,7 @@ class SuiGrpcService:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=environment,
+                    limit=_BRIDGE_STREAM_LIMIT,
                 )
             except FileNotFoundError as exc:
                 raise RuntimeError(
@@ -102,6 +104,13 @@ class SuiGrpcService:
                     )
                 else:
                     future.set_result(response.get("result"))
+        except Exception as exc:
+            logging.error("Sui SDK response reader failed: %s", exc)
+            if process.returncode is None:
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
         finally:
             return_code = await process.wait()
             error = RuntimeError(
@@ -146,6 +155,16 @@ class SuiGrpcService:
                 process.stdin.write(payload)
                 await process.stdin.drain()
             return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            self._pending.pop(request_id, None)
+            if not future.done():
+                future.cancel()
+            if self._process is process:
+                await self.close()
+            raise RuntimeError(
+                f"Sui SDK {method} request timed out after {timeout:g} seconds; "
+                "the bridge was restarted."
+            ) from exc
         except BaseException:
             self._pending.pop(request_id, None)
             if not future.done():
