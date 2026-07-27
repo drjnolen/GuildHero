@@ -56,6 +56,7 @@ for _mod_name in ("sui_utils", "raffle_utils", "nacl", "nacl.signing", "nacl.sec
     sys.modules.pop(_mod_name, None)
 
 from bot import (  # noqa: E402
+    _initialize_buybot_start_checkpoints,
     format_large_number,
     format_detailed_leaderboard,
     get_stable_proportional_sample,
@@ -139,6 +140,36 @@ class TestGetStableProportionalSample(unittest.TestCase):
         result, was_sampled = get_stable_proportional_sample([], 50)
         self.assertEqual(result, [])
         self.assertFalse(was_sampled)
+
+
+# ---------------------------------------------------------------------------
+# Buy bot activation boundaries
+# ---------------------------------------------------------------------------
+
+class TestBuyBotActivationCheckpoints(unittest.TestCase):
+    def test_initializes_new_chats_without_replaying_history(self):
+        original_db = bot.db
+        fake_db = {}
+        bot.db = fake_db
+        try:
+            initialized = _initialize_buybot_start_checkpoints(
+                {
+                    "0xabc::coin::COIN": [
+                        (1001, None),
+                        (1002, 88),
+                    ]
+                },
+                latest_sequence=100,
+            )
+        finally:
+            bot.db = original_db
+
+        self.assertEqual(
+            initialized,
+            {"0xabc::coin::COIN": [(1001, 100), (1002, 88)]},
+        )
+        self.assertEqual(fake_db["buybot_start_checkpoint:1001"], 100)
+        self.assertNotIn("buybot_start_checkpoint:1002", fake_db)
 
 
 # ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@ Thanks for your interest in contributing!  This guide covers how to set up the p
 ## Prerequisites
 
 - **Python 3.12+**
+- **Node.js 22+**
 - **PostgreSQL** (or a managed instance, e.g. Railway)
 - A **Telegram Bot Token** from [@BotFather](https://t.me/botfather)
 - An **OpenAI API key**
@@ -25,6 +26,7 @@ Thanks for your interest in contributing!  This guide covers how to set up the p
 2. **Install dependencies**
 
    ```bash
+   npm ci
    pip install -r requirements.txt
    ```
 
@@ -47,9 +49,11 @@ Thanks for your interest in contributing!  This guide covers how to set up the p
 
 ```bash
 python -m unittest discover -s tests -v
+npm run check:sui
+npm run test:sui
 ```
 
-Tests live in the `tests/` directory.  They mock all external services (database, OpenAI, Telegram API) and run fully offline.
+Tests live in the `tests/` directory. They mock all external services (database, OpenAI, Telegram API, and Sui) and run fully offline.
 
 ---
 
@@ -59,6 +63,8 @@ Tests live in the `tests/` directory.  They mock all external services (database
 CityLedger/
 ├── main.py                 # Repository entrypoint
 ├── requirements.txt        # Python dependencies
+├── package.json            # Official Sui SDK dependency and bridge scripts
+├── package-lock.json       # Reproducible Node dependency lock
 ├── Dockerfile              # Container build (used by Railway)
 ├── railway.toml            # Railway deploy config
 ├── .env.example            # Environment variable template
@@ -68,11 +74,17 @@ CityLedger/
 │   ├── db.py               # PostgreSQL-backed key-value + message storage
 │   ├── telegram_utils.py   # Help text, admin checks, HTML sanitisation
 │   ├── sui_utils.py        # SUI blockchain key handling and airdrop utilities
+│   ├── sui_service.py      # Async Python/SDK bridge client
+│   ├── sui_bridge.mjs      # Official SDK gRPC and PTB implementation
+│   ├── buy_tracker.py      # Pure finalized-swap detection
 │   ├── raffle_utils.py     # Weighted raffle winner selection
 │   └── http_clients.py     # Shared async HTTP client
 └── tests/                  # Unit tests
     ├── test_telegram_utils.py
     ├── test_sui_utils.py
+    ├── test_sui_service.py
+    ├── test_buy_tracker.py
+    ├── sui_bridge.test.mjs
     ├── test_raffle_utils.py
     └── test_bot_utils.py
 ```

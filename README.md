@@ -14,7 +14,8 @@ An all-in-one Telegram community management and engagement bot built for crypto-
 - **/airdrop** `<count>` `<amount>` — Airdrop SUI tokens to top scorers by replying to a `/score` leaderboard (admin only)
 - **/raffle** `<amount>` — Pick a weighted winner from the top 20 ranked wallets in a replied `/score` leaderboard and airdrop the prize (admin only)
 - **/setairdropwallet** — Configure an encrypted, per-group airdrop wallet in DM (admin only)
-- **/settoken** `<coin_type>` — Set the airdrop token type for the group (admin only, default: `0x2::sui::SUI`)
+- **/settoken** `<coin_type|off>` — Set or clear the group's airdrop token (admin only; airdrops fall back to `0x2::sui::SUI`)
+- **/setbuybot** `on|off` — Toggle finalized DEX-buy announcements for the explicitly selected token (admin only)
 
 ### 📊 Leaderboards & Stats
 - **/score** — Detailed AI-integrated contribution leaderboard with quality, tone, helpfulness, and humor scoring (admin only)
@@ -52,6 +53,7 @@ An all-in-one Telegram community management and engagement bot built for crypto-
 
 ### Requirements
 - Python 3.12+
+- Node.js 22+ (for Mysten's official Sui SDK)
 - A [Telegram Bot Token](https://core.telegram.org/bots#botfather)
 - An [OpenAI API Key](https://platform.openai.com/api-keys)
 - A PostgreSQL database (provided automatically by Railway)
@@ -60,6 +62,7 @@ An all-in-one Telegram community management and engagement bot built for crypto-
 ### Installation
 
 ```bash
+npm ci
 pip install -r requirements.txt
 ```
 
@@ -72,7 +75,12 @@ pip install -r requirements.txt
 | `OPENAI_API_KEY` | Yes | Your OpenAI API key |
 | `SUI_PRIVATE_KEY` | No | Legacy global fallback airdrop key shared by all groups |
 | `AIRDROP_ENCRYPTION_KEY` | No | 32-byte hex key used to encrypt per-group airdrop private keys at rest (required for `/setairdropwallet`) |
-| `SUI_RPC_URL` | No | SUI JSON-RPC endpoint (defaults to `https://fullnode.mainnet.sui.io:443`) |
+| `SUI_GRPC_URL` | No | Sui gRPC v2 endpoint (defaults to `https://fullnode.mainnet.sui.io:443`) |
+| `SUI_GRPC_HEADERS_JSON` | No | JSON object containing provider headers such as an API key |
+| `SUI_GAS_BUDGET` | No | Maximum gas budget per airdrop transfer in MIST (default: `50000000`) |
+| `SUI_EXPLORER_TX_URL` | No | Explorer transaction URL prefix used in buy announcements |
+| `SUI_DEX_PACKAGES_JSON` | No | JSON map of additional DEX package IDs to display names |
+| `SUI_NODE_BINARY` | No | Node.js executable override (default: `node`) |
 
 ### Running Locally
 
@@ -92,7 +100,7 @@ python main.py
 
 ### SUI Airdrop Setup
 
-The `/airdrop` command uses standard SUI JSON-RPC methods (`unsafe_paySui`, `unsafe_pay`, `sui_executeTransactionBlock`) for native coin transfers. **No custom smart contracts or Move packages need to be deployed** — the bot talks directly to the SUI network's built-in transfer functionality.
+The `/airdrop` command uses Mysten's official TypeScript SDK, Sui gRPC v2, and programmable transaction blocks. The SDK's `tx.coin()` intent draws from the sender's address balance and owned coin objects, then transfers the selected token to each recipient. **No custom smart contract or Move package needs to be deployed.**
 
 To enable airdrops:
 
@@ -107,32 +115,61 @@ To enable airdrops:
 1. Admin runs:  /score 30 days
 2. Admin clicks: "📢 Broadcast in Group"
 3. Admin configures the group's sender with: /setairdropwallet
-4. Admin replies to the leaderboard message with:  /airdrop 10 1000000000
-   → Sends 1 SUI (1,000,000,000 MIST) to each of the top 10 users who have registered wallets.
+4. Admin replies to the leaderboard message with:  /airdrop 10 1
+   → Sends 1 SUI to each of the top 10 users who have registered wallets.
    → Runs a preflight balance/gas check before sending.
    → Users without wallets are gracefully skipped.
-5. Admin can also reply with: /raffle 1000000000
+5. Admin can also reply with: /raffle 1
    → Selects one winner from the top 20 ranked users with registered wallets.
    → Applies a slight weighting toward higher leaderboard ranks.
    → Sends the configured token prize to the winner's wallet after preflight checks.
 ```
 
+### Sui Buy Bot Setup
+
+The buy bot reads finalized Sui checkpoints over gRPC. A transaction is announced only when both conditions are true:
+
+1. The selected token has a positive balance change for a wallet.
+2. The successful transaction contains a swap/trade/market-order Move call or event.
+
+This deliberately excludes plain transfers, airdrops, failed transactions, and most liquidity operations. The announcement includes the token amount, full purchasing wallet, inferred exchange (when recognizable), transaction sender when different, and an explorer link.
+
+To enable it in a group:
+
+```text
+/settoken 0xPACKAGE::module::TOKEN
+/setbuybot on
+```
+
+There is no implicit tracked token: if `/settoken off` is used, buy announcements are disabled even though airdrops continue to fall back to SUI. Enabling or changing the token starts at the current finalized checkpoint, so historical buys are not replayed.
+
+Exchange labels are inferred from known package/module names. Operators can add or update package labels without a release:
+
+```bash
+export SUI_DEX_PACKAGES_JSON='{"0xPACKAGE_ID":"Exchange Name"}'
+```
+
+The public Sui Foundation endpoint is the default. A dedicated gRPC provider endpoint is recommended for production polling; provider credentials can be passed through `SUI_GRPC_HEADERS_JSON`.
+
 ## Architecture
 
-The bot uses a small modular Python layout:
+The bot uses a modular Python layout with a narrow Node.js chain boundary:
 - `main.py` — repository-root entrypoint
 - `CityLedger/bot.py` — Telegram command handlers and bot wiring
 - `CityLedger/ai_services.py` — OpenAI-powered scoring, summaries, vibe checks, and copypasta generation
 - `CityLedger/telegram_utils.py` — shared help text, admin checks, HTML sanitization, and wallet validation
 - `CityLedger/db.py` — PostgreSQL-backed key-value storage plus normalized message storage
+- `CityLedger/buy_tracker.py` — pure finalized-transaction buy classification
+- `CityLedger/sui_service.py` — async Python client for the persistent SDK bridge
+- `CityLedger/sui_bridge.mjs` — official Sui SDK gRPC reads and PTB signing/execution
 
 Core integrations:
 - **python-telegram-bot** — Telegram Bot API framework
 - **OpenAI GPT-3.5** — AI-powered chat analysis and content generation
 - **PostgreSQL** — Persistent bot state plus normalized message history storage
 - **CoinGecko API** — Real-time cryptocurrency price data
-- **SUI JSON-RPC** — Blockchain token transfers for airdrops
-- **PyNaCl** — Ed25519 signing for SUI transactions
+- **Mysten Sui SDK + gRPC v2** — Finalized checkpoint reads and programmable token transfers
+- **PyNaCl** — Encryption and local validation of per-group Ed25519 airdrop keys
 - **httpx** — Async HTTP client for external API calls
 
 ## License
