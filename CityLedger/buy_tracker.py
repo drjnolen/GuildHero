@@ -57,6 +57,7 @@ class BuyEvent:
     wallet: str
     sender: str | None
     exchange: str
+    sui_spent: int | None = None
     checkpoint: int | None = None
     timestamp: Any = None
 
@@ -182,6 +183,36 @@ def _gas_cost(transaction: Any) -> int:
     return max(0, computation + storage - rebate)
 
 
+def _wallet_net_spend(
+    transaction: Any,
+    wallet: str,
+    coin_type: str,
+) -> int:
+    """Return a wallet's net spend for one coin, excluding SUI gas."""
+
+    selected = canonicalize_sui_type(coin_type)
+    wallet_lower = wallet.lower()
+    net_change = 0
+    for change in _get(transaction, "balance_changes", []) or []:
+        address = str(_get(change, "address", "") or "").lower()
+        if (
+            address != wallet_lower
+            or canonicalize_sui_type(_get(change, "coin_type")) != selected
+        ):
+            continue
+        try:
+            net_change += int(_get(change, "amount", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+
+    spend = max(0, -net_change)
+    effects = _get(transaction, "effects")
+    gas_payer = str(_get(effects, "gas_payer", "") or "").lower()
+    if selected == SUI_COIN_TYPE and wallet_lower == gas_payer:
+        spend = max(0, spend - _gas_cost(transaction))
+    return spend
+
+
 def _wallet_spent_another_coin(
     transaction: Any,
     wallet: str,
@@ -191,25 +222,17 @@ def _wallet_spent_another_coin(
 
     selected = canonicalize_sui_type(selected_coin_type)
     wallet_lower = wallet.lower()
-    effects = _get(transaction, "effects")
-    gas_payer = str(_get(effects, "gas_payer", "") or "").lower()
-    gas_cost = _gas_cost(transaction)
+    coin_types: set[str] = set()
 
     for change in _get(transaction, "balance_changes", []) or []:
         address = str(_get(change, "address", "") or "").lower()
         coin_type = canonicalize_sui_type(_get(change, "coin_type"))
         if address != wallet_lower or coin_type == selected:
             continue
-        try:
-            amount = int(_get(change, "amount", 0) or 0)
-        except (TypeError, ValueError):
-            continue
-        if amount >= 0:
-            continue
-        spend = -amount
-        if coin_type == SUI_COIN_TYPE and address == gas_payer:
-            spend -= gas_cost
-        if spend > 0:
+        coin_types.add(coin_type)
+
+    for coin_type in coin_types:
+        if _wallet_net_spend(transaction, wallet, coin_type) > 0:
             return True
     return False
 
@@ -274,6 +297,7 @@ def detect_buy(
         wallet=wallet,
         sender=sender,
         exchange=_infer_exchange(package_clues, dex_packages),
+        sui_spent=_wallet_net_spend(transaction, wallet, SUI_COIN_TYPE) or None,
         checkpoint=_get(transaction, "checkpoint"),
         timestamp=_get(transaction, "timestamp"),
     )

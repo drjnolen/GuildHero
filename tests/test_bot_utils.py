@@ -9,7 +9,9 @@ import datetime
 import os
 import sys
 import unittest
+from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -56,12 +58,75 @@ for _mod_name in ("sui_utils", "raffle_utils", "nacl", "nacl.signing", "nacl.sec
     sys.modules.pop(_mod_name, None)
 
 from bot import (  # noqa: E402
+    _buy_emoji_count,
     _buybot_checkpoint_batches,
+    _calculate_buy_valuation,
+    _format_buy_announcement,
     _initialize_buybot_start_checkpoints,
     format_large_number,
     format_detailed_leaderboard,
     get_stable_proportional_sample,
 )
+
+
+# ---------------------------------------------------------------------------
+# Buy announcement valuation and emoji scale
+# ---------------------------------------------------------------------------
+
+class TestBuyAnnouncementFormatting(unittest.TestCase):
+    def _event(self, *, amount=10_000_000_000, sui_spent=None):
+        return SimpleNamespace(
+            amount=amount,
+            sui_spent=sui_spent,
+            exchange="Cetus",
+            wallet="0xbuyer",
+            sender="0xbuyer",
+            digest="Digest123",
+        )
+
+    def test_uses_exact_gas_adjusted_sui_spend(self):
+        valuation = _calculate_buy_valuation(
+            self._event(sui_spent=2_000_000_000),
+            {"symbol": "CITY", "decimals": 9},
+            token_usd_price="99",
+            sui_usd_price="1.50",
+        )
+
+        self.assertEqual(valuation["sui"], Decimal("2"))
+        self.assertEqual(valuation["usd"], Decimal("3.00"))
+
+        text = _format_buy_announcement(
+            self._event(sui_spent=2_000_000_000),
+            {"symbol": "CITY", "decimals": 9},
+            valuation,
+        )
+        self.assertTrue(text.startswith("🟢 <b>CITY Buy!</b>\n🔥\n"))
+        self.assertIn("<b>Value:</b> 2 SUI / $3.00 USD", text)
+
+    def test_estimates_cross_token_buy_from_market_prices(self):
+        valuation = _calculate_buy_valuation(
+            self._event(),
+            {"symbol": "CITY", "decimals": 9},
+            token_usd_price="2",
+            sui_usd_price="4",
+        )
+
+        self.assertEqual(valuation["usd"], Decimal("20"))
+        self.assertEqual(valuation["sui"], Decimal("5"))
+
+        text = _format_buy_announcement(
+            self._event(),
+            {"symbol": "CITY", "decimals": 9},
+            valuation,
+        )
+        self.assertTrue(text.startswith("🟢 <b>CITY Buy!</b>\n🔥🔥🔥🔥🔥\n"))
+        self.assertIn("<b>Value:</b> 5 SUI / $20.00 USD", text)
+
+    def test_adds_one_emoji_for_each_five_dollars(self):
+        self.assertEqual(_buy_emoji_count(None), 1)
+        self.assertEqual(_buy_emoji_count(Decimal("4.99")), 1)
+        self.assertEqual(_buy_emoji_count(Decimal("5")), 2)
+        self.assertEqual(_buy_emoji_count(Decimal("10")), 3)
 
 
 # ---------------------------------------------------------------------------

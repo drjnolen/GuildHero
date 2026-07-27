@@ -13,6 +13,7 @@ import json
 import time
 import uuid
 from collections import defaultdict
+from decimal import Decimal, InvalidOperation
 import pytz
 from ai_services import analyze_user_messages, summarize_chat_history, get_best_of_messages, get_vibe_check, generate_copypasta
 from buy_tracker import detect_buy
@@ -116,6 +117,10 @@ _BUYBOT_CHECKPOINT_BATCH_SIZE = 50
 _BUYBOT_MAX_CHECKPOINTS_PER_RUN = 250
 _BUYBOT_LIVE_GAP_LOOKBACK = 100
 _BUYBOT_POLL_SECONDS = 3
+_BUYBOT_EMOJI = "🔥"
+_BUYBOT_EMOJI_USD_STEP = Decimal("5")
+_BUYBOT_MAX_EMOJIS = 100
+_MIST_PER_SUI = Decimal("1000000000")
 
 
 def _check_ai_rate_limit(user_id: int, chat_id: int) -> float:
@@ -815,7 +820,108 @@ def _remember_buybot_digest(chat_id: int, digest: str) -> None:
         db[key] = seen[-_BUYBOT_SEEN_DIGEST_LIMIT:]
 
 
-def _format_buy_announcement(event, amount_config: dict) -> str:
+def _positive_decimal(value) -> Decimal | None:
+    try:
+        decimal_value = Decimal(str(value))
+        return decimal_value if decimal_value.is_finite() and decimal_value > 0 else None
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _calculate_buy_valuation(
+    event,
+    amount_config: dict,
+    *,
+    token_usd_price=None,
+    sui_usd_price=None,
+) -> dict[str, Decimal | None]:
+    """Calculate exact SUI spend when available, otherwise market equivalents."""
+
+    sui_price = _positive_decimal(sui_usd_price)
+    token_price = _positive_decimal(token_usd_price)
+    raw_sui_spent = getattr(event, "sui_spent", None)
+
+    if raw_sui_spent:
+        sui_value = Decimal(int(raw_sui_spent)) / _MIST_PER_SUI
+        return {
+            "sui": sui_value,
+            "usd": sui_value * sui_price if sui_price else None,
+        }
+
+    try:
+        token_value = Decimal(int(event.amount)) / (
+            Decimal(10) ** int(amount_config["decimals"])
+        )
+    except (KeyError, TypeError, ValueError):
+        return {"sui": None, "usd": None}
+
+    usd_value = token_value * token_price if token_price else None
+    return {
+        "sui": usd_value / sui_price if usd_value is not None and sui_price else None,
+        "usd": usd_value,
+    }
+
+
+async def _get_buy_valuation(event, amount_config: dict) -> dict[str, Decimal | None]:
+    """Fetch cached market prices without making announcement delivery depend on them."""
+
+    symbol = str(amount_config.get("symbol") or "").upper()
+    if getattr(event, "sui_spent", None) or symbol == "SUI":
+        sui_market = await fetch_crypto_price("SUI")
+        sui_price = (sui_market or {}).get("price")
+        return _calculate_buy_valuation(
+            event,
+            amount_config,
+            token_usd_price=sui_price if symbol == "SUI" else None,
+            sui_usd_price=sui_price,
+        )
+
+    sui_market, token_market = await asyncio.gather(
+        fetch_crypto_price("SUI"),
+        fetch_crypto_price(symbol),
+    )
+    return _calculate_buy_valuation(
+        event,
+        amount_config,
+        token_usd_price=(token_market or {}).get("price"),
+        sui_usd_price=(sui_market or {}).get("price"),
+    )
+
+
+def _buy_emoji_count(usd_value: Decimal | None) -> int:
+    value = _positive_decimal(usd_value) or Decimal(0)
+    return 1 + int(value // _BUYBOT_EMOJI_USD_STEP)
+
+
+def _format_buy_emojis(usd_value: Decimal | None) -> str:
+    count = _buy_emoji_count(usd_value)
+    shown = min(count, _BUYBOT_MAX_EMOJIS)
+    emojis = _BUYBOT_EMOJI * shown
+    if count > shown:
+        emojis += f" <b>×{count:,}</b>"
+    return emojis
+
+
+def _format_sui_value(value: Decimal | None) -> str:
+    if value is None:
+        return "N/A"
+    return f"{value:,.6f}".rstrip("0").rstrip(".")
+
+
+def _format_usd_value(value: Decimal | None) -> str:
+    if value is None:
+        return "N/A"
+    if 0 < value < Decimal("0.01"):
+        return "&lt;$0.01"
+    return f"${value:,.2f}"
+
+
+def _format_buy_announcement(
+    event,
+    amount_config: dict,
+    valuation: dict[str, Decimal | None] | None = None,
+) -> str:
+    valuation = valuation or {"sui": None, "usd": None}
     symbol = html.escape(amount_config["symbol"])
     exchange = html.escape(event.exchange)
     wallet = html.escape(event.wallet)
@@ -823,8 +929,13 @@ def _format_buy_announcement(event, amount_config: dict) -> str:
     tx_url = f"{SUI_EXPLORER_TX_URL.rstrip('/')}/{event.digest}"
     lines = [
         f"🟢 <b>{symbol} Buy!</b>",
+        _format_buy_emojis(valuation.get("usd")),
         "",
         f"<b>Amount:</b> {format_token_amount(event.amount, amount_config['decimals'])} {symbol}",
+        (
+            f"<b>Value:</b> {_format_sui_value(valuation.get('sui'))} SUI"
+            f" / {_format_usd_value(valuation.get('usd'))} USD"
+        ),
         f"<b>Buyer:</b> <code>{wallet}</code>",
         f"<b>Exchange:</b> {exchange}",
     ]
@@ -855,7 +966,12 @@ async def _announce_checkpoint_buys(
                 continue
             if coin_type not in amount_configs:
                 amount_configs[coin_type] = await get_coin_amount_config(coin_type)
-            text = _format_buy_announcement(event, amount_configs[coin_type])
+            valuation = await _get_buy_valuation(event, amount_configs[coin_type])
+            text = _format_buy_announcement(
+                event,
+                amount_configs[coin_type],
+                valuation,
+            )
 
             for chat_id, start_checkpoint in chats:
                 if checkpoint.sequence_number <= start_checkpoint:
