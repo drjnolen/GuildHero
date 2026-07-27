@@ -9,7 +9,7 @@ from typing import Any, Mapping
 DEFAULT_DEX_PACKAGES = {
     # Cetus CLMM mainnet package. Additional/upgraded packages can be supplied
     # through SUI_DEX_PACKAGES_JSON without requiring a bot release.
-    "0x1eabed72c53feb3808baf90123f619fd6b0bd8d07f40fd46553a559c8e7b7c2": "Cetus",
+    "0x1eabed72c53feb3805120a081dc15963c204dc8d091542592abaf7a35689b2fb": "Cetus",
 }
 
 _DEX_NAME_HINTS = (
@@ -145,6 +145,9 @@ def _infer_exchange(
         package_label = package_labels.get(_canonicalize_package(package))
         if package_label and package_label not in labels:
             labels.append(str(package_label))
+        for known_package, label in package_labels.items():
+            if f"{known_package}::" in descriptor and label not in labels:
+                labels.append(str(label))
         for hint, label in _DEX_NAME_HINTS:
             if hint in descriptor and label not in labels:
                 labels.append(label)

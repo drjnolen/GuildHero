@@ -24,6 +24,9 @@ const CHECKPOINT_READ_MASK = {
   ],
 };
 
+const CHECKPOINT_BATCH_LIMIT = 50;
+const CHECKPOINT_BATCH_CONCURRENCY = 10;
+
 function requiredString(value, name) {
   if (typeof value !== 'string' || value.trim() === '') {
     throw new Error(`${name} is required.`);
@@ -42,6 +45,27 @@ function requiredUnsignedInteger(value, name, { allowZero = false } = {}) {
     throw new Error(`${name} must be ${allowZero ? 'non-negative' : 'greater than zero'}.`);
   }
   return parsed;
+}
+
+async function mapWithConcurrency(values, concurrency, callback) {
+  const results = new Array(values.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < values.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await callback(values[index], index);
+    }
+  }
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(concurrency, values.length) },
+      () => worker(),
+    ),
+  );
+  return results;
 }
 
 export function sanitizeError(error) {
@@ -182,6 +206,34 @@ export async function handleRequest(request, client) {
         readMask: CHECKPOINT_READ_MASK,
       });
       return mapCheckpoint(response.checkpoint);
+    }
+    case 'checkpoints': {
+      if (!Array.isArray(params.sequenceNumbers) || params.sequenceNumbers.length === 0) {
+        throw new Error('sequenceNumbers must be a non-empty array.');
+      }
+      if (params.sequenceNumbers.length > CHECKPOINT_BATCH_LIMIT) {
+        throw new Error(
+          `sequenceNumbers cannot contain more than ${CHECKPOINT_BATCH_LIMIT} checkpoints.`,
+        );
+      }
+      const sequenceNumbers = params.sequenceNumbers.map((value) =>
+        requiredUnsignedInteger(value, 'sequenceNumber', { allowZero: true }),
+      );
+      const checkpoints = await mapWithConcurrency(
+        sequenceNumbers,
+        CHECKPOINT_BATCH_CONCURRENCY,
+        async (sequenceNumber) => {
+          const { response } = await client.ledgerService.getCheckpoint({
+            checkpointId: {
+              oneofKind: 'sequenceNumber',
+              sequenceNumber,
+            },
+            readMask: CHECKPOINT_READ_MASK,
+          });
+          return mapCheckpoint(response.checkpoint);
+        },
+      );
+      return { checkpoints };
     }
     case 'balance': {
       const response = await client.getBalance({

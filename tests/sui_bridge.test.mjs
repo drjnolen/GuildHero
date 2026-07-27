@@ -140,6 +140,65 @@ test('latest checkpoint request converts bigint to a JSON-safe string', async ()
   assert.deepEqual(result, { sequenceNumber: '999' });
 });
 
+test('fetches checkpoint batches concurrently and preserves sequence order', async () => {
+  let inFlight = 0;
+  let peakInFlight = 0;
+  const client = {
+    ledgerService: {
+      getCheckpoint: async ({ checkpointId }) => {
+        inFlight += 1;
+        peakInFlight = Math.max(peakInFlight, inFlight);
+        const sequenceNumber = checkpointId.sequenceNumber;
+        await new Promise((resolve) =>
+          setTimeout(resolve, Number(13n - sequenceNumber)),
+        );
+        inFlight -= 1;
+        return {
+          response: {
+            checkpoint: {
+              sequenceNumber,
+              transactions: [],
+            },
+          },
+        };
+      },
+    },
+  };
+
+  const result = await handleRequest(
+    {
+      method: 'checkpoints',
+      params: {
+        sequenceNumbers: Array.from({ length: 12 }, (_, index) =>
+          String(index + 1),
+        ),
+      },
+    },
+    client,
+  );
+
+  assert.deepEqual(
+    result.checkpoints.map((checkpoint) => checkpoint.sequenceNumber),
+    Array.from({ length: 12 }, (_, index) => String(index + 1)),
+  );
+  assert.equal(peakInFlight, 10);
+});
+
+test('rejects oversized checkpoint batches', async () => {
+  await assert.rejects(
+    handleRequest(
+      {
+        method: 'checkpoints',
+        params: {
+          sequenceNumbers: Array.from({ length: 51 }, (_, index) => index),
+        },
+      },
+      {},
+    ),
+    /more than 50 checkpoints/,
+  );
+});
+
 test('builds a Sui v2 coin intent and transfer PTB', () => {
   const transaction = buildTransferTransaction({
     recipient: '0x1',

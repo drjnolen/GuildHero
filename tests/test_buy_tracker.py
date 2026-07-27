@@ -105,6 +105,25 @@ class BuyTrackerTests(unittest.TestCase):
 
         self.assertEqual(event.exchange, "Example DEX")
 
+    def test_infers_cetus_from_wrapped_swap_event_type(self):
+        transaction = make_transaction(module="router")
+        transaction.events = ns(
+            events=[
+                ns(
+                    package_id="0xwrapper",
+                    module="router",
+                    event_type=(
+                        "0x1eabed72c53feb3805120a081dc15963c204dc8d091542592"
+                        "abaf7a35689b2fb::pool::SwapEvent"
+                    ),
+                )
+            ]
+        )
+
+        event = detect_buy(transaction, "0x2::demo::DEMO")
+
+        self.assertEqual(event.exchange, "Cetus")
+
     def test_normalizes_padded_move_addresses(self):
         padded = "0x00000000000000000000000000000002::demo::DEMO"
 
