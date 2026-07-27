@@ -140,7 +140,7 @@ test('latest checkpoint request converts bigint to a JSON-safe string', async ()
   assert.deepEqual(result, { sequenceNumber: '999' });
 });
 
-test('fetches checkpoint batches concurrently and preserves sequence order', async () => {
+test('fetches checkpoint batches with bounded concurrency and preserves sequence order', async () => {
   let inFlight = 0;
   let peakInFlight = 0;
   const client = {
@@ -181,7 +181,41 @@ test('fetches checkpoint batches concurrently and preserves sequence order', asy
     result.checkpoints.map((checkpoint) => checkpoint.sequenceNumber),
     Array.from({ length: 12 }, (_, index) => String(index + 1)),
   );
-  assert.equal(peakInFlight, 10);
+  assert.equal(peakInFlight, 5);
+});
+
+test('retries timed-out checkpoint calls with an RPC deadline', async () => {
+  let attempts = 0;
+  const client = {
+    ledgerService: {
+      getCheckpoint: async ({ checkpointId }, options) => {
+        attempts += 1;
+        assert.equal(options.timeout, 10_000);
+        if (attempts === 1) {
+          throw new Error('temporary upstream timeout');
+        }
+        return {
+          response: {
+            checkpoint: {
+              sequenceNumber: checkpointId.sequenceNumber,
+              transactions: [],
+            },
+          },
+        };
+      },
+    },
+  };
+
+  const result = await handleRequest(
+    {
+      method: 'checkpoints',
+      params: { sequenceNumbers: ['42'] },
+    },
+    client,
+  );
+
+  assert.equal(attempts, 2);
+  assert.equal(result.checkpoints[0].sequenceNumber, '42');
 });
 
 test('rejects oversized checkpoint batches', async () => {

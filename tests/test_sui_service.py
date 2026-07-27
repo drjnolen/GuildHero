@@ -1,7 +1,14 @@
+import asyncio
 import unittest
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
-from CityLedger.sui_service import SuiCheckpoint, SuiGrpcService, parse_grpc_headers
+from CityLedger.sui_service import (
+    _BRIDGE_STREAM_LIMIT,
+    SuiCheckpoint,
+    SuiGrpcService,
+    parse_grpc_headers,
+)
 
 
 class SuiServiceHelpersTests(unittest.TestCase):
@@ -52,7 +59,60 @@ class SuiServiceHelpersTests(unittest.TestCase):
                 timeout=60.0,
             )
 
-        import asyncio
+        asyncio.run(exercise())
+
+    def test_request_timeout_restarts_stuck_bridge(self):
+        async def exercise():
+            service = SuiGrpcService("https://example.invalid")
+            process = SimpleNamespace(
+                stdin=SimpleNamespace(
+                    write=lambda payload: None,
+                    drain=AsyncMock(),
+                )
+            )
+            service._process = process
+            service._ensure_process = AsyncMock(return_value=process)
+            service.close = AsyncMock()
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "request timed out.*bridge was restarted",
+            ):
+                await service._request("checkpoints", timeout=0.001)
+
+            service.close.assert_awaited_once()
+            self.assertEqual(service._pending, {})
+
+        asyncio.run(exercise())
+
+    def test_bridge_process_accepts_large_checkpoint_batch_responses(self):
+        async def exercise():
+            process = SimpleNamespace(
+                stdin=SimpleNamespace(),
+                stdout=SimpleNamespace(readline=AsyncMock(return_value=b"")),
+                stderr=SimpleNamespace(readline=AsyncMock(return_value=b"")),
+                returncode=None,
+                wait=AsyncMock(return_value=0),
+            )
+            spawn = AsyncMock(return_value=process)
+            service = SuiGrpcService("https://example.invalid")
+
+            with patch(
+                "CityLedger.sui_service.asyncio.create_subprocess_exec",
+                spawn,
+            ):
+                await service._ensure_process()
+                await asyncio.gather(
+                    service._reader_task,
+                    service._stderr_task,
+                    return_exceptions=True,
+                )
+
+            self.assertEqual(
+                spawn.await_args.kwargs["limit"],
+                _BRIDGE_STREAM_LIMIT,
+            )
+            self.assertGreater(_BRIDGE_STREAM_LIMIT, 833_680)
 
         asyncio.run(exercise())
 

@@ -112,7 +112,8 @@ _AI_RATE_LIMIT_MESSAGE = "⏳ Please wait {remaining:.0f}s before using AI comma
 # How often (in transfer count) to edit the airdrop progress message.
 _AIRDROP_PROGRESS_UPDATE_INTERVAL = 3
 _BUYBOT_SEEN_DIGEST_LIMIT = 500
-_BUYBOT_MAX_CHECKPOINTS_PER_RUN = 50
+_BUYBOT_CHECKPOINT_BATCH_SIZE = 50
+_BUYBOT_MAX_CHECKPOINTS_PER_RUN = 250
 _BUYBOT_POLL_SECONDS = 3
 
 
@@ -776,6 +777,27 @@ def _initialize_buybot_start_checkpoints(
     return initialized
 
 
+def _buybot_checkpoint_batches(
+    start_sequence: int,
+    end_sequence: int,
+):
+    """Yield bounded checkpoint ranges while preserving processing order."""
+
+    for batch_start in range(
+        start_sequence,
+        end_sequence + 1,
+        _BUYBOT_CHECKPOINT_BATCH_SIZE,
+    ):
+        yield range(
+            batch_start,
+            min(
+                batch_start + _BUYBOT_CHECKPOINT_BATCH_SIZE - 1,
+                end_sequence,
+            )
+            + 1,
+        )
+
+
 def _buybot_digest_seen(chat_id: int, digest: str) -> bool:
     return digest in db.get(_get_buybot_seen_key(chat_id), [])
 
@@ -909,24 +931,31 @@ async def check_sui_buys(context: ContextTypes.DEFAULT_TYPE):
                 latest_sequence,
                 int(cursor) + _BUYBOT_MAX_CHECKPOINTS_PER_RUN,
             )
-            sequence_numbers = range(int(cursor) + 1, end_sequence + 1)
-            checkpoints = await service.get_checkpoints(sequence_numbers)
-            checkpoints_by_sequence = {
-                checkpoint.sequence_number: checkpoint for checkpoint in checkpoints
-            }
-            for sequence_number in sequence_numbers:
-                checkpoint = checkpoints_by_sequence.get(sequence_number)
-                if checkpoint is None:
-                    raise RuntimeError(
-                        f"Sui gRPC batch omitted checkpoint {sequence_number}."
+            for sequence_numbers in _buybot_checkpoint_batches(
+                int(cursor) + 1,
+                end_sequence,
+            ):
+                checkpoints = await service.get_checkpoints(sequence_numbers)
+                checkpoints_by_sequence = {
+                    checkpoint.sequence_number: checkpoint for checkpoint in checkpoints
+                }
+                for sequence_number in sequence_numbers:
+                    checkpoint = checkpoints_by_sequence.get(sequence_number)
+                    if checkpoint is None:
+                        raise RuntimeError(
+                            f"Sui gRPC batch omitted checkpoint {sequence_number}."
+                        )
+                    if not await _announce_checkpoint_buys(
+                        context,
+                        checkpoint,
+                        token_chats,
+                    ):
+                        return
+                    await asyncio.to_thread(
+                        db.__setitem__,
+                        _get_buybot_checkpoint_key(),
+                        sequence_number,
                     )
-                if not await _announce_checkpoint_buys(context, checkpoint, token_chats):
-                    return
-                await asyncio.to_thread(
-                    db.__setitem__,
-                    _get_buybot_checkpoint_key(),
-                    sequence_number,
-                )
         except Exception as exc:
             logging.error(f"Sui buy tracker checkpoint poll failed: {exc}")
 

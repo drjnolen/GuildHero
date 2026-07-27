@@ -56,6 +56,7 @@ for _mod_name in ("sui_utils", "raffle_utils", "nacl", "nacl.signing", "nacl.sec
     sys.modules.pop(_mod_name, None)
 
 from bot import (  # noqa: E402
+    _buybot_checkpoint_batches,
     _initialize_buybot_start_checkpoints,
     format_large_number,
     format_detailed_leaderboard,
@@ -170,6 +171,21 @@ class TestBuyBotActivationCheckpoints(unittest.TestCase):
         )
         self.assertEqual(fake_db["buybot_start_checkpoint:1001"], 100)
         self.assertNotIn("buybot_start_checkpoint:1002", fake_db)
+
+    def test_splits_catch_up_ranges_into_bridge_sized_batches(self):
+        batches = [
+            list(checkpoints)
+            for checkpoints in _buybot_checkpoint_batches(101, 221)
+        ]
+
+        self.assertEqual(
+            batches,
+            [
+                list(range(101, 151)),
+                list(range(151, 201)),
+                list(range(201, 222)),
+            ],
+        )
 
 
 # ---------------------------------------------------------------------------
