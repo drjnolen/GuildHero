@@ -61,6 +61,32 @@ class SuiServiceHelpersTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_maps_live_subscription_checkpoints(self):
+        async def exercise():
+            service = SuiGrpcService("https://example.invalid")
+            service._request = AsyncMock(
+                return_value={
+                    "checkpoints": [
+                        {"sequenceNumber": "51", "transactions": [{"digest": "live"}]}
+                    ]
+                }
+            )
+
+            checkpoints = await service.get_subscribed_checkpoints(
+                max_items=25,
+                wait_ms=500,
+            )
+
+            self.assertEqual(checkpoints[0].sequence_number, 51)
+            self.assertEqual(checkpoints[0].transactions[0]["digest"], "live")
+            service._request.assert_awaited_once_with(
+                "subscribedCheckpoints",
+                {"maxItems": 25, "waitMs": 500},
+                timeout=15.0,
+            )
+
+        asyncio.run(exercise())
+
     def test_request_timeout_restarts_stuck_bridge(self):
         async def exercise():
             service = SuiGrpcService("https://example.invalid")

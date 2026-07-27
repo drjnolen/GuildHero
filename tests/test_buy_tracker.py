@@ -24,7 +24,15 @@ def make_transaction(
     programmable = ns(commands=[command])
     kind = ns(programmable_transaction=programmable)
     tx_data = ns(kind=kind, sender=sender)
-    effects = ns(status=ns(success=success, error=None if success else "aborted"))
+    effects = ns(
+        status=ns(success=success, error=None if success else "aborted"),
+        gas_used=ns(
+            computation_cost="500",
+            storage_cost="0",
+            storage_rebate="0",
+        ),
+        gas_payer=sender,
+    )
     balance_changes = [
         ns(address=recipient or sender, coin_type=coin_type, amount=str(amount)),
         ns(address=sender, coin_type="0x2::sui::SUI", amount="-500"),
@@ -104,6 +112,65 @@ class BuyTrackerTests(unittest.TestCase):
         )
 
         self.assertEqual(event.exchange, "Example DEX")
+
+    def test_detects_unknown_venue_when_buyer_spent_another_token(self):
+        transaction = make_transaction(function="execute", module="adapter")
+        transaction.balance_changes[-1] = ns(
+            address="0xbuyer",
+            coin_type="0x99::usdc::USDC",
+            amount="-1000000",
+        )
+
+        event = detect_buy(transaction, "0x2::demo::DEMO")
+
+        self.assertIsNotNone(event)
+        self.assertEqual(event.amount, 1250)
+
+    def test_detects_unknown_venue_when_sui_spend_exceeds_gas(self):
+        transaction = make_transaction(function="execute", module="adapter")
+        transaction.balance_changes[-1].amount = "-1500"
+
+        event = detect_buy(transaction, "0x2::demo::DEMO")
+
+        self.assertIsNotNone(event)
+
+    def test_rejects_reward_claim_with_only_sui_gas_outflow(self):
+        transaction = make_transaction(function="claim", module="rewards")
+
+        event = detect_buy(transaction, "0x2::demo::DEMO")
+
+        self.assertIsNone(event)
+
+    def test_rejects_liquidity_withdrawal_with_lp_token_outflow(self):
+        transaction = make_transaction(
+            function="remove_liquidity",
+            module="pool",
+        )
+        transaction.balance_changes[-1] = ns(
+            address="0xbuyer",
+            coin_type="0x99::pool::LP",
+            amount="-1",
+        )
+
+        event = detect_buy(transaction, "0x2::demo::DEMO")
+
+        self.assertIsNone(event)
+
+    def test_infers_turbos_from_known_wrapper_package(self):
+        transaction = make_transaction(
+            function="execute",
+            module="adapter",
+            package="0x8b14f4351bb342b81c27fce2fe6d0f56b98288dc88fbe60b28b26d804b25941a",
+        )
+        transaction.balance_changes[-1] = ns(
+            address="0xbuyer",
+            coin_type="0x99::usdc::USDC",
+            amount="-1000000",
+        )
+
+        event = detect_buy(transaction, "0x2::demo::DEMO")
+
+        self.assertEqual(event.exchange, "Turbos")
 
     def test_infers_cetus_from_wrapped_swap_event_type(self):
         transaction = make_transaction(module="router")

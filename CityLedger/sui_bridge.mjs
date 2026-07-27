@@ -14,6 +14,8 @@ const CHECKPOINT_READ_MASK = {
     'transactions.transaction.kind.programmable_transaction.commands.move_call.module',
     'transactions.transaction.kind.programmable_transaction.commands.move_call.function',
     'transactions.effects.status',
+    'transactions.effects.gas_used',
+    'transactions.effects.gas_object.input_owner',
     'transactions.events.events.package_id',
     'transactions.events.events.module',
     'transactions.events.events.event_type',
@@ -29,6 +31,10 @@ const CHECKPOINT_BATCH_CONCURRENCY = 5;
 const CHECKPOINT_REQUEST_TIMEOUT_MS = 10_000;
 const CHECKPOINT_REQUEST_ATTEMPTS = 3;
 const CHECKPOINT_RETRY_DELAY_MS = 250;
+const SUBSCRIPTION_BATCH_LIMIT = 100;
+const SUBSCRIPTION_QUEUE_LIMIT = 500;
+const SUBSCRIPTION_WAIT_LIMIT_MS = 5_000;
+const checkpointSubscriptionStates = new WeakMap();
 
 function requiredString(value, name) {
   if (typeof value !== 'string' || value.trim() === '') {
@@ -100,6 +106,94 @@ async function getCheckpointWithRetry(client, sequenceNumber) {
   );
 }
 
+function createCheckpointSubscription(client) {
+  const state = {
+    queue: [],
+    waiters: [],
+    error: null,
+    pump: null,
+  };
+  checkpointSubscriptionStates.set(client, state);
+  const call = client.subscriptionService.subscribeCheckpoints({
+    readMask: CHECKPOINT_READ_MASK,
+  });
+
+  state.pump = (async () => {
+    try {
+      for await (const response of call.responses) {
+        if (!response.checkpoint) {
+          continue;
+        }
+        const checkpoint = mapCheckpoint(response.checkpoint);
+        const waiter = state.waiters.shift();
+        if (waiter) {
+          clearTimeout(waiter.timer);
+          waiter.resolve(checkpoint);
+        } else {
+          state.queue.push(checkpoint);
+          if (state.queue.length > SUBSCRIPTION_QUEUE_LIMIT) {
+            state.queue.splice(
+              0,
+              state.queue.length - SUBSCRIPTION_QUEUE_LIMIT,
+            );
+          }
+        }
+      }
+      throw new Error('Sui checkpoint subscription ended unexpectedly.');
+    } catch (error) {
+      state.error = error;
+      for (const waiter of state.waiters.splice(0)) {
+        clearTimeout(waiter.timer);
+        waiter.reject(error);
+      }
+    } finally {
+      if (checkpointSubscriptionStates.get(client) === state) {
+        checkpointSubscriptionStates.delete(client);
+      }
+    }
+  })();
+
+  return state;
+}
+
+function waitForSubscribedCheckpoint(state, waitMs) {
+  if (state.queue.length > 0) {
+    return Promise.resolve(state.queue.shift());
+  }
+  if (state.error) {
+    return Promise.reject(state.error);
+  }
+  return new Promise((resolve, reject) => {
+    const waiter = { resolve, reject, timer: null };
+    waiter.timer = setTimeout(() => {
+      const index = state.waiters.indexOf(waiter);
+      if (index >= 0) {
+        state.waiters.splice(index, 1);
+      }
+      resolve(null);
+    }, waitMs);
+    state.waiters.push(waiter);
+  });
+}
+
+async function getSubscribedCheckpoints(client, maxItems, waitMs) {
+  const state =
+    checkpointSubscriptionStates.get(client) ??
+    createCheckpointSubscription(client);
+  const first = await waitForSubscribedCheckpoint(state, waitMs);
+  if (!first) {
+    return [];
+  }
+
+  // Give the subscription pump one turn to enqueue any already-buffered items.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const checkpoints = [first];
+  while (checkpoints.length < maxItems && state.queue.length > 0) {
+    checkpoints.push(state.queue.shift());
+  }
+  return checkpoints;
+}
+
 export function sanitizeError(error) {
   const message = error instanceof Error ? error.message : String(error);
   return message
@@ -151,6 +245,15 @@ export function mapCheckpoint(checkpoint) {
                 : 'Transaction failed')
             : null,
         },
+        gas_used: {
+          computation_cost:
+            item.effects?.gasUsed?.computationCost?.toString() ?? '0',
+          storage_cost:
+            item.effects?.gasUsed?.storageCost?.toString() ?? '0',
+          storage_rebate:
+            item.effects?.gasUsed?.storageRebate?.toString() ?? '0',
+        },
+        gas_payer: item.effects?.gasObject?.inputOwner?.address ?? '',
       },
       events: {
         events: (item.events?.events ?? []).map((event) => ({
@@ -230,14 +333,7 @@ export async function handleRequest(request, client) {
         'sequenceNumber',
         { allowZero: true },
       );
-      const { response } = await client.ledgerService.getCheckpoint({
-        checkpointId: {
-          oneofKind: 'sequenceNumber',
-          sequenceNumber,
-        },
-        readMask: CHECKPOINT_READ_MASK,
-      });
-      return mapCheckpoint(response.checkpoint);
+      return getCheckpointWithRetry(client, sequenceNumber);
     }
     case 'checkpoints': {
       if (!Array.isArray(params.sequenceNumbers) || params.sequenceNumbers.length === 0) {
@@ -257,6 +353,38 @@ export async function handleRequest(request, client) {
         (sequenceNumber) => getCheckpointWithRetry(client, sequenceNumber),
       );
       return { checkpoints };
+    }
+    case 'subscribedCheckpoints': {
+      const maxItems = Number(
+        requiredUnsignedInteger(
+          params.maxItems ?? CHECKPOINT_BATCH_LIMIT,
+          'maxItems',
+        ),
+      );
+      if (maxItems > SUBSCRIPTION_BATCH_LIMIT) {
+        throw new Error(
+          `maxItems cannot be greater than ${SUBSCRIPTION_BATCH_LIMIT}.`,
+        );
+      }
+      const waitMs = Number(
+        requiredUnsignedInteger(
+          params.waitMs ?? 1_000,
+          'waitMs',
+          { allowZero: true },
+        ),
+      );
+      if (waitMs > SUBSCRIPTION_WAIT_LIMIT_MS) {
+        throw new Error(
+          `waitMs cannot be greater than ${SUBSCRIPTION_WAIT_LIMIT_MS}.`,
+        );
+      }
+      return {
+        checkpoints: await getSubscribedCheckpoints(
+          client,
+          maxItems,
+          waitMs,
+        ),
+      };
     }
     case 'balance': {
       const response = await client.getBalance({

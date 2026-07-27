@@ -114,6 +114,7 @@ _AIRDROP_PROGRESS_UPDATE_INTERVAL = 3
 _BUYBOT_SEEN_DIGEST_LIMIT = 500
 _BUYBOT_CHECKPOINT_BATCH_SIZE = 50
 _BUYBOT_MAX_CHECKPOINTS_PER_RUN = 250
+_BUYBOT_LIVE_GAP_LOOKBACK = 100
 _BUYBOT_POLL_SECONDS = 3
 
 
@@ -427,6 +428,10 @@ def _get_buybot_start_checkpoint_key(chat_id):
 
 def _get_buybot_checkpoint_key():
     return "buybot:checkpoint"
+
+
+def _get_buybot_live_checkpoint_key():
+    return "buybot:live_checkpoint"
 
 
 def _track_chat(chat_id):
@@ -884,8 +889,24 @@ async def _announce_checkpoint_buys(
     return all_sent
 
 
+async def _announce_and_advance_buybot_cursor(
+    context,
+    checkpoint,
+    token_chats: dict[str, list[tuple[int, int]]],
+    cursor_key: str,
+) -> bool:
+    if not await _announce_checkpoint_buys(context, checkpoint, token_chats):
+        return False
+    await asyncio.to_thread(
+        db.__setitem__,
+        cursor_key,
+        checkpoint.sequence_number,
+    )
+    return True
+
+
 async def check_sui_buys(context: ContextTypes.DEFAULT_TYPE):
-    """Poll finalized Sui checkpoints and announce selected-token DEX purchases."""
+    """Stream live buys first, then advance the durable historical cursor."""
 
     lock = context.application.bot_data.setdefault("buybot_checkpoint_lock", asyncio.Lock())
     if lock.locked():
@@ -905,6 +926,52 @@ async def check_sui_buys(context: ContextTypes.DEFAULT_TYPE):
                 token_chats,
                 latest_sequence,
             )
+            subscribed = await service.get_subscribed_checkpoints(
+                max_items=100,
+                wait_ms=500,
+            )
+            live_cursor_key = _get_buybot_live_checkpoint_key()
+            live_cursor = await asyncio.to_thread(db.get, live_cursor_key)
+            for checkpoint in subscribed:
+                if (
+                    live_cursor is not None
+                    and checkpoint.sequence_number <= int(live_cursor)
+                ):
+                    continue
+
+                gap_start = checkpoint.sequence_number
+                if live_cursor is not None:
+                    gap_start = max(
+                        int(live_cursor) + 1,
+                        checkpoint.sequence_number - _BUYBOT_LIVE_GAP_LOOKBACK,
+                    )
+                if gap_start < checkpoint.sequence_number:
+                    for sequence_numbers in _buybot_checkpoint_batches(
+                        gap_start,
+                        checkpoint.sequence_number - 1,
+                    ):
+                        gap_checkpoints = await service.get_checkpoints(
+                            sequence_numbers
+                        )
+                        for gap_checkpoint in gap_checkpoints:
+                            if not await _announce_and_advance_buybot_cursor(
+                                context,
+                                gap_checkpoint,
+                                token_chats,
+                                live_cursor_key,
+                            ):
+                                return
+                            live_cursor = gap_checkpoint.sequence_number
+
+                if not await _announce_and_advance_buybot_cursor(
+                    context,
+                    checkpoint,
+                    token_chats,
+                    live_cursor_key,
+                ):
+                    return
+                live_cursor = checkpoint.sequence_number
+
             cursor = await asyncio.to_thread(db.get, _get_buybot_checkpoint_key())
             if cursor is None or int(cursor) > latest_sequence:
                 await asyncio.to_thread(
@@ -945,17 +1012,13 @@ async def check_sui_buys(context: ContextTypes.DEFAULT_TYPE):
                         raise RuntimeError(
                             f"Sui gRPC batch omitted checkpoint {sequence_number}."
                         )
-                    if not await _announce_checkpoint_buys(
+                    if not await _announce_and_advance_buybot_cursor(
                         context,
                         checkpoint,
                         token_chats,
+                        _get_buybot_checkpoint_key(),
                     ):
                         return
-                    await asyncio.to_thread(
-                        db.__setitem__,
-                        _get_buybot_checkpoint_key(),
-                        sequence_number,
-                    )
         except Exception as exc:
             logging.error(f"Sui buy tracker checkpoint poll failed: {exc}")
 

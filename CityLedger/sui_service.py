@@ -212,10 +212,7 @@ class SuiGrpcService:
             {"sequenceNumber": int(sequence_number)},
             timeout=45.0,
         )
-        return SuiCheckpoint(
-            sequence_number=int(result["sequenceNumber"]),
-            transactions=list(result.get("transactions") or []),
-        )
+        return self._checkpoint_from_result(result)
 
     async def get_checkpoints(
         self,
@@ -232,12 +229,36 @@ class SuiGrpcService:
             timeout=60.0,
         )
         return [
-            SuiCheckpoint(
-                sequence_number=int(checkpoint["sequenceNumber"]),
-                transactions=list(checkpoint.get("transactions") or []),
-            )
+            self._checkpoint_from_result(checkpoint)
             for checkpoint in result.get("checkpoints") or []
         ]
+
+    async def get_subscribed_checkpoints(
+        self,
+        max_items: int = 50,
+        wait_ms: int = 1_000,
+    ) -> list[SuiCheckpoint]:
+        """Drain finalized checkpoints from the official live gRPC stream."""
+
+        result = await self._request(
+            "subscribedCheckpoints",
+            {
+                "maxItems": int(max_items),
+                "waitMs": int(wait_ms),
+            },
+            timeout=max(15.0, (int(wait_ms) / 1_000) + 5.0),
+        )
+        return [
+            self._checkpoint_from_result(checkpoint)
+            for checkpoint in result.get("checkpoints") or []
+        ]
+
+    @staticmethod
+    def _checkpoint_from_result(result: dict[str, Any]) -> SuiCheckpoint:
+        return SuiCheckpoint(
+            sequence_number=int(result["sequenceNumber"]),
+            transactions=list(result.get("transactions") or []),
+        )
 
     async def get_balance(self, owner: str, coin_type: str) -> int:
         result = await self._request(
