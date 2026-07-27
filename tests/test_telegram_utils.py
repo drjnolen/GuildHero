@@ -7,10 +7,14 @@ BOT_DIR = PROJECT_ROOT / "CityLedger"
 if str(BOT_DIR) not in sys.path:
     sys.path.insert(0, str(BOT_DIR))
 
-from telegram_utils import normalize_wallet_address, sanitize_html_for_telegram
+from telegram_utils import HELP_TEXT, normalize_wallet_address, sanitize_html_for_telegram
 
 
 class TelegramUtilsTests(unittest.TestCase):
+    def test_help_lists_buy_configuration_commands(self):
+        self.assertIn("/setbuybot", HELP_TEXT)
+        self.assertIn("/setbuyimage", HELP_TEXT)
+
     def test_normalize_wallet_address_accepts_valid_sui_hex(self):
         raw = "A" * 64
         self.assertEqual(normalize_wallet_address(raw), "0x" + ("a" * 64))
