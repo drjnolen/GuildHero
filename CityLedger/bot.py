@@ -909,8 +909,17 @@ async def check_sui_buys(context: ContextTypes.DEFAULT_TYPE):
                 latest_sequence,
                 int(cursor) + _BUYBOT_MAX_CHECKPOINTS_PER_RUN,
             )
-            for sequence_number in range(int(cursor) + 1, end_sequence + 1):
-                checkpoint = await service.get_checkpoint(sequence_number)
+            sequence_numbers = range(int(cursor) + 1, end_sequence + 1)
+            checkpoints = await service.get_checkpoints(sequence_numbers)
+            checkpoints_by_sequence = {
+                checkpoint.sequence_number: checkpoint for checkpoint in checkpoints
+            }
+            for sequence_number in sequence_numbers:
+                checkpoint = checkpoints_by_sequence.get(sequence_number)
+                if checkpoint is None:
+                    raise RuntimeError(
+                        f"Sui gRPC batch omitted checkpoint {sequence_number}."
+                    )
                 if not await _announce_checkpoint_buys(context, checkpoint, token_chats):
                     return
                 await asyncio.to_thread(
@@ -1715,16 +1724,30 @@ async def setbuybot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    db[_get_buybot_enabled_key(chat_id)] = requested_enabled
     start_key = _get_buybot_start_checkpoint_key(chat_id)
-    if start_key in db:
-        del db[start_key]
     if requested_enabled:
+        try:
+            latest = await get_sui_service(
+                SUI_GRPC_URL,
+                SUI_GRPC_HEADERS,
+            ).get_latest_checkpoint()
+        except Exception as exc:
+            logging.error(f"Unable to enable buy bot because Sui is unavailable: {exc}")
+            await update.message.reply_text(
+                "❌ The Sui tracker is temporarily unavailable, so buy announcements "
+                "were not enabled. Please try again shortly."
+            )
+            return
+        db[_get_buybot_enabled_key(chat_id)] = True
+        db[start_key] = latest.sequence_number
         await update.message.reply_text(
             f"✅ Buy announcements are enabled for <code>{html.escape(selected_token)}</code>.",
             parse_mode=ParseMode.HTML,
         )
     else:
+        db[_get_buybot_enabled_key(chat_id)] = False
+        if start_key in db:
+            del db[start_key]
         await update.message.reply_text("✅ Buy announcements are disabled.")
 
 

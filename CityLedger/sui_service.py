@@ -198,6 +198,28 @@ class SuiGrpcService:
             transactions=list(result.get("transactions") or []),
         )
 
+    async def get_checkpoints(
+        self,
+        sequence_numbers: list[int] | range,
+    ) -> list[SuiCheckpoint]:
+        """Fetch an ordered checkpoint batch through bounded bridge concurrency."""
+
+        requested = [int(sequence_number) for sequence_number in sequence_numbers]
+        if not requested:
+            return []
+        result = await self._request(
+            "checkpoints",
+            {"sequenceNumbers": requested},
+            timeout=60.0,
+        )
+        return [
+            SuiCheckpoint(
+                sequence_number=int(checkpoint["sequenceNumber"]),
+                transactions=list(checkpoint.get("transactions") or []),
+            )
+            for checkpoint in result.get("checkpoints") or []
+        ]
+
     async def get_balance(self, owner: str, coin_type: str) -> int:
         result = await self._request(
             "balance",
