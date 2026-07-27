@@ -133,6 +133,7 @@ class BuyTrackerTests(unittest.TestCase):
         event = detect_buy(transaction, "0x2::demo::DEMO")
 
         self.assertIsNotNone(event)
+        self.assertEqual(event.sui_spent, 1000)
 
     def test_rejects_reward_claim_with_only_sui_gas_outflow(self):
         transaction = make_transaction(function="claim", module="rewards")

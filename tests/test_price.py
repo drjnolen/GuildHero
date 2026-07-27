@@ -7,7 +7,9 @@ exercise only the price lookup logic without real external calls.
 import os
 import sys
 import unittest
+from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -188,6 +190,49 @@ class TestPriceFetching(unittest.IsolatedAsyncioTestCase):
             second_args, second_kwargs = mock_client.get.call_args_list[1]
             self.assertIn("coins/markets", second_args[0])
             self.assertEqual(second_kwargs["params"]["ids"], "unknown-coin")
+
+    async def test_exact_sui_buy_valuation_only_fetches_sui_price(self):
+        event = SimpleNamespace(
+            amount=10_000_000_000,
+            sui_spent=2_000_000_000,
+        )
+        with patch(
+            "bot.fetch_crypto_price",
+            new=AsyncMock(return_value={"price": 1.5}),
+        ) as mock_fetch:
+            valuation = await bot._get_buy_valuation(
+                event,
+                {"symbol": "CITY", "decimals": 9},
+            )
+
+        self.assertEqual(valuation["sui"], Decimal("2"))
+        self.assertEqual(valuation["usd"], Decimal("3.0"))
+        mock_fetch.assert_awaited_once_with("SUI")
+
+    async def test_cross_token_buy_valuation_fetches_token_and_sui_prices(self):
+        event = SimpleNamespace(
+            amount=10_000_000_000,
+            sui_spent=None,
+        )
+
+        async def price_for(symbol):
+            return {"price": 4 if symbol == "SUI" else 2}
+
+        with patch(
+            "bot.fetch_crypto_price",
+            new=AsyncMock(side_effect=price_for),
+        ) as mock_fetch:
+            valuation = await bot._get_buy_valuation(
+                event,
+                {"symbol": "CITY", "decimals": 9},
+            )
+
+        self.assertEqual(valuation["sui"], Decimal("5"))
+        self.assertEqual(valuation["usd"], Decimal("20"))
+        self.assertCountEqual(
+            [call.args[0] for call in mock_fetch.await_args_list],
+            ["SUI", "CITY"],
+        )
 
 
 if __name__ == "__main__":
