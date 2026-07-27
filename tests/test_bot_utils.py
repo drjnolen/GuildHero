@@ -59,13 +59,16 @@ for _mod_name in ("sui_utils", "raffle_utils", "nacl", "nacl.signing", "nacl.sec
     sys.modules.pop(_mod_name, None)
 
 from bot import (  # noqa: E402
+    _buy_event_date,
     _buy_emoji_count,
     _buybot_media_from_message,
     _buybot_checkpoint_batches,
     _calculate_buy_valuation,
+    _classify_buy_badges,
     _format_buy_announcement,
     _initialize_buybot_start_checkpoints,
     _send_buy_announcement,
+    _updated_buybot_buyer_profile,
     format_large_number,
     format_detailed_leaderboard,
     get_stable_proportional_sample,
@@ -132,6 +135,93 @@ class TestBuyAnnouncementFormatting(unittest.TestCase):
         self.assertEqual(_buy_emoji_count(Decimal("5")), 2)
         self.assertEqual(_buy_emoji_count(Decimal("10")), 3)
 
+    def test_formats_smart_buyer_badges_below_emojis(self):
+        text = _format_buy_announcement(
+            self._event(),
+            {"symbol": "CITY", "decimals": 9},
+            {"sui": Decimal("25"), "usd": Decimal("100")},
+            ["whale", "first_time"],
+        )
+
+        self.assertTrue(
+            text.startswith(
+                "🟢 <b>CITY Buy!</b>\n"
+                "🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥\n"
+                "🐋 <b>Whale Buy</b> · 🆕 <b>First-Time Buyer</b>\n"
+            )
+        )
+
+
+class TestSmartBuyerBadges(unittest.TestCase):
+    def test_first_observed_buy_can_also_be_a_whale(self):
+        badges = _classify_buy_badges(
+            {},
+            Decimal("100"),
+            datetime.date(2026, 7, 27),
+        )
+
+        self.assertEqual(badges, ["whale", "first_time"])
+
+    def test_subsequent_buy_is_a_returning_holder(self):
+        badges = _classify_buy_badges(
+            {"buy_count": 1, "buy_dates": ["2026-07-26"]},
+            Decimal("20"),
+            datetime.date(2026, 7, 27),
+        )
+
+        self.assertEqual(badges, ["returning"])
+
+    def test_third_consecutive_utc_day_earns_streak(self):
+        profile = {
+            "buy_count": 2,
+            "buy_dates": ["2026-07-25", "2026-07-26"],
+        }
+
+        badges = _classify_buy_badges(
+            profile,
+            Decimal("20"),
+            datetime.date(2026, 7, 27),
+        )
+        updated = _updated_buybot_buyer_profile(
+            profile,
+            datetime.date(2026, 7, 27),
+        )
+
+        self.assertEqual(badges, ["returning", "three_day_streak"])
+        self.assertEqual(updated["buy_count"], 3)
+        self.assertEqual(
+            updated["buy_dates"],
+            ["2026-07-25", "2026-07-26", "2026-07-27"],
+        )
+
+    def test_multiple_buys_on_one_day_do_not_advance_streak(self):
+        profile = {
+            "buy_count": 2,
+            "buy_dates": ["2026-07-26"],
+        }
+
+        badges = _classify_buy_badges(
+            profile,
+            Decimal("20"),
+            datetime.date(2026, 7, 26),
+        )
+        updated = _updated_buybot_buyer_profile(
+            profile,
+            datetime.date(2026, 7, 26),
+        )
+
+        self.assertEqual(badges, ["returning"])
+        self.assertEqual(updated["buy_dates"], ["2026-07-26"])
+
+    def test_uses_finalized_transaction_timestamp_in_utc(self):
+        self.assertEqual(
+            _buy_event_date(
+                {"seconds": "1785126600", "nanos": 0},
+                fallback=datetime.date(2000, 1, 1),
+            ),
+            datetime.date(2026, 7, 27),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Custom buy announcement media and command menu
@@ -140,6 +230,69 @@ class TestBuyAnnouncementFormatting(unittest.TestCase):
 class _FakeDB(dict):
     def enroll_chat(self, _chat_id):
         return None
+
+
+class TestSmartBuyerBadgePersistence(unittest.TestCase):
+    def test_records_profile_only_after_successful_announcement(self):
+        async def exercise(send_error=None):
+            originals = {
+                "db": bot.db,
+                "detect_buy": bot.detect_buy,
+                "get_coin_amount_config": bot.get_coin_amount_config,
+                "_get_buy_valuation": bot._get_buy_valuation,
+                "_send_buy_announcement": bot._send_buy_announcement,
+            }
+            event = SimpleNamespace(
+                amount=10_000_000_000,
+                sui_spent=1_000_000_000,
+                exchange="Cetus",
+                wallet="0xbuyer",
+                sender="0xbuyer",
+                digest="Digest123",
+                timestamp={"seconds": "1785126600", "nanos": 0},
+            )
+            fake_db = _FakeDB()
+            send_announcement = AsyncMock(side_effect=send_error)
+            bot.db = fake_db
+            bot.detect_buy = MagicMock(return_value=event)
+            bot.get_coin_amount_config = AsyncMock(
+                return_value={"symbol": "CITY", "decimals": 9}
+            )
+            bot._get_buy_valuation = AsyncMock(
+                return_value={"sui": Decimal("100"), "usd": Decimal("150")}
+            )
+            bot._send_buy_announcement = send_announcement
+            try:
+                all_sent = await bot._announce_checkpoint_buys(
+                    SimpleNamespace(),
+                    SimpleNamespace(sequence_number=11, transactions=[object()]),
+                    {"0xabc::city::CITY": [(42, 10)]},
+                )
+            finally:
+                for name, value in originals.items():
+                    setattr(bot, name, value)
+            return all_sent, fake_db, send_announcement
+
+        all_sent, fake_db, send_announcement = asyncio.run(exercise())
+
+        self.assertTrue(all_sent)
+        announcement = send_announcement.await_args.args[2]
+        self.assertIn("🐋 <b>Whale Buy</b>", announcement)
+        self.assertIn("🆕 <b>First-Time Buyer</b>", announcement)
+        buyer_keys = [
+            key for key in fake_db if key.startswith("buybot_buyer:42:")
+        ]
+        self.assertEqual(len(buyer_keys), 1)
+        self.assertEqual(fake_db[buyer_keys[0]]["buy_count"], 1)
+        self.assertEqual(fake_db["buybot_seen:42"], ["Digest123"])
+
+        all_sent, failed_db, _ = asyncio.run(exercise(RuntimeError("temporary")))
+
+        self.assertFalse(all_sent)
+        self.assertFalse(
+            any(key.startswith("buybot_buyer:42:") for key in failed_db)
+        )
+        self.assertNotIn("buybot_seen:42", failed_db)
 
 
 class TestBuyAnnouncementMedia(unittest.TestCase):
