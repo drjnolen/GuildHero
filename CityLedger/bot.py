@@ -9,14 +9,21 @@ import logging
 import io
 import csv
 import html
-import hashlib
+import json
 import time
 import uuid
 from collections import defaultdict
 import pytz
 from ai_services import analyze_user_messages, summarize_chat_history, get_best_of_messages, get_vibe_check, generate_copypasta
+from buy_tracker import detect_buy
 from db import db
 from http_clients import close_shared_async_client, get_shared_async_client
+from sui_service import (
+    DEFAULT_SUI_GRPC_URL,
+    close_sui_service,
+    get_sui_service,
+    parse_grpc_headers,
+)
 from sui_utils import (
     DEFAULT_SUI_COIN_DECIMALS,
     DEFAULT_SUI_COIN_TYPE as SUI_DEFAULT_COIN_TYPE,
@@ -25,7 +32,6 @@ from sui_utils import (
     derive_sui_address,
     encrypt_private_key,
     format_token_amount,
-    get_sui_signing_key,
     normalize_sui_private_key,
     parse_token_amount,
     resolve_airdrop_sender_config,
@@ -105,6 +111,9 @@ _AI_RATE_LIMIT_MESSAGE = "⏳ Please wait {remaining:.0f}s before using AI comma
 
 # How often (in transfer count) to edit the airdrop progress message.
 _AIRDROP_PROGRESS_UPDATE_INTERVAL = 3
+_BUYBOT_SEEN_DIGEST_LIMIT = 500
+_BUYBOT_MAX_CHECKPOINTS_PER_RUN = 50
+_BUYBOT_POLL_SECONDS = 3
 
 
 def _check_ai_rate_limit(user_id: int, chat_id: int) -> float:
@@ -261,9 +270,27 @@ GENERAL_PRICE_ALIASES = {
 ALL_PRICE_ALIASES = {**SUI_PRICE_ALIASES, **GENERAL_PRICE_ALIASES}
 
 # --- SUI Blockchain ---
-SUI_RPC_URL = os.environ.get("SUI_RPC_URL", "https://fullnode.mainnet.sui.io:443")
+SUI_GRPC_URL = os.environ.get("SUI_GRPC_URL", DEFAULT_SUI_GRPC_URL)
 DEFAULT_SUI_COIN_TYPE = SUI_DEFAULT_COIN_TYPE
-SUI_GAS_BUDGET = "50000000"  # 0.05 SUI
+SUI_GAS_BUDGET = int(os.environ.get("SUI_GAS_BUDGET", "50000000"))  # 0.05 SUI
+SUI_EXPLORER_TX_URL = os.environ.get("SUI_EXPLORER_TX_URL", "https://suivision.xyz/txblock")
+
+try:
+    SUI_GRPC_HEADERS = parse_grpc_headers(os.environ.get("SUI_GRPC_HEADERS_JSON"))
+except ValueError as exc:
+    logging.warning(f"{exc} Provider headers will not be sent.")
+    SUI_GRPC_HEADERS = {}
+
+try:
+    _dex_packages_from_env = json.loads(os.environ.get("SUI_DEX_PACKAGES_JSON", "{}"))
+    SUI_DEX_PACKAGES = (
+        {str(package): str(label) for package, label in _dex_packages_from_env.items()}
+        if isinstance(_dex_packages_from_env, dict)
+        else {}
+    )
+except json.JSONDecodeError:
+    logging.warning("SUI_DEX_PACKAGES_JSON is invalid JSON; custom DEX labels are disabled.")
+    SUI_DEX_PACKAGES = {}
 
 
 # --- Helper Functions ---
@@ -383,6 +410,22 @@ def _get_airdrop_token_key(chat_id):
 def _get_airdrop_wallet_key(chat_id):
     """Returns the database key for the group's encrypted airdrop wallet config."""
     return f"airdrop_wallet:{chat_id}"
+
+
+def _get_buybot_enabled_key(chat_id):
+    return f"buybot_enabled:{chat_id}"
+
+
+def _get_buybot_seen_key(chat_id):
+    return f"buybot_seen:{chat_id}"
+
+
+def _get_buybot_start_checkpoint_key(chat_id):
+    return f"buybot_start_checkpoint:{chat_id}"
+
+
+def _get_buybot_checkpoint_key():
+    return "buybot:checkpoint"
 
 
 def _track_chat(chat_id):
@@ -626,31 +669,9 @@ def get_top_users_by_messages(chat_id, count):
     return [(str(user_id), message_count) for user_id, _, message_count in db.get_top_message_counts(int(chat_id), int(count))]
 
 
-async def sui_rpc_call(method: str, params: list) -> dict:
-    """Makes a JSON-RPC call to the SUI network."""
-    client = await get_shared_async_client()
-    resp = await client.post(
-        SUI_RPC_URL,
-        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-    )
-    resp.raise_for_status()
-    result = resp.json()
-    if "error" in result:
-        raise Exception(f"SUI RPC error: {result['error']}")
-    return result.get("result")
-
-
-async def sui_get_coins(owner: str, coin_type: str = None) -> dict:
-    """Gets coin objects owned by an address."""
-    params = [owner]
-    if coin_type:
-        params.append(coin_type)
-    return await sui_rpc_call("suix_getCoins", params) or {}
-
-
 async def sui_get_total_balance(owner: str, coin_type: str) -> int:
-    coins_result = await sui_get_coins(owner, coin_type)
-    return sum(int(coin.get("balance", 0)) for coin in coins_result.get("data", []))
+    service = get_sui_service(SUI_GRPC_URL, SUI_GRPC_HEADERS)
+    return await service.get_balance(owner, coin_type)
 
 
 async def sui_get_coin_metadata(coin_type: str) -> dict | None:
@@ -658,7 +679,8 @@ async def sui_get_coin_metadata(coin_type: str) -> dict | None:
         return _coin_metadata_cache[coin_type]
 
     try:
-        metadata = await sui_rpc_call("suix_getCoinMetadata", [coin_type])
+        service = get_sui_service(SUI_GRPC_URL, SUI_GRPC_HEADERS)
+        metadata = await service.get_coin_metadata(coin_type)
     except Exception as exc:
         logging.warning(f"Failed to fetch coin metadata for {coin_type}: {exc}")
         metadata = None
@@ -679,7 +701,7 @@ async def get_coin_amount_config(coin_type: str) -> dict:
 
 
 async def preflight_airdrop(sender_address: str, recipient_count: int, amount: int, coin_type: str) -> dict:
-    requirements = build_airdrop_balance_requirements(recipient_count, amount, coin_type, int(SUI_GAS_BUDGET))
+    requirements = build_airdrop_balance_requirements(recipient_count, amount, coin_type, SUI_GAS_BUDGET)
     required_token_balance = requirements["required_token_balance"]
     required_sui_balance = requirements["required_sui_balance"]
 
@@ -704,80 +726,200 @@ async def preflight_airdrop(sender_address: str, recipient_count: int, amount: i
 
 
 async def sui_transfer_token(recipient: str, amount: int, coin_type: str, sender_private_key_hex: str) -> dict | None:
-    """Builds, signs, and executes a SUI token transfer.
+    """Build, sign, and execute a Sui v2 programmable transaction over gRPC."""
 
-    Uses the SUI `unsafe_paySui` (for native SUI) or `unsafe_pay` (for other coins)
-    RPC methods to build a transaction, then signs and executes it.
-    """
-    import base64
+    service = get_sui_service(SUI_GRPC_URL, SUI_GRPC_HEADERS)
+    return await service.transfer_token(
+        recipient=recipient,
+        amount=amount,
+        coin_type=coin_type,
+        sender_private_key_hex=sender_private_key_hex,
+        gas_budget=SUI_GAS_BUDGET,
+    )
 
-    signing_key = get_sui_signing_key(sender_private_key_hex)
-    public_key = signing_key.verify_key.encode()
-    sender_address = derive_sui_address(sender_private_key_hex)
 
-    is_sui = coin_type == "0x2::sui::SUI"
+def _load_buybot_chat_tokens() -> dict[str, list[tuple[int, int | None]]]:
+    """Return selected token types, chats, and their activation checkpoints."""
 
-    if is_sui:
-        # For native SUI, use unsafe_paySui
-        coins_result = await sui_get_coins(sender_address, "0x2::sui::SUI")
-        coin_ids = [c["coinObjectId"] for c in coins_result.get("data", [])]
-        if not coin_ids:
-            raise ValueError("Bot wallet has no SUI coins for transfer")
+    token_chats: dict[str, list[tuple[int, int | None]]] = defaultdict(list)
+    for key in db.prefix("buybot_enabled:"):
+        if not db.get(key, False):
+            continue
+        try:
+            chat_id = int(key.split(":", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        coin_type = db.get(_get_airdrop_token_key(chat_id))
+        if coin_type:
+            start_checkpoint = db.get(_get_buybot_start_checkpoint_key(chat_id))
+            token_chats[str(coin_type)].append(
+                (
+                    chat_id,
+                    int(start_checkpoint) if start_checkpoint is not None else None,
+                )
+            )
+    return dict(token_chats)
 
-        tx_result = await sui_rpc_call("unsafe_paySui", [
-            sender_address,
-            coin_ids,
-            [recipient],
-            [str(amount)],
-            SUI_GAS_BUDGET
-        ])
-    else:
-        # For other coin types, use unsafe_pay
-        coins_result = await sui_get_coins(sender_address, coin_type)
-        coin_ids = [c["coinObjectId"] for c in coins_result.get("data", [])]
-        if not coin_ids:
-            raise ValueError(f"Bot wallet has no coins of type {coin_type}")
 
-        # Need separate gas coins (SUI)
-        gas_result = await sui_get_coins(sender_address, "0x2::sui::SUI")
-        gas_data = gas_result.get("data", [])
-        if not gas_data:
-            raise ValueError("Bot wallet has no SUI for gas")
-        gas_coin = gas_data[0].get("coinObjectId")
+def _initialize_buybot_start_checkpoints(
+    token_chats: dict[str, list[tuple[int, int | None]]],
+    latest_sequence: int,
+) -> dict[str, list[tuple[int, int]]]:
+    initialized: dict[str, list[tuple[int, int]]] = {}
+    for coin_type, chats in token_chats.items():
+        initialized[coin_type] = []
+        for chat_id, start_checkpoint in chats:
+            if start_checkpoint is None:
+                start_checkpoint = latest_sequence
+                db[_get_buybot_start_checkpoint_key(chat_id)] = start_checkpoint
+            initialized[coin_type].append((chat_id, start_checkpoint))
+    return initialized
 
-        tx_result = await sui_rpc_call("unsafe_pay", [
-            sender_address,
-            coin_ids,
-            [recipient],
-            [str(amount)],
-            gas_coin,
-            SUI_GAS_BUDGET
-        ])
 
-    # Sign the transaction
-    tx_bytes_b64 = tx_result["txBytes"]
-    tx_bytes = base64.b64decode(tx_bytes_b64)
+def _buybot_digest_seen(chat_id: int, digest: str) -> bool:
+    return digest in db.get(_get_buybot_seen_key(chat_id), [])
 
-    # Intent message: intent_scope(0) + version(0) + app_id(0) + tx_bytes
-    intent_message = bytes([0, 0, 0]) + tx_bytes
-    digest = hashlib.blake2b(intent_message, digest_size=32).digest()
 
-    # Ed25519 signature
-    signed = signing_key.sign(digest)
-    signature = signed.signature  # 64 bytes
+def _remember_buybot_digest(chat_id: int, digest: str) -> None:
+    key = _get_buybot_seen_key(chat_id)
+    seen = db.get(key, [])
+    if digest not in seen:
+        seen.append(digest)
+        db[key] = seen[-_BUYBOT_SEEN_DIGEST_LIMIT:]
 
-    # Serialized signature: flag(1) + sig(64) + pubkey(32) = 97 bytes
-    serialized_sig = base64.b64encode(bytes([0x00]) + signature + public_key).decode()
 
-    # Execute the transaction
-    exec_result = await sui_rpc_call("sui_executeTransactionBlock", [
-        tx_bytes_b64,
-        [serialized_sig],
-        {"showEffects": True},
-        "WaitForLocalExecution"
-    ])
+def _format_buy_announcement(event, amount_config: dict) -> str:
+    symbol = html.escape(amount_config["symbol"])
+    exchange = html.escape(event.exchange)
+    wallet = html.escape(event.wallet)
+    digest = html.escape(event.digest)
+    tx_url = f"{SUI_EXPLORER_TX_URL.rstrip('/')}/{event.digest}"
+    lines = [
+        f"🟢 <b>{symbol} Buy!</b>",
+        "",
+        f"<b>Amount:</b> {format_token_amount(event.amount, amount_config['decimals'])} {symbol}",
+        f"<b>Buyer:</b> <code>{wallet}</code>",
+        f"<b>Exchange:</b> {exchange}",
+    ]
+    if event.sender and event.sender.lower() != event.wallet.lower():
+        lines.append(f"<b>Transaction sender:</b> <code>{html.escape(event.sender)}</code>")
+    lines.extend(
+        [
+            f'<a href="{html.escape(tx_url, quote=True)}">View transaction</a>',
+            f"<code>{digest}</code>",
+        ]
+    )
+    return "\n".join(lines) + FOOTER_HTML
 
-    return exec_result
+
+async def _announce_checkpoint_buys(
+    context,
+    checkpoint,
+    token_chats: dict[str, list[tuple[int, int]]],
+) -> bool:
+    """Announce buys in one checkpoint; return False when a transient send failed."""
+
+    all_sent = True
+    amount_configs: dict[str, dict] = {}
+    for transaction in checkpoint.transactions or []:
+        for coin_type, chats in token_chats.items():
+            event = detect_buy(transaction, coin_type, SUI_DEX_PACKAGES)
+            if not event or not event.digest:
+                continue
+            if coin_type not in amount_configs:
+                amount_configs[coin_type] = await get_coin_amount_config(coin_type)
+            text = _format_buy_announcement(event, amount_configs[coin_type])
+
+            for chat_id, start_checkpoint in chats:
+                if checkpoint.sequence_number <= start_checkpoint:
+                    continue
+                if await asyncio.to_thread(_buybot_digest_seen, chat_id, event.digest):
+                    continue
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=text,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+                except Exception as exc:
+                    error_name = exc.__class__.__name__
+                    logging.error(
+                        f"Failed to send buy announcement for {event.digest} to chat {chat_id}: {error_name}: {exc}"
+                    )
+                    if error_name in {"Forbidden", "BadRequest"}:
+                        await asyncio.to_thread(
+                            db.__setitem__,
+                            _get_buybot_enabled_key(chat_id),
+                            False,
+                        )
+                        logging.warning(f"Disabled buy bot for unreachable chat {chat_id}.")
+                    else:
+                        all_sent = False
+                    continue
+                await asyncio.to_thread(_remember_buybot_digest, chat_id, event.digest)
+
+    return all_sent
+
+
+async def check_sui_buys(context: ContextTypes.DEFAULT_TYPE):
+    """Poll finalized Sui checkpoints and announce selected-token DEX purchases."""
+
+    lock = context.application.bot_data.setdefault("buybot_checkpoint_lock", asyncio.Lock())
+    if lock.locked():
+        return
+
+    async with lock:
+        token_chats = await asyncio.to_thread(_load_buybot_chat_tokens)
+        if not token_chats:
+            return
+
+        service = get_sui_service(SUI_GRPC_URL, SUI_GRPC_HEADERS)
+        try:
+            latest = await service.get_latest_checkpoint()
+            latest_sequence = int(latest.sequence_number)
+            token_chats = await asyncio.to_thread(
+                _initialize_buybot_start_checkpoints,
+                token_chats,
+                latest_sequence,
+            )
+            cursor = await asyncio.to_thread(db.get, _get_buybot_checkpoint_key())
+            if cursor is None or int(cursor) > latest_sequence:
+                await asyncio.to_thread(
+                    db.__setitem__,
+                    _get_buybot_checkpoint_key(),
+                    latest_sequence,
+                )
+                return
+
+            earliest_active_checkpoint = min(
+                start_checkpoint
+                for chats in token_chats.values()
+                for _, start_checkpoint in chats
+            )
+            if int(cursor) < earliest_active_checkpoint:
+                cursor = earliest_active_checkpoint
+                await asyncio.to_thread(
+                    db.__setitem__,
+                    _get_buybot_checkpoint_key(),
+                    cursor,
+                )
+
+            end_sequence = min(
+                latest_sequence,
+                int(cursor) + _BUYBOT_MAX_CHECKPOINTS_PER_RUN,
+            )
+            for sequence_number in range(int(cursor) + 1, end_sequence + 1):
+                checkpoint = await service.get_checkpoint(sequence_number)
+                if not await _announce_checkpoint_buys(context, checkpoint, token_chats):
+                    return
+                await asyncio.to_thread(
+                    db.__setitem__,
+                    _get_buybot_checkpoint_key(),
+                    sequence_number,
+                )
+        except Exception as exc:
+            logging.error(f"Sui buy tracker checkpoint poll failed: {exc}")
 
 
 # --- Price Lookup ---
@@ -1494,23 +1636,96 @@ async def settoken_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update, context):
         return
 
-    _track_chat(update.effective_chat.id)
+    chat_id = update.effective_chat.id
+    _track_chat(chat_id)
     if not context.args:
-        current_token = db.get(_get_airdrop_token_key(update.effective_chat.id), DEFAULT_SUI_COIN_TYPE)
+        selected_token = db.get(_get_airdrop_token_key(chat_id))
+        current_token = selected_token or DEFAULT_SUI_COIN_TYPE
+        selection_note = (
+            "This token is explicitly selected and can be tracked by the buy bot."
+            if selected_token
+            else "No token is explicitly selected. Airdrops fall back to SUI, and the buy bot stays idle."
+        )
         await update.message.reply_text(
             f"Current airdrop token: <code>{html.escape(current_token)}</code>\n\n"
+            f"{selection_note}\n\n"
             "Usage: /settoken &lt;coin_type&gt;\n"
-            "Example: /settoken 0x2::sui::SUI",
+            "Example: /settoken 0x2::sui::SUI\n"
+            "Use /settoken off to clear the selected token.",
             parse_mode=ParseMode.HTML,
         )
         return
 
     coin_type = context.args[0].strip()
-    db[_get_airdrop_token_key(update.effective_chat.id)] = coin_type
+    if coin_type.lower() in {"off", "none", "clear"}:
+        key = _get_airdrop_token_key(chat_id)
+        if key in db:
+            del db[key]
+        db[_get_buybot_enabled_key(chat_id)] = False
+        start_key = _get_buybot_start_checkpoint_key(chat_id)
+        if start_key in db:
+            del db[start_key]
+        await update.message.reply_text(
+            "✅ The selected token has been cleared. Airdrops will fall back to SUI, and buy announcements are disabled."
+        )
+        return
+
+    db[_get_airdrop_token_key(chat_id)] = coin_type
+    if db.get(_get_buybot_enabled_key(chat_id), False):
+        start_key = _get_buybot_start_checkpoint_key(chat_id)
+        if start_key in db:
+            del db[start_key]
     await update.message.reply_text(
         f"✅ Airdrop token set to: <code>{html.escape(coin_type)}</code>",
         parse_mode=ParseMode.HTML,
     )
+
+
+async def setbuybot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Enable or disable selected-token buy announcements for a group."""
+
+    if not await require_admin(update, context):
+        return
+
+    chat_id = update.effective_chat.id
+    _track_chat(chat_id)
+    selected_token = db.get(_get_airdrop_token_key(chat_id))
+    enabled = bool(db.get(_get_buybot_enabled_key(chat_id), False))
+
+    if not context.args or context.args[0].lower() not in {"on", "off"}:
+        status = "on ✅" if enabled else "off ❌"
+        token_text = (
+            f"<code>{html.escape(selected_token)}</code>"
+            if selected_token
+            else "none"
+        )
+        await update.message.reply_text(
+            f"Buy bot: {status}\nSelected token: {token_text}\n\n"
+            "Usage: /setbuybot on or /setbuybot off",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    requested_enabled = context.args[0].lower() == "on"
+    if requested_enabled and not selected_token:
+        await update.message.reply_text(
+            "❌ Select an airdrop token first with /settoken &lt;coin_type&gt;. "
+            "The buy bot never uses the implicit SUI airdrop fallback.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    db[_get_buybot_enabled_key(chat_id)] = requested_enabled
+    start_key = _get_buybot_start_checkpoint_key(chat_id)
+    if start_key in db:
+        del db[start_key]
+    if requested_enabled:
+        await update.message.reply_text(
+            f"✅ Buy announcements are enabled for <code>{html.escape(selected_token)}</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text("✅ Buy announcements are disabled.")
 
 
 async def setairdropwallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2385,6 +2600,7 @@ async def setup_bot_commands(application):
         BotCommand("raffle", "Raffle prize: reply to /score with /raffle <amount>"),
         BotCommand("setairdropwallet", "Set this group's encrypted airdrop wallet (admin)"),
         BotCommand("settoken", "Set airdrop token (admin)"),
+        BotCommand("setbuybot", "Toggle selected-token buy announcements (admin)"),
         BotCommand("mybadges", "View your earned badges"),
         BotCommand("allbadges", "See all available badges"),
         BotCommand("mystats", "View your personal stats"),
@@ -2417,7 +2633,10 @@ async def setup_bot_commands(application):
     )
 
 async def shutdown_services(application):
-    await close_shared_async_client()
+    await asyncio.gather(
+        close_shared_async_client(),
+        close_sui_service(),
+    )
 
 
 def main():
@@ -2432,6 +2651,7 @@ def main():
 
     job_queue = application.job_queue
     job_queue.run_repeating(check_and_announce_events, interval=datetime.timedelta(minutes=30), first=10)
+    job_queue.run_repeating(check_sui_buys, interval=_BUYBOT_POLL_SECONDS, first=5)
 
 
     calendar_conv_handler = ConversationHandler(
@@ -2470,6 +2690,7 @@ def main():
     application.add_handler(CommandHandler("raffle", raffle_command))
     application.add_handler(CommandHandler("setairdropwallet", setairdropwallet_command))
     application.add_handler(CommandHandler("settoken", settoken_command))
+    application.add_handler(CommandHandler("setbuybot", setbuybot_command))
     application.add_handler(CommandHandler("setwelcome", setwelcome_command))
     application.add_handler(CommandHandler("setachievements", setachievements_command))
     application.add_handler(CommandHandler("help", help_command))

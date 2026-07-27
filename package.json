@@ -1,0 +1,15 @@
+{
+  "name": "guildhero-sui-bridge",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "check:sui": "node --check CityLedger/sui_bridge.mjs",
+    "test:sui": "node --test tests/sui_bridge.test.mjs"
+  },
+  "dependencies": {
+    "@mysten/sui": "2.22.1"
+  }
+}
