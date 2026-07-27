@@ -7,10 +7,13 @@ from typing import Any, Mapping
 
 
 DEFAULT_DEX_PACKAGES = {
-    # Cetus CLMM mainnet package. Additional/upgraded packages can be supplied
-    # through SUI_DEX_PACKAGES_JSON without requiring a bot release.
+    # Mainnet packages used by common direct and wrapped swap routes.
     "0x1eabed72c53feb3805120a081dc15963c204dc8d091542592abaf7a35689b2fb": "Cetus",
+    "0x62a97a4997a54999ac817621c43433c482392698061c9d6aef867cac5d30d838": "Cetus",
+    "0x91bfbc386a41afcfd9b2533058d7e915a1d3829089cc268ff4333d54d6339ca1": "Turbos",
+    "0x8b14f4351bb342b81c27fce2fe6d0f56b98288dc88fbe60b28b26d804b25941a": "Turbos",
 }
+SUI_COIN_TYPE = "0x2::sui::sui"
 
 _DEX_NAME_HINTS = (
     ("cetus", "Cetus"),
@@ -31,6 +34,16 @@ _SWAP_OPERATION_HINTS = (
     "place_order",
     "fill_order",
     "route",
+)
+
+_NON_BUY_OPERATION_HINTS = (
+    "add_liquidity",
+    "remove_liquidity",
+    "withdraw",
+    "redeem",
+    "claim",
+    "reward",
+    "unstake",
 )
 
 
@@ -105,7 +118,9 @@ def _events(transaction: Any) -> list[Any]:
     return list(_get(_get(transaction, "events"), "events", []) or [])
 
 
-def _swap_evidence(transaction: Any) -> tuple[bool, list[tuple[str, str]]]:
+def _swap_evidence(
+    transaction: Any,
+) -> tuple[bool, list[tuple[str, str]], list[str]]:
     """Return whether a swap-like call/event exists and venue-identifying clues."""
 
     descriptors: list[str] = []
@@ -128,6 +143,7 @@ def _swap_evidence(transaction: Any) -> tuple[bool, list[tuple[str, str]]]:
     return (
         any(hint in descriptor for descriptor in descriptors for hint in _SWAP_OPERATION_HINTS),
         packages,
+        descriptors,
     )
 
 
@@ -155,6 +171,49 @@ def _infer_exchange(
     return " / ".join(labels[:3]) if labels else "Unknown DEX"
 
 
+def _gas_cost(transaction: Any) -> int:
+    gas_used = _get(_get(transaction, "effects"), "gas_used")
+    try:
+        computation = int(_get(gas_used, "computation_cost", 0) or 0)
+        storage = int(_get(gas_used, "storage_cost", 0) or 0)
+        rebate = int(_get(gas_used, "storage_rebate", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, computation + storage - rebate)
+
+
+def _wallet_spent_another_coin(
+    transaction: Any,
+    wallet: str,
+    selected_coin_type: str,
+) -> bool:
+    """Identify an input-coin outflow, excluding the wallet's SUI gas."""
+
+    selected = canonicalize_sui_type(selected_coin_type)
+    wallet_lower = wallet.lower()
+    effects = _get(transaction, "effects")
+    gas_payer = str(_get(effects, "gas_payer", "") or "").lower()
+    gas_cost = _gas_cost(transaction)
+
+    for change in _get(transaction, "balance_changes", []) or []:
+        address = str(_get(change, "address", "") or "").lower()
+        coin_type = canonicalize_sui_type(_get(change, "coin_type"))
+        if address != wallet_lower or coin_type == selected:
+            continue
+        try:
+            amount = int(_get(change, "amount", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if amount >= 0:
+            continue
+        spend = -amount
+        if coin_type == SUI_COIN_TYPE and address == gas_payer:
+            spend -= gas_cost
+        if spend > 0:
+            return True
+    return False
+
+
 def detect_buy(
     transaction: Any,
     selected_coin_type: str,
@@ -162,17 +221,15 @@ def detect_buy(
 ) -> BuyEvent | None:
     """Detect the principal recipient of a selected token in a DEX swap.
 
-    A positive balance change by itself is deliberately insufficient because
-    transfers, airdrops, rewards, and liquidity withdrawals also increase token
-    balances. A swap-like Move call or event must be present.
+    Named swap calls/events are preferred evidence. Unknown or upgraded venues
+    are also accepted when the recipient spent another coin, after subtracting
+    SUI gas, unless the transaction is clearly a claim or liquidity operation.
     """
 
     if not selected_coin_type or not _transaction_succeeded(transaction):
         return None
 
-    has_swap_evidence, package_clues = _swap_evidence(transaction)
-    if not has_swap_evidence:
-        return None
+    has_swap_evidence, package_clues, descriptors = _swap_evidence(transaction)
 
     selected = canonicalize_sui_type(selected_coin_type)
     received_by_wallet: dict[str, int] = {}
@@ -196,6 +253,19 @@ def detect_buy(
         wallet = sender
     else:
         wallet = max(received_by_wallet, key=received_by_wallet.get)
+
+    if not has_swap_evidence:
+        has_non_buy_evidence = any(
+            hint in descriptor
+            for descriptor in descriptors
+            for hint in _NON_BUY_OPERATION_HINTS
+        )
+        if has_non_buy_evidence or not _wallet_spent_another_coin(
+            transaction,
+            wallet,
+            selected_coin_type,
+        ):
+            return None
 
     return BuyEvent(
         digest=str(_get(transaction, "digest", "") or ""),

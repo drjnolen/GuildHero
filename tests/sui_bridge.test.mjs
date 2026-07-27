@@ -52,6 +52,16 @@ test('maps only buy-detection fields from a gRPC checkpoint', () => {
               nestedProtocolField: 123n,
             },
           },
+          gasUsed: {
+            computationCost: 100n,
+            storageCost: 50n,
+            storageRebate: 20n,
+          },
+          gasObject: {
+            inputOwner: {
+              address: '0xbuyer',
+            },
+          },
         },
         events: {
           events: [
@@ -98,7 +108,15 @@ test('maps only buy-detection fields from a gRPC checkpoint', () => {
             },
           },
         },
-        effects: { status: { success: true, error: 'Transaction failed' } },
+        effects: {
+          status: { success: true, error: 'Transaction failed' },
+          gas_used: {
+            computation_cost: '100',
+            storage_cost: '50',
+            storage_rebate: '20',
+          },
+          gas_payer: '0xbuyer',
+        },
         events: {
           events: [
             {
@@ -216,6 +234,51 @@ test('retries timed-out checkpoint calls with an RPC deadline', async () => {
 
   assert.equal(attempts, 2);
   assert.equal(result.checkpoints[0].sequenceNumber, '42');
+});
+
+test('drains finalized checkpoints from the live subscription', async () => {
+  const subscribedRequests = [];
+  const client = {
+    subscriptionService: {
+      subscribeCheckpoints: (request) => {
+        subscribedRequests.push(request);
+        return {
+          responses: {
+            async *[Symbol.asyncIterator]() {
+              for (const sequenceNumber of [201n, 202n, 203n]) {
+                yield {
+                  cursor: sequenceNumber,
+                  checkpoint: {
+                    sequenceNumber,
+                    transactions: [],
+                  },
+                };
+              }
+            },
+          },
+        };
+      },
+    },
+  };
+
+  const result = await handleRequest(
+    {
+      method: 'subscribedCheckpoints',
+      params: { maxItems: 3, waitMs: 100 },
+    },
+    client,
+  );
+
+  assert.deepEqual(
+    result.checkpoints.map((checkpoint) => checkpoint.sequenceNumber),
+    ['201', '202', '203'],
+  );
+  assert.equal(subscribedRequests.length, 1);
+  assert.ok(
+    subscribedRequests[0].readMask.paths.includes(
+      'transactions.balance_changes',
+    ),
+  );
 });
 
 test('rejects oversized checkpoint batches', async () => {
