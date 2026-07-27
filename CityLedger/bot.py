@@ -16,7 +16,7 @@ from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 import pytz
 from ai_services import analyze_user_messages, summarize_chat_history, get_best_of_messages, get_vibe_check, generate_copypasta
-from buy_tracker import detect_buy
+from buy_tracker import canonicalize_sui_type, detect_buy
 from db import db
 from http_clients import close_shared_async_client, get_shared_async_client
 from sui_service import (
@@ -120,7 +120,27 @@ _BUYBOT_POLL_SECONDS = 3
 _BUYBOT_EMOJI = "🔥"
 _BUYBOT_EMOJI_USD_STEP = Decimal("5")
 _BUYBOT_MAX_EMOJIS = 100
+_BUYBOT_BUYER_DATE_HISTORY_LIMIT = 32
 _MIST_PER_SUI = Decimal("1000000000")
+
+try:
+    _BUYBOT_WHALE_USD_THRESHOLD = Decimal(
+        os.environ.get("BUYBOT_WHALE_USD_THRESHOLD", "100")
+    )
+    if not _BUYBOT_WHALE_USD_THRESHOLD.is_finite() or _BUYBOT_WHALE_USD_THRESHOLD <= 0:
+        raise InvalidOperation
+except (InvalidOperation, TypeError, ValueError):
+    logging.warning(
+        "Invalid BUYBOT_WHALE_USD_THRESHOLD; falling back to $100."
+    )
+    _BUYBOT_WHALE_USD_THRESHOLD = Decimal("100")
+
+_BUYBOT_BADGES = {
+    "whale": ("🐋", "Whale Buy"),
+    "first_time": ("🆕", "First-Time Buyer"),
+    "returning": ("💎", "Returning Holder"),
+    "three_day_streak": ("🔥", "Three-Day Streak"),
+}
 
 
 def _check_ai_rate_limit(user_id: int, chat_id: int) -> float:
@@ -433,6 +453,11 @@ def _get_buybot_start_checkpoint_key(chat_id):
 
 def _get_buybot_media_key(chat_id):
     return f"buybot_media:{chat_id}"
+
+
+def _get_buybot_buyer_key(chat_id: int, coin_type: str, wallet: str) -> str:
+    token = canonicalize_sui_type(coin_type)
+    return f"buybot_buyer:{chat_id}:{token}:{wallet.lower()}"
 
 
 def _get_buybot_checkpoint_key():
@@ -824,6 +849,122 @@ def _remember_buybot_digest(chat_id: int, digest: str) -> None:
         db[key] = seen[-_BUYBOT_SEEN_DIGEST_LIMIT:]
 
 
+def _buy_event_date(
+    timestamp,
+    fallback: datetime.date | None = None,
+) -> datetime.date:
+    """Return the finalized transaction's UTC date."""
+
+    fallback = fallback or datetime.datetime.now(datetime.timezone.utc).date()
+    try:
+        if isinstance(timestamp, datetime.datetime):
+            value = timestamp
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=datetime.timezone.utc)
+            return value.astimezone(datetime.timezone.utc).date()
+        if isinstance(timestamp, dict):
+            timestamp = timestamp.get("seconds")
+        if isinstance(timestamp, (int, float)) or (
+            isinstance(timestamp, str) and timestamp.strip().lstrip("-").isdigit()
+        ):
+            return datetime.datetime.fromtimestamp(
+                int(timestamp),
+                tz=datetime.timezone.utc,
+            ).date()
+        if isinstance(timestamp, str) and timestamp.strip():
+            value = datetime.datetime.fromisoformat(
+                timestamp.strip().replace("Z", "+00:00")
+            )
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=datetime.timezone.utc)
+            return value.astimezone(datetime.timezone.utc).date()
+    except (OverflowError, TypeError, ValueError):
+        pass
+    return fallback
+
+
+def _load_buybot_buyer_profile(
+    chat_id: int,
+    coin_type: str,
+    wallet: str,
+) -> dict:
+    profile = db.get(_get_buybot_buyer_key(chat_id, coin_type, wallet), {})
+    return profile if isinstance(profile, dict) else {}
+
+
+def _classify_buy_badges(
+    profile: dict | None,
+    usd_value: Decimal | None,
+    purchase_date: datetime.date,
+) -> list[str]:
+    """Classify a buy using only history recorded before this transaction."""
+
+    profile = profile if isinstance(profile, dict) else {}
+    try:
+        buy_count = max(0, int(profile.get("buy_count", 0)))
+    except (TypeError, ValueError):
+        buy_count = 0
+
+    badges = []
+    value = _positive_decimal(usd_value)
+    if value is not None and value >= _BUYBOT_WHALE_USD_THRESHOLD:
+        badges.append("whale")
+    badges.append("first_time" if buy_count == 0 else "returning")
+
+    observed_dates = set()
+    for raw_date in profile.get("buy_dates", []) or []:
+        try:
+            observed_dates.add(datetime.date.fromisoformat(str(raw_date)))
+        except (TypeError, ValueError):
+            continue
+    if all(
+        purchase_date - datetime.timedelta(days=offset) in observed_dates
+        for offset in (1, 2)
+    ):
+        badges.append("three_day_streak")
+    return badges
+
+
+def _updated_buybot_buyer_profile(
+    profile: dict | None,
+    purchase_date: datetime.date,
+) -> dict:
+    """Return bounded buyer history after one successfully announced buy."""
+
+    profile = profile if isinstance(profile, dict) else {}
+    try:
+        buy_count = max(0, int(profile.get("buy_count", 0)))
+    except (TypeError, ValueError):
+        buy_count = 0
+
+    observed_dates = {purchase_date}
+    for raw_date in profile.get("buy_dates", []) or []:
+        try:
+            observed_dates.add(datetime.date.fromisoformat(str(raw_date)))
+        except (TypeError, ValueError):
+            continue
+    recent_dates = sorted(observed_dates)[-_BUYBOT_BUYER_DATE_HISTORY_LIMIT:]
+
+    first_buy_date = profile.get("first_buy_date")
+    if not isinstance(first_buy_date, str):
+        first_buy_date = min(recent_dates).isoformat()
+    return {
+        "buy_count": buy_count + 1,
+        "first_buy_date": first_buy_date,
+        "last_buy_date": max(recent_dates).isoformat(),
+        "buy_dates": [value.isoformat() for value in recent_dates],
+    }
+
+
+def _remember_buybot_buyer(
+    chat_id: int,
+    coin_type: str,
+    wallet: str,
+    profile: dict,
+) -> None:
+    db[_get_buybot_buyer_key(chat_id, coin_type, wallet)] = profile
+
+
 def _buybot_media_from_message(message) -> dict[str, str] | None:
     """Extract reusable Telegram media from a replied-to message."""
 
@@ -962,6 +1103,7 @@ def _format_buy_announcement(
     event,
     amount_config: dict,
     valuation: dict[str, Decimal | None] | None = None,
+    badges: list[str] | None = None,
 ) -> str:
     valuation = valuation or {"sui": None, "usd": None}
     symbol = html.escape(amount_config["symbol"])
@@ -972,15 +1114,26 @@ def _format_buy_announcement(
     lines = [
         f"🟢 <b>{symbol} Buy!</b>",
         _format_buy_emojis(valuation.get("usd")),
-        "",
-        f"<b>Amount:</b> {format_token_amount(event.amount, amount_config['decimals'])} {symbol}",
-        (
-            f"<b>Value:</b> {_format_sui_value(valuation.get('sui'))} SUI"
-            f" / {_format_usd_value(valuation.get('usd'))} USD"
-        ),
-        f"<b>Buyer:</b> <code>{wallet}</code>",
-        f"<b>Exchange:</b> {exchange}",
     ]
+    badge_text = [
+        f"{_BUYBOT_BADGES[badge][0]} <b>{_BUYBOT_BADGES[badge][1]}</b>"
+        for badge in badges or []
+        if badge in _BUYBOT_BADGES
+    ]
+    if badge_text:
+        lines.append(" · ".join(badge_text))
+    lines.extend(
+        [
+            "",
+            f"<b>Amount:</b> {format_token_amount(event.amount, amount_config['decimals'])} {symbol}",
+            (
+                f"<b>Value:</b> {_format_sui_value(valuation.get('sui'))} SUI"
+                f" / {_format_usd_value(valuation.get('usd'))} USD"
+            ),
+            f"<b>Buyer:</b> <code>{wallet}</code>",
+            f"<b>Exchange:</b> {exchange}",
+        ]
+    )
     if event.sender and event.sender.lower() != event.wallet.lower():
         lines.append(f"<b>Transaction sender:</b> <code>{html.escape(event.sender)}</code>")
     lines.extend(
@@ -1055,17 +1208,30 @@ async def _announce_checkpoint_buys(
             if coin_type not in amount_configs:
                 amount_configs[coin_type] = await get_coin_amount_config(coin_type)
             valuation = await _get_buy_valuation(event, amount_configs[coin_type])
-            text = _format_buy_announcement(
-                event,
-                amount_configs[coin_type],
-                valuation,
-            )
 
             for chat_id, start_checkpoint in chats:
                 if checkpoint.sequence_number <= start_checkpoint:
                     continue
                 if await asyncio.to_thread(_buybot_digest_seen, chat_id, event.digest):
                     continue
+                purchase_date = _buy_event_date(event.timestamp)
+                buyer_profile = await asyncio.to_thread(
+                    _load_buybot_buyer_profile,
+                    chat_id,
+                    coin_type,
+                    event.wallet,
+                )
+                badges = _classify_buy_badges(
+                    buyer_profile,
+                    valuation.get("usd"),
+                    purchase_date,
+                )
+                text = _format_buy_announcement(
+                    event,
+                    amount_configs[coin_type],
+                    valuation,
+                    badges,
+                )
                 try:
                     await _send_buy_announcement(context, chat_id, text)
                 except Exception as exc:
@@ -1083,6 +1249,17 @@ async def _announce_checkpoint_buys(
                     else:
                         all_sent = False
                     continue
+                updated_profile = _updated_buybot_buyer_profile(
+                    buyer_profile,
+                    purchase_date,
+                )
+                await asyncio.to_thread(
+                    _remember_buybot_buyer,
+                    chat_id,
+                    coin_type,
+                    event.wallet,
+                    updated_profile,
+                )
                 await asyncio.to_thread(_remember_buybot_digest, chat_id, event.digest)
 
     return all_sent

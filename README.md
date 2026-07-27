@@ -80,6 +80,7 @@ pip install -r requirements.txt
 | `SUI_GRPC_HEADERS_JSON` | No | JSON object containing provider headers such as an API key |
 | `SUI_GAS_BUDGET` | No | Maximum gas budget per airdrop transfer in MIST (default: `50000000`) |
 | `SUI_EXPLORER_TX_URL` | No | Explorer transaction URL prefix used in buy announcements |
+| `BUYBOT_WHALE_USD_THRESHOLD` | No | USD purchase value that earns the Whale Buy badge (default: `100`) |
 | `SUI_DEX_PACKAGES_JSON` | No | JSON map of additional DEX package IDs to display names |
 | `SUI_NODE_BINARY` | No | Node.js executable override (default: `node`) |
 
@@ -133,7 +134,16 @@ The buy bot reads finalized Sui checkpoints over gRPC. A transaction is announce
 1. The selected token has a positive balance change for a wallet; and
 2. The successful transaction contains swap evidence, or the recipient has a net outflow of another coin after SUI gas is removed.
 
-This deliberately excludes plain transfers, airdrops, failed transactions, claims, rewards, and most liquidity operations. The announcement includes the token amount, SUI and USD purchase values, a size-based flame scale, full purchasing wallet, inferred exchange (when recognizable), transaction sender when different, and an explorer link.
+This deliberately excludes plain transfers, airdrops, failed transactions, claims, rewards, and most liquidity operations. The announcement includes the token amount, SUI and USD purchase values, a size-based flame scale, smart buyer badges, full purchasing wallet, inferred exchange (when recognizable), transaction sender when different, and an explorer link.
+
+Buyer badges are tracked separately for each group, selected token, and wallet:
+
+- 🐋 **Whale Buy** — purchase value meets `BUYBOT_WHALE_USD_THRESHOLD` (default: $100)
+- 🆕 **First-Time Buyer** — the first buy GuildHero observes after this feature is deployed
+- 💎 **Returning Holder** — GuildHero has previously observed the wallet buy that token
+- 🔥 **Three-Day Streak** — the wallet buys on three consecutive UTC calendar days
+
+Buyer history is saved only after Telegram accepts the announcement, so delivery retries do not create false returning-buyer or streak badges.
 
 To enable it in a group:
 
