@@ -136,7 +136,7 @@ The buy bot reads finalized Sui checkpoints over gRPC. A transaction is announce
 
 This deliberately excludes plain transfers, airdrops, failed transactions, claims, rewards, and most liquidity operations. The announcement includes the token amount, SUI and USD purchase values, a size-based flame scale, smart buyer badges, full purchasing wallet, token-wide 24-hour and 1-hour DEX volume, transaction sender when different, and an explorer link.
 
-Rolling USD volume comes from [DEX Screener](https://docs.dexscreener.com/api/reference) and is summed across the selected token's unique Sui pools. Results are cached for 60 seconds. If market data is unavailable, the announcement still sends with `N/A` volume rather than losing a buy alert.
+Rolling USD volume comes from [DEX Screener](https://docs.dexscreener.com/api/reference) and is summed across the selected token's unique Sui pools. Results are cached for 60 seconds. Because the provider can lag a newly finalized transaction, GuildHero adds the triggering buy's USD value to both displayed windows. If provider volume is unavailable but the buy can be valued, the current buy becomes the minimum displayed 1-hour and 24-hour volume instead of showing `N/A`.
 
 Buyer badges are tracked separately for each group, selected token, and wallet:
 
