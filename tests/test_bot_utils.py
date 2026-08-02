@@ -70,6 +70,7 @@ from bot import (  # noqa: E402
     _initialize_buybot_start_checkpoints,
     _send_buy_announcement,
     _updated_buybot_buyer_profile,
+    _volume_including_current_buy,
     format_large_number,
     format_detailed_leaderboard,
     get_stable_proportional_sample,
@@ -164,6 +165,34 @@ class TestBuyAnnouncementFormatting(unittest.TestCase):
         self.assertEqual(_format_volume_usd(Decimal("1234.5")), "$1.23K")
         self.assertEqual(_format_volume_usd(Decimal("1234567")), "$1.23M")
         self.assertEqual(_format_volume_usd(None), "N/A")
+
+    def test_adds_current_buy_to_both_volume_windows(self):
+        provider_volume = {"h1": Decimal("500"), "h24": Decimal("2500")}
+        adjusted = _volume_including_current_buy(provider_volume, Decimal("150"))
+        retried = _volume_including_current_buy(provider_volume, Decimal("150"))
+
+        self.assertEqual(
+            adjusted,
+            {"h1": Decimal("650"), "h24": Decimal("2650")},
+        )
+        self.assertEqual(retried, adjusted)
+        self.assertEqual(
+            provider_volume,
+            {"h1": Decimal("500"), "h24": Decimal("2500")},
+        )
+
+    def test_current_buy_is_minimum_when_provider_volume_is_unavailable(self):
+        adjusted = _volume_including_current_buy(None, Decimal("150"))
+
+        self.assertEqual(
+            adjusted,
+            {"h1": Decimal("150"), "h24": Decimal("150")},
+        )
+
+    def test_unknown_buy_value_does_not_change_provider_volume(self):
+        volume = {"h1": Decimal("500"), "h24": Decimal("2500")}
+
+        self.assertIs(_volume_including_current_buy(volume, None), volume)
 
 
 class TestSmartBuyerBadges(unittest.TestCase):
@@ -297,6 +326,8 @@ class TestSmartBuyerBadgePersistence(unittest.TestCase):
         announcement = send_announcement.await_args.args[2]
         self.assertIn("🐋 <b>Whale Buy</b>", announcement)
         self.assertIn("🆕 <b>First-Time Buyer</b>", announcement)
+        self.assertIn("<b>24h Volume:</b> $2.65K", announcement)
+        self.assertIn("<b>1h Volume:</b> $650.00", announcement)
         buyer_keys = [
             key for key in fake_db if key.startswith("buybot_buyer:42:")
         ]

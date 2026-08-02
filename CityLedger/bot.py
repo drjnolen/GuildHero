@@ -1106,6 +1106,25 @@ async def fetch_token_volume(coin_type: str) -> dict[str, Decimal] | None:
     return result
 
 
+def _volume_including_current_buy(
+    volume: dict[str, Decimal] | None,
+    current_buy_usd: Decimal | None,
+) -> dict[str, Decimal] | None:
+    """Add this finalized buy to both provider volume windows."""
+
+    current_value = _positive_decimal(current_buy_usd)
+    if current_value is None:
+        return volume
+
+    baseline = volume if isinstance(volume, dict) else {}
+    return {
+        period: (
+            _nonnegative_decimal(baseline.get(period)) or Decimal(0)
+        ) + current_value
+        for period in ("h1", "h24")
+    }
+
+
 def _calculate_buy_valuation(
     event,
     amount_config: dict,
@@ -1321,6 +1340,10 @@ async def _announce_checkpoint_buys(
                 _get_buy_valuation(event, amount_configs[coin_type]),
                 fetch_token_volume(coin_type),
             )
+            display_volume = _volume_including_current_buy(
+                volume,
+                valuation.get("usd"),
+            )
 
             for chat_id, start_checkpoint in chats:
                 if checkpoint.sequence_number <= start_checkpoint:
@@ -1344,7 +1367,7 @@ async def _announce_checkpoint_buys(
                     amount_configs[coin_type],
                     valuation,
                     badges,
-                    volume,
+                    display_volume,
                 )
                 try:
                     await _send_buy_announcement(context, chat_id, text)
