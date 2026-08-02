@@ -14,6 +14,7 @@ import time
 import uuid
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
+from urllib.parse import quote
 import pytz
 from ai_services import analyze_user_messages, summarize_chat_history, get_best_of_messages, get_vibe_check, generate_copypasta
 from buy_tracker import canonicalize_sui_type, detect_buy
@@ -103,6 +104,10 @@ COINGECKO_SCORE_SEARCH_ORDER_BONUS = 20
 COINGECKO_SCORE_MARKET_CAP_BONUS = 125
 PRICE_CACHE_TTL = 60  # seconds – avoid repeated API hits for the same symbol
 _price_cache: dict[str, tuple[dict, float]] = {}
+DEXSCREENER_API_URL = "https://api.dexscreener.com"
+TOKEN_VOLUME_CACHE_TTL = 60
+TOKEN_VOLUME_REQUEST_TIMEOUT = 5.0
+_token_volume_cache: dict[str, tuple[dict[str, Decimal] | None, float]] = {}
 
 # --- AI Rate Limiting ---
 # One AI command per user per group per 60 seconds to prevent API cost abuse.
@@ -1011,6 +1016,96 @@ def _positive_decimal(value) -> Decimal | None:
         return None
 
 
+def _nonnegative_decimal(value) -> Decimal | None:
+    try:
+        decimal_value = Decimal(str(value))
+        return (
+            decimal_value
+            if decimal_value.is_finite() and decimal_value >= 0
+            else None
+        )
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _aggregate_token_volumes(
+    pairs,
+    coin_type: str,
+) -> dict[str, Decimal] | None:
+    """Sum rolling USD volume across unique Sui pools for one token."""
+
+    if not isinstance(pairs, list):
+        return None
+
+    selected = canonicalize_sui_type(coin_type)
+    seen_pairs: set[str] = set()
+    totals = {"h1": Decimal(0), "h24": Decimal(0)}
+    matched_pair = False
+
+    for index, pair in enumerate(pairs):
+        if not isinstance(pair, dict):
+            continue
+        if str(pair.get("chainId") or "").lower() != "sui":
+            continue
+        token_addresses = {
+            canonicalize_sui_type((pair.get(side) or {}).get("address"))
+            for side in ("baseToken", "quoteToken")
+            if isinstance(pair.get(side), dict)
+        }
+        if selected not in token_addresses:
+            continue
+
+        pair_address = str(pair.get("pairAddress") or "").lower()
+        pair_key = pair_address or f"response-index:{index}"
+        if pair_key in seen_pairs:
+            continue
+        seen_pairs.add(pair_key)
+        matched_pair = True
+
+        volume = pair.get("volume")
+        if not isinstance(volume, dict):
+            continue
+        for period in totals:
+            value = _nonnegative_decimal(volume.get(period))
+            if value is not None:
+                totals[period] += value
+
+    return totals if matched_pair else None
+
+
+async def fetch_token_volume(coin_type: str) -> dict[str, Decimal] | None:
+    """Fetch cached token-wide 24h and 1h USD DEX volume from DEX Screener."""
+
+    cache_key = canonicalize_sui_type(coin_type)
+    cached = _token_volume_cache.get(cache_key)
+    if cached:
+        result, cached_at = cached
+        if time.monotonic() - cached_at < TOKEN_VOLUME_CACHE_TTL:
+            return result
+
+    result = None
+    try:
+        client = await get_shared_async_client()
+        response = await client.get(
+            f"{DEXSCREENER_API_URL}/token-pairs/v1/sui/"
+            f"{quote(str(coin_type), safe='')}",
+            timeout=TOKEN_VOLUME_REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        result = _aggregate_token_volumes(response.json(), coin_type)
+    except Exception as exc:
+        logging.warning(
+            "Unable to fetch Sui token volume for %s: %s",
+            coin_type,
+            exc,
+        )
+
+    # Negative-cache unavailable data too, so a provider outage cannot create
+    # one external request per buy announcement.
+    _token_volume_cache[cache_key] = (result, time.monotonic())
+    return result
+
+
 def _calculate_buy_valuation(
     event,
     amount_config: dict,
@@ -1099,15 +1194,29 @@ def _format_usd_value(value: Decimal | None) -> str:
     return f"${value:,.2f}"
 
 
+def _format_volume_usd(value: Decimal | None) -> str:
+    value = _nonnegative_decimal(value)
+    if value is None:
+        return "N/A"
+    if value >= Decimal("1000000000"):
+        return f"${value / Decimal('1000000000'):.2f}B"
+    if value >= Decimal("1000000"):
+        return f"${value / Decimal('1000000'):.2f}M"
+    if value >= Decimal("1000"):
+        return f"${value / Decimal('1000'):.2f}K"
+    return f"${value:.2f}"
+
+
 def _format_buy_announcement(
     event,
     amount_config: dict,
     valuation: dict[str, Decimal | None] | None = None,
     badges: list[str] | None = None,
+    volume: dict[str, Decimal] | None = None,
 ) -> str:
     valuation = valuation or {"sui": None, "usd": None}
+    volume = volume or {}
     symbol = html.escape(amount_config["symbol"])
-    exchange = html.escape(event.exchange)
     wallet = html.escape(event.wallet)
     digest = html.escape(event.digest)
     tx_url = f"{SUI_EXPLORER_TX_URL.rstrip('/')}/{event.digest}"
@@ -1131,7 +1240,8 @@ def _format_buy_announcement(
                 f" / {_format_usd_value(valuation.get('usd'))} USD"
             ),
             f"<b>Buyer:</b> <code>{wallet}</code>",
-            f"<b>Exchange:</b> {exchange}",
+            f"<b>24h Volume:</b> {_format_volume_usd(volume.get('h24'))}",
+            f"<b>1h Volume:</b> {_format_volume_usd(volume.get('h1'))}",
         ]
     )
     if event.sender and event.sender.lower() != event.wallet.lower():
@@ -1207,7 +1317,10 @@ async def _announce_checkpoint_buys(
                 continue
             if coin_type not in amount_configs:
                 amount_configs[coin_type] = await get_coin_amount_config(coin_type)
-            valuation = await _get_buy_valuation(event, amount_configs[coin_type])
+            valuation, volume = await asyncio.gather(
+                _get_buy_valuation(event, amount_configs[coin_type]),
+                fetch_token_volume(coin_type),
+            )
 
             for chat_id, start_checkpoint in chats:
                 if checkpoint.sequence_number <= start_checkpoint:
@@ -1231,6 +1344,7 @@ async def _announce_checkpoint_buys(
                     amount_configs[coin_type],
                     valuation,
                     badges,
+                    volume,
                 )
                 try:
                     await _send_buy_announcement(context, chat_id, text)

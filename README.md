@@ -134,7 +134,9 @@ The buy bot reads finalized Sui checkpoints over gRPC. A transaction is announce
 1. The selected token has a positive balance change for a wallet; and
 2. The successful transaction contains swap evidence, or the recipient has a net outflow of another coin after SUI gas is removed.
 
-This deliberately excludes plain transfers, airdrops, failed transactions, claims, rewards, and most liquidity operations. The announcement includes the token amount, SUI and USD purchase values, a size-based flame scale, smart buyer badges, full purchasing wallet, inferred exchange (when recognizable), transaction sender when different, and an explorer link.
+This deliberately excludes plain transfers, airdrops, failed transactions, claims, rewards, and most liquidity operations. The announcement includes the token amount, SUI and USD purchase values, a size-based flame scale, smart buyer badges, full purchasing wallet, token-wide 24-hour and 1-hour DEX volume, transaction sender when different, and an explorer link.
+
+Rolling USD volume comes from [DEX Screener](https://docs.dexscreener.com/api/reference) and is summed across the selected token's unique Sui pools. Results are cached for 60 seconds. If market data is unavailable, the announcement still sends with `N/A` volume rather than losing a buy alert.
 
 Buyer badges are tracked separately for each group, selected token, and wallet:
 
