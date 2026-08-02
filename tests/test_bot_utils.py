@@ -65,6 +65,7 @@ from bot import (  # noqa: E402
     _buybot_checkpoint_batches,
     _calculate_buy_valuation,
     _classify_buy_badges,
+    _format_volume_usd,
     _format_buy_announcement,
     _initialize_buybot_start_checkpoints,
     _send_buy_announcement,
@@ -109,6 +110,9 @@ class TestBuyAnnouncementFormatting(unittest.TestCase):
         )
         self.assertTrue(text.startswith("🟢 <b>CITY Buy!</b>\n🔥\n"))
         self.assertIn("<b>Value:</b> 2 SUI / $3.00 USD", text)
+        self.assertIn("<b>1h Volume:</b> N/A", text)
+        self.assertIn("<b>24h Volume:</b> N/A", text)
+        self.assertNotIn("<b>Exchange:</b>", text)
 
     def test_estimates_cross_token_buy_from_market_prices(self):
         valuation = _calculate_buy_valuation(
@@ -141,6 +145,7 @@ class TestBuyAnnouncementFormatting(unittest.TestCase):
             {"symbol": "CITY", "decimals": 9},
             {"sui": Decimal("25"), "usd": Decimal("100")},
             ["whale", "first_time"],
+            {"h1": Decimal("1234.56"), "h24": Decimal("9876543.21")},
         )
 
         self.assertTrue(
@@ -150,6 +155,15 @@ class TestBuyAnnouncementFormatting(unittest.TestCase):
                 "🐋 <b>Whale Buy</b> · 🆕 <b>First-Time Buyer</b>\n"
             )
         )
+        self.assertIn("<b>1h Volume:</b> $1.23K", text)
+        self.assertIn("<b>24h Volume:</b> $9.88M", text)
+        self.assertNotIn("<b>Exchange:</b>", text)
+
+    def test_formats_zero_and_large_volume(self):
+        self.assertEqual(_format_volume_usd(Decimal(0)), "$0.00")
+        self.assertEqual(_format_volume_usd(Decimal("1234.5")), "$1.23K")
+        self.assertEqual(_format_volume_usd(Decimal("1234567")), "$1.23M")
+        self.assertEqual(_format_volume_usd(None), "N/A")
 
 
 class TestSmartBuyerBadges(unittest.TestCase):
@@ -240,6 +254,7 @@ class TestSmartBuyerBadgePersistence(unittest.TestCase):
                 "detect_buy": bot.detect_buy,
                 "get_coin_amount_config": bot.get_coin_amount_config,
                 "_get_buy_valuation": bot._get_buy_valuation,
+                "fetch_token_volume": bot.fetch_token_volume,
                 "_send_buy_announcement": bot._send_buy_announcement,
             }
             event = SimpleNamespace(
@@ -260,6 +275,9 @@ class TestSmartBuyerBadgePersistence(unittest.TestCase):
             )
             bot._get_buy_valuation = AsyncMock(
                 return_value={"sui": Decimal("100"), "usd": Decimal("150")}
+            )
+            bot.fetch_token_volume = AsyncMock(
+                return_value={"h1": Decimal("500"), "h24": Decimal("2500")}
             )
             bot._send_buy_announcement = send_announcement
             try:

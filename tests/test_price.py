@@ -55,6 +55,7 @@ class TestPriceFetching(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         # Clear the in-memory price cache before each test
         bot._price_cache.clear()
+        bot._token_volume_cache.clear()
 
     async def test_preferred_alias_lookup(self):
         # Test that preferred aliases like SUI bypass the Search API
@@ -233,6 +234,72 @@ class TestPriceFetching(unittest.IsolatedAsyncioTestCase):
             [call.args[0] for call in mock_fetch.await_args_list],
             ["SUI", "CITY"],
         )
+
+    async def test_aggregates_unique_sui_pair_volume_and_caches_it(self):
+        coin_type = "0xabc::city::CITY"
+        pair = {
+            "chainId": "sui",
+            "pairAddress": "0xpair1",
+            "baseToken": {"address": coin_type},
+            "quoteToken": {"address": "0x2::sui::SUI"},
+            "volume": {"h1": 125.5, "h24": 1000},
+        }
+        second_pair = {
+            "chainId": "sui",
+            "pairAddress": "0xpair2",
+            "baseToken": {"address": "0x2::sui::SUI"},
+            "quoteToken": {"address": coin_type},
+            "volume": {"h1": "24.5", "h24": "250"},
+        }
+        unrelated_pair = {
+            "chainId": "sui",
+            "pairAddress": "0xother",
+            "baseToken": {"address": "0xdef::other::OTHER"},
+            "quoteToken": {"address": "0x2::sui::SUI"},
+            "volume": {"h1": 999, "h24": 999},
+        }
+        response = MagicMock()
+        response.json.return_value = [
+            pair,
+            pair,  # A duplicate pair must not be double-counted.
+            second_pair,
+            unrelated_pair,
+        ]
+        response.raise_for_status = MagicMock()
+        mock_client = AsyncMock()
+        mock_client.get.return_value = response
+
+        with patch(
+            "bot.get_shared_async_client",
+            new=AsyncMock(return_value=mock_client),
+        ):
+            first = await bot.fetch_token_volume(coin_type)
+            second = await bot.fetch_token_volume(coin_type)
+
+        self.assertEqual(
+            first,
+            {"h1": Decimal("150.0"), "h24": Decimal("1250")},
+        )
+        self.assertEqual(second, first)
+        mock_client.get.assert_awaited_once()
+        request_url = mock_client.get.await_args.args[0]
+        self.assertIn("/token-pairs/v1/sui/", request_url)
+        self.assertIn("%3A%3Acity%3A%3ACITY", request_url)
+
+    async def test_volume_api_failure_is_negative_cached(self):
+        mock_client = AsyncMock()
+        mock_client.get.side_effect = RuntimeError("provider unavailable")
+
+        with patch(
+            "bot.get_shared_async_client",
+            new=AsyncMock(return_value=mock_client),
+        ):
+            first = await bot.fetch_token_volume("0xabc::city::CITY")
+            second = await bot.fetch_token_volume("0xabc::city::CITY")
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        mock_client.get.assert_awaited_once()
 
 
 if __name__ == "__main__":
