@@ -14,6 +14,7 @@ class TelegramUtilsTests(unittest.TestCase):
     def test_help_lists_buy_configuration_commands(self):
         self.assertIn("/setbuybot", HELP_TEXT)
         self.assertIn("/setbuyimage", HELP_TEXT)
+        self.assertIn("/nameguard", HELP_TEXT)
 
     def test_normalize_wallet_address_accepts_valid_sui_hex(self):
         raw = "A" * 64

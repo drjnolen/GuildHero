@@ -74,7 +74,9 @@ from bot import (  # noqa: E402
     format_large_number,
     format_detailed_leaderboard,
     get_stable_proportional_sample,
+    nameguard_command,
     setbuyimage_command,
+    welcome_new_member,
 )
 
 
@@ -273,6 +275,121 @@ class TestSmartBuyerBadges(unittest.TestCase):
 class _FakeDB(dict):
     def enroll_chat(self, _chat_id):
         return None
+
+
+class TestNameGuardIntegration(unittest.TestCase):
+    def test_command_toggles_group_setting(self):
+        async def exercise():
+            original_db = bot.db
+            original_require_admin = bot.require_admin
+            fake_db = _FakeDB()
+            bot.db = fake_db
+            bot.require_admin = AsyncMock(return_value=True)
+            reply_text = AsyncMock()
+            update = SimpleNamespace(
+                effective_chat=SimpleNamespace(id=42, type="group"),
+                message=SimpleNamespace(reply_text=reply_text),
+            )
+            try:
+                await nameguard_command(update, SimpleNamespace(args=["on"]))
+                self.assertTrue(fake_db["name_guard:42"])
+
+                await nameguard_command(update, SimpleNamespace(args=["off"]))
+                self.assertFalse(fake_db["name_guard:42"])
+            finally:
+                bot.db = original_db
+                bot.require_admin = original_require_admin
+
+        asyncio.run(exercise())
+
+    def test_silences_keyword_match_even_if_admin_lookup_fails(self):
+        async def exercise():
+            original_db = bot.db
+            bot.db = _FakeDB({"name_guard:42": True})
+            member = SimpleNamespace(
+                id=99,
+                is_bot=False,
+                first_name="CITY Support",
+                last_name=None,
+                full_name="CITY Support",
+                username=None,
+            )
+            reply_text = AsyncMock()
+            telegram_bot = SimpleNamespace(
+                get_chat_administrators=AsyncMock(
+                    side_effect=RuntimeError("temporary Telegram failure")
+                ),
+                restrict_chat_member=AsyncMock(return_value=True),
+            )
+            update = SimpleNamespace(
+                effective_chat=SimpleNamespace(id=42, type="supergroup"),
+                message=SimpleNamespace(
+                    new_chat_members=[member],
+                    reply_text=reply_text,
+                ),
+            )
+            try:
+                await welcome_new_member(
+                    update,
+                    SimpleNamespace(bot=telegram_bot),
+                )
+            finally:
+                bot.db = original_db
+
+            telegram_bot.restrict_chat_member.assert_awaited_once()
+            call = telegram_bot.restrict_chat_member.await_args
+            self.assertEqual(call.kwargs["chat_id"], 42)
+            self.assertEqual(call.kwargs["user_id"], 99)
+            self.assertIn("silenced", reply_text.await_args.args[0])
+
+        asyncio.run(exercise())
+
+    def test_silences_protected_admin_identity(self):
+        async def exercise():
+            original_db = bot.db
+            bot.db = _FakeDB({"name_guard:42": True})
+            administrator = SimpleNamespace(
+                id=7,
+                is_bot=False,
+                first_name="Julia",
+                last_name="Nolen",
+                full_name="Julia Nolen",
+                username="JuliaAdminAccount",
+            )
+            impersonator = SimpleNamespace(
+                id=99,
+                is_bot=False,
+                first_name="Júlia-Nolen",
+                last_name=None,
+                full_name="Júlia-Nolen",
+                username=None,
+            )
+            reply_text = AsyncMock()
+            telegram_bot = SimpleNamespace(
+                get_chat_administrators=AsyncMock(
+                    return_value=[SimpleNamespace(user=administrator)]
+                ),
+                restrict_chat_member=AsyncMock(return_value=True),
+            )
+            update = SimpleNamespace(
+                effective_chat=SimpleNamespace(id=42, type="supergroup"),
+                message=SimpleNamespace(
+                    new_chat_members=[impersonator],
+                    reply_text=reply_text,
+                ),
+            )
+            try:
+                await welcome_new_member(
+                    update,
+                    SimpleNamespace(bot=telegram_bot),
+                )
+            finally:
+                bot.db = original_db
+
+            telegram_bot.restrict_chat_member.assert_awaited_once()
+            self.assertIn("admin identity", reply_text.await_args.args[0])
+
+        asyncio.run(exercise())
 
 
 class TestSmartBuyerBadgePersistence(unittest.TestCase):
@@ -497,8 +614,10 @@ class TestBuyAnnouncementMedia(unittest.TestCase):
 
             self.assertIn("setbuybot", group_names)
             self.assertIn("setbuyimage", group_names)
+            self.assertIn("nameguard", group_names)
             self.assertNotIn("setbuybot", private_names)
             self.assertNotIn("setbuyimage", private_names)
+            self.assertNotIn("nameguard", private_names)
 
         asyncio.run(exercise())
 
