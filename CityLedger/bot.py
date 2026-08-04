@@ -39,6 +39,7 @@ from sui_utils import (
     resolve_airdrop_sender_config,
 )
 from raffle_utils import RAFFLE_MAX_RANK, select_weighted_raffle_winner
+from name_guard import NameGuardMatch, evaluate_name_guard
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -47,6 +48,7 @@ from telegram import (
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeDefault,
+    ChatPermissions,
 )
 from telegram.constants import ChatType, ParseMode
 from telegram.ext import (
@@ -429,6 +431,12 @@ def _get_badges_key(chat_id, user_id):
 def _get_welcome_key(chat_id):
     """Returns the database key for the welcome message toggle."""
     return f"welcome:{chat_id}"
+
+
+def _get_name_guard_key(chat_id):
+    """Returns the database key for the group name-guard toggle."""
+    return f"name_guard:{chat_id}"
+
 
 def _get_achievements_enabled_key(chat_id):
     """Returns the database key for the achievements enabled toggle."""
@@ -1725,17 +1733,88 @@ async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     await store_message_db(context, update.effective_chat.id, user.id, user.username or user.first_name, user.first_name, user.last_name, update.message.text, update.message.date, update.message.reply_to_message is not None, update.message.message_id)
 
+def _name_guard_reason_text(match: NameGuardMatch) -> str:
+    if match.kind == "protected_word":
+        return f'their name contains the protected word "{match.value}"'
+    return "their name matches a protected admin identity"
+
+
+async def _silence_name_guard_member(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    member,
+    match: NameGuardMatch,
+) -> bool:
+    chat_id = update.effective_chat.id
+    safe_name = html.escape(member.full_name)
+    mention = f'<a href="tg://user?id={member.id}">{safe_name}</a>'
+    try:
+        restricted = await context.bot.restrict_chat_member(
+            chat_id=chat_id,
+            user_id=member.id,
+            permissions=ChatPermissions(can_send_messages=False),
+        )
+        if restricted is not True:
+            raise RuntimeError("Telegram did not confirm the restriction")
+    except Exception as exc:
+        logging.error(
+            "Name Guard could not silence user %s in chat %s: %s",
+            member.id,
+            chat_id,
+            exc,
+        )
+        await update.message.reply_text(
+            f"⚠️ <b>Name Guard</b> matched {mention}, but could not silence "
+            "the account. Check that the bot has the Ban users permission.",
+            parse_mode=ParseMode.HTML,
+        )
+        return False
+
+    logging.info(
+        "Name Guard silenced user %s in chat %s (%s)",
+        member.id,
+        chat_id,
+        match.kind,
+    )
+    await update.message.reply_text(
+        f"🛡️ <b>Name Guard</b> silenced {mention} because "
+        f"{html.escape(_name_guard_reason_text(match))}.",
+        parse_mode=ParseMode.HTML,
+    )
+    return True
+
+
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Welcomes new members joining the group chat, if enabled by admins."""
+    """Apply join protection and optionally welcome new group members."""
     if not update.message or not update.message.new_chat_members:
         return
-    # Check if welcome messages are enabled for this group (default: off)
+
     chat_id = update.effective_chat.id
+    name_guard_enabled = db.get(_get_name_guard_key(chat_id), False)
     welcome_enabled = db.get(_get_welcome_key(chat_id), False)
-    if not welcome_enabled:
-        return
+
+    administrators = []
+    if name_guard_enabled:
+        try:
+            administrators = await context.bot.get_chat_administrators(chat_id)
+        except Exception as exc:
+            # Keyword screening can still operate. Protected identities will be
+            # retried on the next join rather than disabling the entire guard.
+            logging.warning(
+                "Name Guard could not load admins for chat %s: %s",
+                chat_id,
+                exc,
+            )
+
     for member in update.message.new_chat_members:
         if member.is_bot:
+            continue
+        if name_guard_enabled:
+            match = evaluate_name_guard(member, administrators)
+            if match:
+                await _silence_name_guard_member(update, context, member, match)
+                continue
+        if not welcome_enabled:
             continue
         name = f"@{member.username}" if member.username else html.escape(member.first_name)
         welcome_text = (
@@ -2227,6 +2306,35 @@ async def setwelcome_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     db[_get_welcome_key(update.effective_chat.id)] = enabled
     status = 'enabled ✅' if enabled else 'disabled ❌'
     await update.message.reply_text(f'Welcome messages have been {status}.')
+
+
+async def nameguard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Allows admins to toggle join-time impersonation protection."""
+    if update.effective_chat.type == ChatType.PRIVATE:
+        await update.message.reply_text("Please use /nameguard in a group chat.")
+        return
+    if not await require_admin(update, context):
+        return
+
+    if len(context.args) != 1 or context.args[0].lower() not in ("on", "off"):
+        await update.message.reply_text("Usage: /nameguard on or /nameguard off")
+        return
+
+    chat_id = update.effective_chat.id
+    _track_chat(chat_id)
+    enabled = context.args[0].lower() == "on"
+    db[_get_name_guard_key(chat_id)] = enabled
+    if enabled:
+        await update.message.reply_text(
+            "🛡️ Name Guard enabled. New members will be silenced when their "
+            "display name or username contains the complete word dev, admin, "
+            "or support, or matches a current admin identity.\n\n"
+            "The bot must have the Ban users permission."
+        )
+    else:
+        await update.message.reply_text(
+            "Name Guard disabled. Existing member restrictions were not changed."
+        )
 
 
 async def setachievements_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3293,6 +3401,7 @@ async def setup_bot_commands(application):
         BotCommand("events", "List all upcoming events"),
         BotCommand("settimezone", "Set timezone for announcements (admin only)"),
         BotCommand("setwelcome", "Toggle welcome messages (admin)"),
+        BotCommand("nameguard", "Toggle join impersonation protection (admin)"),
         BotCommand("setachievements", "Toggle achievement tracking (admin)"),
         BotCommand("stats", "Show chat statistics"),
         BotCommand("wallet", "Submit or check your wallet address"),
@@ -3378,6 +3487,7 @@ def main():
     application.add_handler(CommandHandler("setbuybot", setbuybot_command))
     application.add_handler(CommandHandler("setbuyimage", setbuyimage_command))
     application.add_handler(CommandHandler("setwelcome", setwelcome_command))
+    application.add_handler(CommandHandler("nameguard", nameguard_command))
     application.add_handler(CommandHandler("setachievements", setachievements_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("mybadges", mybadges_command))

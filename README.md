@@ -43,6 +43,7 @@ An all-in-one Telegram community management and engagement bot built for crypto-
 - **/events** — List upcoming events
 - **/settimezone** `<timezone>` — Set timezone for event announcements (admin only)
 - **/setwelcome** `on|off` — Toggle new member welcome messages (admin only, default: off)
+- **/nameguard** `on|off` — Toggle join-time impersonation protection (admin only, default: off). When enabled, new members are silenced if their display name or username contains the complete word `dev`, `admin`, or `support`, or matches a current human admin's normalized display name or username. The bot must have Telegram's **Ban users** permission.
 - **/wallet** — Submit or check wallet address (private via DM)
 - **/copypasta** — Generate a copypasta from your message history
 
