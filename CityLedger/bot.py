@@ -468,6 +468,10 @@ def _get_buybot_media_key(chat_id):
     return f"buybot_media:{chat_id}"
 
 
+def _get_buybot_minimum_usd_key(chat_id):
+    return f"buybot_minimum_usd:{chat_id}"
+
+
 def _get_buybot_buyer_key(chat_id: int, coin_type: str, wallet: str) -> str:
     token = canonicalize_sui_type(coin_type)
     return f"buybot_buyer:{chat_id}:{token}:{wallet.lower()}"
@@ -1036,6 +1040,23 @@ def _nonnegative_decimal(value) -> Decimal | None:
         return None
 
 
+def _buy_meets_minimum(
+    current_buy_usd: Decimal | None,
+    minimum_buy_usd: Decimal | None,
+) -> bool:
+    """Return whether a buy is eligible for a group's announcements."""
+
+    minimum = _positive_decimal(minimum_buy_usd)
+    if minimum is None:
+        return True
+    current_value = _nonnegative_decimal(current_buy_usd)
+    return current_value is not None and current_value >= minimum
+
+
+def _get_buybot_minimum_usd(chat_id: int) -> Decimal | None:
+    return _positive_decimal(db.get(_get_buybot_minimum_usd_key(chat_id)))
+
+
 def _aggregate_token_volumes(
     pairs,
     coin_type: str,
@@ -1337,6 +1358,7 @@ async def _announce_checkpoint_buys(
 
     all_sent = True
     amount_configs: dict[str, dict] = {}
+    minimums_by_chat: dict[int, Decimal | None] = {}
     for transaction in checkpoint.transactions or []:
         for coin_type, chats in token_chats.items():
             event = detect_buy(transaction, coin_type, SUI_DEX_PACKAGES)
@@ -1357,6 +1379,25 @@ async def _announce_checkpoint_buys(
                 if checkpoint.sequence_number <= start_checkpoint:
                     continue
                 if await asyncio.to_thread(_buybot_digest_seen, chat_id, event.digest):
+                    continue
+                if chat_id not in minimums_by_chat:
+                    minimums_by_chat[chat_id] = await asyncio.to_thread(
+                        _get_buybot_minimum_usd,
+                        chat_id,
+                    )
+                minimum_buy_usd = minimums_by_chat[chat_id]
+                if not _buy_meets_minimum(
+                    valuation.get("usd"),
+                    minimum_buy_usd,
+                ):
+                    logging.info(
+                        "Skipped buy announcement for %s in chat %s: USD value %s "
+                        "is below or unavailable for minimum %s",
+                        event.digest,
+                        chat_id,
+                        valuation.get("usd"),
+                        minimum_buy_usd,
+                    )
                     continue
                 purchase_date = _buy_event_date(event.timestamp)
                 buyer_profile = await asyncio.to_thread(
@@ -2520,6 +2561,65 @@ async def setbuyimage_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
+async def setminbuy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set, inspect, or remove a group's minimum announced buy value in USD."""
+
+    if update.effective_chat.type == ChatType.PRIVATE:
+        await update.message.reply_text(
+            "Use /setminbuy in the group whose buy announcements you want to configure."
+        )
+        return
+    if not await require_admin(update, context):
+        return
+
+    chat_id = update.effective_chat.id
+    _track_chat(chat_id)
+    args = [str(arg).strip() for arg in (context.args or [])]
+    key = _get_buybot_minimum_usd_key(chat_id)
+
+    if not args:
+        minimum = _get_buybot_minimum_usd(chat_id)
+        status = _format_volume_usd(minimum) if minimum is not None else "off"
+        await update.message.reply_text(
+            f"Minimum announced buy: {status}\n\n"
+            "Usage: /setminbuy &lt;USD amount&gt;\n"
+            "Example: /setminbuy 5\n"
+            "Use /setminbuy off (or 0) to announce buys of any size.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if len(args) != 1:
+        await update.message.reply_text(
+            "❌ Enter one USD amount, for example /setminbuy 5."
+        )
+        return
+
+    raw_minimum = args[0]
+    if raw_minimum.lower() in {"off", "none", "clear"}:
+        minimum = Decimal(0)
+    else:
+        minimum = _nonnegative_decimal(raw_minimum)
+        if minimum is None:
+            await update.message.reply_text(
+                "❌ Enter a valid non-negative USD amount, for example /setminbuy .5."
+            )
+            return
+
+    if minimum == 0:
+        if key in db:
+            del db[key]
+        await update.message.reply_text(
+            "✅ The minimum buy has been removed. Buys of any size can be announced."
+        )
+        return
+
+    db[key] = str(minimum)
+    await update.message.reply_text(
+        f"✅ Only buys worth at least {_format_volume_usd(minimum)} will be announced."
+    )
+
+
 async def setairdropwallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Allows admins to configure an encrypted, per-group airdrop wallet in DM."""
     if update.effective_chat.type == ChatType.PRIVATE:
@@ -3394,6 +3494,7 @@ async def setup_bot_commands(application):
         BotCommand("settoken", "Set airdrop token (admin)"),
         BotCommand("setbuybot", "Toggle selected-token buy announcements (admin)"),
         BotCommand("setbuyimage", "Set a custom buy announcement image or GIF (admin)"),
+        BotCommand("setminbuy", "Set minimum announced buy value in USD (admin)"),
         BotCommand("mybadges", "View your earned badges"),
         BotCommand("allbadges", "See all available badges"),
         BotCommand("mystats", "View your personal stats"),
@@ -3486,6 +3587,7 @@ def main():
     application.add_handler(CommandHandler("settoken", settoken_command))
     application.add_handler(CommandHandler("setbuybot", setbuybot_command))
     application.add_handler(CommandHandler("setbuyimage", setbuyimage_command))
+    application.add_handler(CommandHandler("setminbuy", setminbuy_command))
     application.add_handler(CommandHandler("setwelcome", setwelcome_command))
     application.add_handler(CommandHandler("nameguard", nameguard_command))
     application.add_handler(CommandHandler("setachievements", setachievements_command))

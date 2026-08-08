@@ -17,6 +17,7 @@ An all-in-one Telegram community management and engagement bot built for crypto-
 - **/settoken** `<coin_type|off>` — Set or clear the group's airdrop token (admin only; airdrops fall back to `0x2::sui::SUI`)
 - **/setbuybot** `on|off` — Toggle finalized DEX-buy announcements for the explicitly selected token (admin only)
 - **/setbuyimage** — Set custom buy announcement media by replying to a photo or GIF; use `off` to remove it (admin only)
+- **/setminbuy** `<USD amount>` — Suppress buy announcements below a per-group USD minimum; use `off` or `0` to remove it (admin only)
 
 ### 📊 Leaderboards & Stats
 - **/score** — Detailed AI-integrated contribution leaderboard with quality, tone, helpfulness, and humor scoring (admin only)
@@ -157,9 +158,11 @@ To enable it in a group:
 
 Optionally, reply to a group photo or GIF with `/setbuyimage` to attach that media to future announcements. Telegram's reusable file ID is stored rather than the media itself. Use `/setbuyimage off` to return to text-only announcements.
 
+Use `/setminbuy 5` to announce only buys valued at $5 USD or more in that group. Decimal values such as `/setminbuy .5` are supported. Use `/setminbuy off` or `/setminbuy 0` to return to announcing buys of any size. When a positive minimum is configured and a buy cannot be valued in USD, it is not announced.
+
 There is no implicit tracked token: if `/settoken off` is used, buy announcements are disabled even though airdrops continue to fall back to SUI. Enabling or changing the token starts at the current finalized checkpoint, so historical buys are not replayed.
 
-The bot registers `/settoken`, `/setbuybot`, `/setbuyimage`, and the other supported commands with Telegram at startup so they appear in group command suggestions.
+The bot registers `/settoken`, `/setbuybot`, `/setbuyimage`, `/setminbuy`, and the other supported commands with Telegram at startup so they appear in group command suggestions.
 
 Exchange labels are inferred from known package/module names. Operators can add or update package labels without a release:
 
