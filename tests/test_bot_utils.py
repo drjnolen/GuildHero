@@ -61,6 +61,7 @@ for _mod_name in ("sui_utils", "raffle_utils", "nacl", "nacl.signing", "nacl.sec
 from bot import (  # noqa: E402
     _buy_event_date,
     _buy_emoji_count,
+    _buy_meets_minimum,
     _buybot_media_from_message,
     _buybot_checkpoint_batches,
     _calculate_buy_valuation,
@@ -76,6 +77,7 @@ from bot import (  # noqa: E402
     get_stable_proportional_sample,
     nameguard_command,
     setbuyimage_command,
+    setminbuy_command,
     welcome_new_member,
 )
 
@@ -195,6 +197,12 @@ class TestBuyAnnouncementFormatting(unittest.TestCase):
         volume = {"h1": Decimal("500"), "h24": Decimal("2500")}
 
         self.assertIs(_volume_including_current_buy(volume, None), volume)
+
+    def test_buy_minimum_is_inclusive_and_requires_usd_valuation(self):
+        self.assertTrue(_buy_meets_minimum(Decimal("5"), Decimal("5")))
+        self.assertFalse(_buy_meets_minimum(Decimal("4.99"), Decimal("5")))
+        self.assertFalse(_buy_meets_minimum(None, Decimal("5")))
+        self.assertTrue(_buy_meets_minimum(None, None))
 
 
 class TestSmartBuyerBadges(unittest.TestCase):
@@ -460,6 +468,57 @@ class TestSmartBuyerBadgePersistence(unittest.TestCase):
         )
         self.assertNotIn("buybot_seen:42", failed_db)
 
+    def test_suppresses_buy_below_group_minimum(self):
+        async def exercise():
+            originals = {
+                "db": bot.db,
+                "detect_buy": bot.detect_buy,
+                "get_coin_amount_config": bot.get_coin_amount_config,
+                "_get_buy_valuation": bot._get_buy_valuation,
+                "fetch_token_volume": bot.fetch_token_volume,
+                "_send_buy_announcement": bot._send_buy_announcement,
+            }
+            event = SimpleNamespace(
+                amount=10_000_000_000,
+                sui_spent=1_000_000_000,
+                exchange="Cetus",
+                wallet="0xbuyer",
+                sender="0xbuyer",
+                digest="BelowMinimum",
+                timestamp={"seconds": "1785126600", "nanos": 0},
+            )
+            fake_db = _FakeDB({"buybot_minimum_usd:42": "5"})
+            send_announcement = AsyncMock()
+            bot.db = fake_db
+            bot.detect_buy = MagicMock(return_value=event)
+            bot.get_coin_amount_config = AsyncMock(
+                return_value={"symbol": "CITY", "decimals": 9}
+            )
+            bot._get_buy_valuation = AsyncMock(
+                return_value={"sui": Decimal("2"), "usd": Decimal("4.99")}
+            )
+            bot.fetch_token_volume = AsyncMock(return_value=None)
+            bot._send_buy_announcement = send_announcement
+            try:
+                all_sent = await bot._announce_checkpoint_buys(
+                    SimpleNamespace(),
+                    SimpleNamespace(sequence_number=11, transactions=[object()]),
+                    {"0xabc::city::CITY": [(42, 10)]},
+                )
+            finally:
+                for name, value in originals.items():
+                    setattr(bot, name, value)
+            return all_sent, fake_db, send_announcement
+
+        all_sent, fake_db, send_announcement = asyncio.run(exercise())
+
+        self.assertTrue(all_sent)
+        send_announcement.assert_not_awaited()
+        self.assertNotIn("buybot_seen:42", fake_db)
+        self.assertFalse(
+            any(key.startswith("buybot_buyer:42:") for key in fake_db)
+        )
+
 
 class TestBuyAnnouncementMedia(unittest.TestCase):
     def test_extracts_largest_photo_or_animation_file_id(self):
@@ -590,6 +649,38 @@ class TestBuyAnnouncementMedia(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_setminbuy_saves_reports_and_removes_group_minimum(self):
+        async def exercise():
+            original_db = bot.db
+            original_require_admin = bot.require_admin
+            fake_db = _FakeDB()
+            bot.db = fake_db
+            bot.require_admin = AsyncMock(return_value=True)
+            reply_text = AsyncMock()
+            update = SimpleNamespace(
+                effective_chat=SimpleNamespace(id=42, type="group"),
+                message=SimpleNamespace(reply_text=reply_text),
+            )
+            try:
+                await setminbuy_command(update, SimpleNamespace(args=[".5"]))
+                self.assertEqual(fake_db["buybot_minimum_usd:42"], "0.5")
+                self.assertIn("$0.50", reply_text.await_args.args[0])
+
+                await setminbuy_command(update, SimpleNamespace(args=[]))
+                self.assertIn("$0.50", reply_text.await_args.args[0])
+
+                await setminbuy_command(update, SimpleNamespace(args=["invalid"]))
+                self.assertEqual(fake_db["buybot_minimum_usd:42"], "0.5")
+                self.assertIn("valid non-negative", reply_text.await_args.args[0])
+
+                await setminbuy_command(update, SimpleNamespace(args=["off"]))
+                self.assertNotIn("buybot_minimum_usd:42", fake_db)
+            finally:
+                bot.db = original_db
+                bot.require_admin = original_require_admin
+
+        asyncio.run(exercise())
+
     def test_command_menu_includes_new_buy_commands(self):
         async def exercise():
             original_bot_command = bot.BotCommand
@@ -614,9 +705,11 @@ class TestBuyAnnouncementMedia(unittest.TestCase):
 
             self.assertIn("setbuybot", group_names)
             self.assertIn("setbuyimage", group_names)
+            self.assertIn("setminbuy", group_names)
             self.assertIn("nameguard", group_names)
             self.assertNotIn("setbuybot", private_names)
             self.assertNotIn("setbuyimage", private_names)
+            self.assertNotIn("setminbuy", private_names)
             self.assertNotIn("nameguard", private_names)
 
         asyncio.run(exercise())
