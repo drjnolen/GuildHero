@@ -308,6 +308,10 @@ SUI_GRPC_URL = os.environ.get("SUI_GRPC_URL", DEFAULT_SUI_GRPC_URL)
 DEFAULT_SUI_COIN_TYPE = SUI_DEFAULT_COIN_TYPE
 SUI_GAS_BUDGET = int(os.environ.get("SUI_GAS_BUDGET", "50000000"))  # 0.05 SUI
 SUI_EXPLORER_TX_URL = os.environ.get("SUI_EXPLORER_TX_URL", "https://suivision.xyz/txblock")
+SUI_EXPLORER_ADDRESS_URL = os.environ.get(
+    "SUI_EXPLORER_ADDRESS_URL",
+    "https://suivision.xyz/account",
+)
 
 try:
     SUI_GRPC_HEADERS = parse_grpc_headers(os.environ.get("SUI_GRPC_HEADERS_JSON"))
@@ -750,11 +754,20 @@ async def get_coin_amount_config(coin_type: str) -> dict:
     metadata = await sui_get_coin_metadata(coin_type)
     decimals = metadata.get("decimals") if isinstance(metadata, dict) else None
     symbol = metadata.get("symbol") if isinstance(metadata, dict) else None
+    total_supply = (
+        _positive_decimal(metadata.get("totalSupply"))
+        if isinstance(metadata, dict)
+        else None
+    )
     if not isinstance(decimals, int):
         decimals = DEFAULT_SUI_COIN_DECIMALS
     if not symbol:
         symbol = coin_type.split("::")[-1]
-    return {"decimals": decimals, "symbol": str(symbol).upper()}
+    return {
+        "decimals": decimals,
+        "symbol": str(symbol).upper(),
+        "total_supply": total_supply,
+    }
 
 
 async def preflight_airdrop(sender_address: str, recipient_count: int, amount: int, coin_type: str) -> dict:
@@ -1169,23 +1182,58 @@ def _calculate_buy_valuation(
 
     if raw_sui_spent:
         sui_value = Decimal(int(raw_sui_spent)) / _MIST_PER_SUI
-        return {
+        valuation = {
             "sui": sui_value,
             "usd": sui_value * sui_price if sui_price else None,
         }
+        valuation["market_cap"] = _calculate_post_buy_market_cap(
+            event,
+            amount_config,
+            valuation.get("usd"),
+        )
+        return valuation
 
     try:
         token_value = Decimal(int(event.amount)) / (
             Decimal(10) ** int(amount_config["decimals"])
         )
     except (KeyError, TypeError, ValueError):
-        return {"sui": None, "usd": None}
+        return {"sui": None, "usd": None, "market_cap": None}
 
     usd_value = token_value * token_price if token_price else None
-    return {
+    valuation = {
         "sui": usd_value / sui_price if usd_value is not None and sui_price else None,
         "usd": usd_value,
     }
+    valuation["market_cap"] = _calculate_post_buy_market_cap(
+        event,
+        amount_config,
+        valuation.get("usd"),
+    )
+    return valuation
+
+
+def _calculate_post_buy_market_cap(
+    event,
+    amount_config: dict,
+    buy_usd: Decimal | None,
+) -> Decimal | None:
+    """Estimate market cap from this finalized buy's effective token price."""
+
+    usd_value = _positive_decimal(buy_usd)
+    raw_supply = _positive_decimal(amount_config.get("total_supply"))
+    try:
+        raw_amount = _positive_decimal(event.amount)
+        decimals = int(amount_config["decimals"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if usd_value is None or raw_supply is None or raw_amount is None or decimals < 0:
+        return None
+
+    scale = Decimal(10) ** decimals
+    purchased_tokens = raw_amount / scale
+    total_tokens = raw_supply / scale
+    return (usd_value / purchased_tokens) * total_tokens
 
 
 async def _get_buy_valuation(event, amount_config: dict) -> dict[str, Decimal | None]:
@@ -1255,6 +1303,23 @@ def _format_volume_usd(value: Decimal | None) -> str:
     return f"${value:.2f}"
 
 
+def _abbreviate_wallet(wallet: str) -> str:
+    wallet = str(wallet or "")
+    return f"{wallet[:4]}...{wallet[-4:]}" if len(wallet) > 11 else wallet
+
+
+def _wallet_link(wallet: str) -> str:
+    wallet = str(wallet or "")
+    wallet_url = (
+        f"{SUI_EXPLORER_ADDRESS_URL.rstrip('/')}/"
+        f"{quote(wallet, safe='')}"
+    )
+    return (
+        f'<a href="{html.escape(wallet_url, quote=True)}">'
+        f"{html.escape(_abbreviate_wallet(wallet))}</a>"
+    )
+
+
 def _format_buy_announcement(
     event,
     amount_config: dict,
@@ -1265,7 +1330,6 @@ def _format_buy_announcement(
     valuation = valuation or {"sui": None, "usd": None}
     volume = volume or {}
     symbol = html.escape(amount_config["symbol"])
-    wallet = html.escape(event.wallet)
     digest = html.escape(event.digest)
     tx_url = f"{SUI_EXPLORER_TX_URL.rstrip('/')}/{event.digest}"
     lines = [
@@ -1287,13 +1351,14 @@ def _format_buy_announcement(
                 f"<b>Value:</b> {_format_sui_value(valuation.get('sui'))} SUI"
                 f" / {_format_usd_value(valuation.get('usd'))} USD"
             ),
-            f"<b>Buyer:</b> <code>{wallet}</code>",
+            f"<b>Buyer:</b> {_wallet_link(event.wallet)}",
+            f"<b>Market Cap:</b> {_format_volume_usd(valuation.get('market_cap'))}",
             f"<b>24h Volume:</b> {_format_volume_usd(volume.get('h24'))}",
             f"<b>1h Volume:</b> {_format_volume_usd(volume.get('h1'))}",
         ]
     )
     if event.sender and event.sender.lower() != event.wallet.lower():
-        lines.append(f"<b>Transaction sender:</b> <code>{html.escape(event.sender)}</code>")
+        lines.append(f"<b>Transaction sender:</b> {_wallet_link(event.sender)}")
     lines.extend(
         [
             f'<a href="{html.escape(tx_url, quote=True)}">View transaction</a>',

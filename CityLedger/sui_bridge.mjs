@@ -394,10 +394,20 @@ export async function handleRequest(request, client) {
       return { balance: response.balance.balance };
     }
     case 'coinMetadata': {
-      const response = await client.getCoinMetadata({
+      const { response } = await client.stateService.getCoinInfo({
         coinType: requiredString(params.coinType, 'coinType'),
       });
-      return { coinMetadata: response.coinMetadata };
+      const totalSupply = response.treasury?.totalSupply;
+      const coinMetadata = response.metadata ?? (response.treasury ? {} : null);
+      return {
+        coinMetadata: coinMetadata
+          ? {
+              ...coinMetadata,
+              totalSupply:
+                totalSupply === undefined ? null : totalSupply.toString(),
+            }
+          : null,
+      };
     }
     case 'transfer': {
       const keypair = keypairFromPrivateKeyHex(params.privateKeyHex);
