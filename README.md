@@ -82,6 +82,7 @@ pip install -r requirements.txt
 | `SUI_GRPC_HEADERS_JSON` | No | JSON object containing provider headers such as an API key |
 | `SUI_GAS_BUDGET` | No | Maximum gas budget per airdrop transfer in MIST (default: `50000000`) |
 | `SUI_EXPLORER_TX_URL` | No | Explorer transaction URL prefix used in buy announcements |
+| `SUI_EXPLORER_ADDRESS_URL` | No | Explorer account URL prefix used for buyer and sender links |
 | `BUYBOT_WHALE_USD_THRESHOLD` | No | USD purchase value that earns the Whale Buy badge (default: `100`) |
 | `SUI_DEX_PACKAGES_JSON` | No | JSON map of additional DEX package IDs to display names |
 | `SUI_NODE_BINARY` | No | Node.js executable override (default: `node`) |
@@ -136,7 +137,9 @@ The buy bot reads finalized Sui checkpoints over gRPC. A transaction is announce
 1. The selected token has a positive balance change for a wallet; and
 2. The successful transaction contains swap evidence, or the recipient has a net outflow of another coin after SUI gas is removed.
 
-This deliberately excludes plain transfers, airdrops, failed transactions, claims, rewards, and most liquidity operations. The announcement includes the token amount, SUI and USD purchase values, a size-based flame scale, smart buyer badges, full purchasing wallet, token-wide 24-hour and 1-hour DEX volume, transaction sender when different, and an explorer link.
+This deliberately excludes plain transfers, airdrops, failed transactions, claims, rewards, and most liquidity operations. The announcement includes the token amount, SUI and USD purchase values, a transaction-derived post-buy market-cap estimate, a size-based flame scale, smart buyer badges, an abbreviated explorer link for the purchasing wallet, token-wide 24-hour and 1-hour DEX volume, an abbreviated sender link when different, and a transaction explorer link.
+
+The market-cap estimate uses the finalized purchase's effective USD price per received token multiplied by Sui's on-chain total supply. This makes the triggering buy part of the displayed estimate instead of relying on a potentially stale pre-buy market snapshot. If the transaction cannot be valued in USD or Sui does not expose the coin's supply, the alert displays `N/A` without suppressing the buy.
 
 Rolling USD volume comes from [DEX Screener](https://docs.dexscreener.com/api/reference) and is summed across the selected token's unique Sui pools. Results are cached for 60 seconds. Because the provider can lag a newly finalized transaction, GuildHero adds the triggering buy's USD value to both displayed windows. If provider volume is unavailable but the buy can be valued, the current buy becomes the minimum displayed 1-hour and 24-hour volume instead of showing `N/A`.
 

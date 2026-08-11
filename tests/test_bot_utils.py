@@ -65,6 +65,7 @@ from bot import (  # noqa: E402
     _buybot_media_from_message,
     _buybot_checkpoint_batches,
     _calculate_buy_valuation,
+    _calculate_post_buy_market_cap,
     _classify_buy_badges,
     _format_volume_usd,
     _format_buy_announcement,
@@ -118,6 +119,72 @@ class TestBuyAnnouncementFormatting(unittest.TestCase):
         self.assertIn("<b>1h Volume:</b> N/A", text)
         self.assertIn("<b>24h Volume:</b> N/A", text)
         self.assertNotIn("<b>Exchange:</b>", text)
+
+    def test_market_cap_uses_finalized_buy_price_and_on_chain_supply(self):
+        event = self._event(amount=10_000_000_000)
+        market_cap = _calculate_post_buy_market_cap(
+            event,
+            {
+                "symbol": "CITY",
+                "decimals": 9,
+                "total_supply": Decimal("1000000000000000000"),
+            },
+            Decimal("20"),
+        )
+
+        self.assertEqual(market_cap, Decimal("2000000000"))
+
+        event.wallet = "0xe41234567890abcdef1234567890abcdef1234567890abcdef1234567898989a"
+        text = _format_buy_announcement(
+            event,
+            {"symbol": "CITY", "decimals": 9},
+            {
+                "sui": Decimal("5"),
+                "usd": Decimal("20"),
+                "market_cap": market_cap,
+            },
+        )
+        self.assertIn("<b>Market Cap:</b> $2.00B", text)
+        self.assertIn(
+            '<b>Buyer:</b> <a href="https://suivision.xyz/account/'
+            '0xe41234567890abcdef1234567890abcdef1234567890abcdef1234567898989a">'
+            "0xe4...989a</a>",
+            text,
+        )
+        self.assertNotIn(f">{event.wallet}</a>", text)
+
+    def test_coin_amount_config_carries_on_chain_supply(self):
+        async def exercise():
+            original = bot.sui_get_coin_metadata
+            bot.sui_get_coin_metadata = AsyncMock(
+                return_value={
+                    "symbol": "CITY",
+                    "decimals": 9,
+                    "totalSupply": "1000000000000000000",
+                }
+            )
+            try:
+                return await bot.get_coin_amount_config("0xabc::city::CITY")
+            finally:
+                bot.sui_get_coin_metadata = original
+
+        config = asyncio.run(exercise())
+
+        self.assertEqual(config["symbol"], "CITY")
+        self.assertEqual(config["decimals"], 9)
+        self.assertEqual(
+            config["total_supply"],
+            Decimal("1000000000000000000"),
+        )
+
+    def test_market_cap_is_unavailable_without_supply(self):
+        self.assertIsNone(
+            _calculate_post_buy_market_cap(
+                self._event(),
+                {"symbol": "CITY", "decimals": 9},
+                Decimal("20"),
+            )
+        )
 
     def test_estimates_cross_token_buy_from_market_prices(self):
         valuation = _calculate_buy_valuation(

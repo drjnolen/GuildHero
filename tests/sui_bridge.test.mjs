@@ -158,6 +158,33 @@ test('latest checkpoint request converts bigint to a JSON-safe string', async ()
   assert.deepEqual(result, { sequenceNumber: '999' });
 });
 
+test('coin metadata includes JSON-safe on-chain total supply', async () => {
+  const client = {
+    stateService: {
+      getCoinInfo: async ({ coinType }) => ({
+        response: {
+          coinType,
+          metadata: { symbol: 'CITY', decimals: 9 },
+          treasury: { totalSupply: 1_000_000_000_000_000_000n },
+        },
+      }),
+    },
+  };
+
+  const result = await handleRequest(
+    { method: 'coinMetadata', params: { coinType: '0xabc::city::CITY' } },
+    client,
+  );
+
+  assert.deepEqual(result, {
+    coinMetadata: {
+      symbol: 'CITY',
+      decimals: 9,
+      totalSupply: '1000000000000000000',
+    },
+  });
+});
+
 test('fetches checkpoint batches with bounded concurrency and preserves sequence order', async () => {
   let inFlight = 0;
   let peakInFlight = 0;
