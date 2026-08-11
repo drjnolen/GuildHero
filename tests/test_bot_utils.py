@@ -69,6 +69,8 @@ from bot import (  # noqa: E402
     _classify_buy_badges,
     _format_volume_usd,
     _format_buy_announcement,
+    _format_buy_token_amount,
+    _format_sui_value,
     _initialize_buybot_start_checkpoints,
     _send_buy_announcement,
     _updated_buybot_buyer_profile,
@@ -210,6 +212,27 @@ class TestBuyAnnouncementFormatting(unittest.TestCase):
         self.assertEqual(_buy_emoji_count(Decimal("4.99")), 1)
         self.assertEqual(_buy_emoji_count(Decimal("5")), 2)
         self.assertEqual(_buy_emoji_count(Decimal("10")), 3)
+
+    def test_buy_amount_and_sui_value_display_as_whole_numbers(self):
+        self.assertEqual(_format_buy_token_amount(1_234_567_890_000, 9), "1,235")
+        self.assertEqual(_format_sui_value(Decimal("2.5")), "3")
+
+        text = _format_buy_announcement(
+            self._event(amount=1_234_567_890_000, sui_spent=2_500_000_000),
+            {"symbol": "CITY", "decimals": 9},
+            {"sui": Decimal("2.5"), "usd": Decimal("4")},
+        )
+        self.assertIn("<b>Amount:</b> 1,235 CITY", text)
+        self.assertIn("<b>Value:</b> 3 SUI / $4.00 USD", text)
+
+    def test_footer_uses_noodles_city_link(self):
+        self.assertIn(
+            "https://app.noodles.fi/coins/"
+            "0x308fa16c7aead43e3a49a4ff2e76205ba2a12697234f4fe80a2da66515284060"
+            "::city::CITY",
+            bot.FOOTER_HTML,
+        )
+        self.assertNotIn("app.nexa.xyz", bot.FOOTER_HTML)
 
     def test_formats_smart_buyer_badges_below_emojis(self):
         text = _format_buy_announcement(

@@ -13,7 +13,7 @@ import json
 import time
 import uuid
 from collections import defaultdict
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from urllib.parse import quote
 import pytz
 from ai_services import analyze_user_messages, summarize_chat_history, get_best_of_messages, get_vibe_check, generate_copypasta
@@ -74,7 +74,7 @@ SELECTING_ACTION, AWAITING_EVENT_TEXT, AWAITING_WALLET, AWAITING_AIRDROP_PRIVATE
 
 
 # --- Constants ---
-FOOTER_HTML = "\n\n<i>Product of Alpha City (<a href=\"https://app.nexa.xyz/trade/0x308fa16c7aead43e3a49a4ff2e76205ba2a12697234f4fe80a2da66515284060::city::CITY\">$CITY</a>)</i>"
+FOOTER_HTML = "\n\n<i>Product of Alpha City (<a href=\"https://app.noodles.fi/coins/0x308fa16c7aead43e3a49a4ff2e76205ba2a12697234f4fe80a2da66515284060::city::CITY\">$CITY</a>)</i>"
 MAX_MESSAGES_FOR_SUMMARY = 1000
 # Set a safe upper limit for messages to load into memory at once to prevent crashes.
 MAX_MESSAGES_TO_PROCESS = 1500
@@ -1279,7 +1279,15 @@ def _format_buy_emojis(usd_value: Decimal | None) -> str:
 def _format_sui_value(value: Decimal | None) -> str:
     if value is None:
         return "N/A"
-    return f"{value:,.6f}".rstrip("0").rstrip(".")
+    return f"{value.quantize(Decimal('1'), rounding=ROUND_HALF_UP):,}"
+
+
+def _format_buy_token_amount(raw_amount: int, decimals: int) -> str:
+    try:
+        amount = Decimal(int(raw_amount)) / (Decimal(10) ** int(decimals))
+    except (InvalidOperation, TypeError, ValueError):
+        return "N/A"
+    return f"{amount.quantize(Decimal('1'), rounding=ROUND_HALF_UP):,}"
 
 
 def _format_usd_value(value: Decimal | None) -> str:
@@ -1346,7 +1354,7 @@ def _format_buy_announcement(
     lines.extend(
         [
             "",
-            f"<b>Amount:</b> {format_token_amount(event.amount, amount_config['decimals'])} {symbol}",
+            f"<b>Amount:</b> {_format_buy_token_amount(event.amount, amount_config['decimals'])} {symbol}",
             (
                 f"<b>Value:</b> {_format_sui_value(valuation.get('sui'))} SUI"
                 f" / {_format_usd_value(valuation.get('usd'))} USD"
