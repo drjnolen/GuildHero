@@ -1005,10 +1005,39 @@ def _buybot_media_from_message(message) -> dict[str, str] | None:
     if animation_file_id:
         return {"type": "animation", "file_id": str(animation_file_id)}
 
+    video = getattr(message, "video", None)
+    video_file_id = getattr(video, "file_id", None)
+    if video_file_id:
+        return {"type": "video", "file_id": str(video_file_id)}
+
     photos = getattr(message, "photo", None) or []
     photo_file_id = getattr(photos[-1], "file_id", None) if photos else None
     if photo_file_id:
         return {"type": "photo", "file_id": str(photo_file_id)}
+
+    document = getattr(message, "document", None)
+    document_file_id = getattr(document, "file_id", None)
+    mime_type = str(getattr(document, "mime_type", "") or "").lower()
+    file_name = str(getattr(document, "file_name", "") or "").lower()
+    supported_extensions = (
+        ".gif",
+        ".heic",
+        ".heif",
+        ".jpeg",
+        ".jpg",
+        ".m4v",
+        ".mkv",
+        ".mov",
+        ".mp4",
+        ".png",
+        ".webm",
+        ".webp",
+    )
+    if document_file_id and (
+        mime_type.startswith(("image/", "video/"))
+        or file_name.endswith(supported_extensions)
+    ):
+        return {"type": "document", "file_id": str(document_file_id)}
     return None
 
 
@@ -1019,7 +1048,7 @@ def _get_buybot_media(chat_id: int) -> dict[str, str] | None:
     media_type = media.get("type")
     file_id = media.get("file_id")
     if (
-        media_type not in {"photo", "animation"}
+        media_type not in {"photo", "animation", "video", "document"}
         or not isinstance(file_id, str)
         or not file_id
     ):
@@ -1397,10 +1426,24 @@ async def _send_buy_announcement(context, chat_id: int, text: str) -> None:
                 caption=text,
                 parse_mode=ParseMode.HTML,
             )
-        else:
+        elif media["type"] == "animation":
             await context.bot.send_animation(
                 chat_id=chat_id,
                 animation=media["file_id"],
+                caption=text,
+                parse_mode=ParseMode.HTML,
+            )
+        elif media["type"] == "video":
+            await context.bot.send_video(
+                chat_id=chat_id,
+                video=media["file_id"],
+                caption=text,
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=media["file_id"],
                 caption=text,
                 parse_mode=ParseMode.HTML,
             )
@@ -2600,7 +2643,7 @@ async def setbuyimage_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return
         await update.message.reply_text(
-            "Usage: Reply to a photo or GIF with /setbuyimage, or use "
+            "Usage: Reply to a photo, GIF, or video with /setbuyimage, or use "
             "/setbuyimage off to remove it."
         )
         return
@@ -2609,7 +2652,12 @@ async def setbuyimage_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     media = _buybot_media_from_message(replied_message)
     if media:
         db[_get_buybot_media_key(chat_id)] = media
-        media_label = "GIF" if media["type"] == "animation" else "image"
+        media_label = {
+            "animation": "GIF/animation",
+            "document": "image/video file",
+            "photo": "image",
+            "video": "video",
+        }[media["type"]]
         await update.message.reply_text(
             f"✅ Custom buy announcement {media_label} saved for this group."
         )
@@ -2617,19 +2665,21 @@ async def setbuyimage_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if replied_message is not None:
         await update.message.reply_text(
-            "❌ That message does not contain a supported photo or GIF."
+            "❌ That message does not contain a supported photo, GIF, or video."
         )
         return
 
     configured = _get_buybot_media(chat_id)
-    status = (
-        ("GIF ✅" if configured["type"] == "animation" else "image ✅")
-        if configured
-        else "not set"
-    )
+    media_labels = {
+        "animation": "GIF/animation",
+        "document": "image/video file",
+        "photo": "image",
+        "video": "video",
+    }
+    status = f"{media_labels[configured['type']]} ✅" if configured else "not set"
     await update.message.reply_text(
         f"Custom buy media: {status}\n\n"
-        "Reply to a photo or GIF with /setbuyimage to use it in future buy "
+        "Reply to a photo, GIF, or video with /setbuyimage to use it in future buy "
         "announcements. Use /setbuyimage off to return to text-only announcements."
     )
 
@@ -3566,7 +3616,7 @@ async def setup_bot_commands(application):
         BotCommand("setairdropwallet", "Set this group's encrypted airdrop wallet (admin)"),
         BotCommand("settoken", "Set airdrop token (admin)"),
         BotCommand("setbuybot", "Toggle selected-token buy announcements (admin)"),
-        BotCommand("setbuyimage", "Set a custom buy announcement image or GIF (admin)"),
+        BotCommand("setbuyimage", "Set a custom buy image, GIF, or video (admin)"),
         BotCommand("setminbuy", "Set minimum announced buy value in USD (admin)"),
         BotCommand("mybadges", "View your earned badges"),
         BotCommand("allbadges", "See all available badges"),

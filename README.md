@@ -16,7 +16,7 @@ An all-in-one Telegram community management and engagement bot built for crypto-
 - **/setairdropwallet** — Configure an encrypted, per-group airdrop wallet in DM (admin only)
 - **/settoken** `<coin_type|off>` — Set or clear the group's airdrop token (admin only; airdrops fall back to `0x2::sui::SUI`)
 - **/setbuybot** `on|off` — Toggle finalized DEX-buy announcements for the explicitly selected token (admin only)
-- **/setbuyimage** — Set custom buy announcement media by replying to a photo or GIF; use `off` to remove it (admin only)
+- **/setbuyimage** — Set custom buy announcement media by replying to a photo, GIF, video, or image/video file; use `off` to remove it (admin only)
 - **/setminbuy** `<USD amount>` — Suppress buy announcements below a per-group USD minimum; use `off` or `0` to remove it (admin only)
 
 ### 📊 Leaderboards & Stats
@@ -159,7 +159,7 @@ To enable it in a group:
 /setbuybot on
 ```
 
-Optionally, reply to a group photo or GIF with `/setbuyimage` to attach that media to future announcements. Telegram's reusable file ID is stored rather than the media itself. Use `/setbuyimage off` to return to text-only announcements.
+Optionally, reply to a group photo, GIF, or video with `/setbuyimage` to attach that media to future announcements. Short MP4s sent as Telegram videos are supported, as are image/video files sent as documents (recognized by MIME type or a common extension). Telegram's reusable file ID is stored rather than the media itself. Use `/setbuyimage off` to return to text-only announcements.
 
 Use `/setminbuy 5` to announce only buys valued at $5 USD or more in that group. Decimal values such as `/setminbuy .5` are supported. Use `/setminbuy off` or `/setminbuy 0` to return to announcing buys of any size. When a positive minimum is configured and a buy cannot be valued in USD, it is not announced.
 

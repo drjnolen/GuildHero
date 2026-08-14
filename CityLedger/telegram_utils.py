@@ -27,7 +27,7 @@ HELP_TEXT = (
     "/setairdropwallet - Set this group's encrypted airdrop wallet (admin).\n"
     "/settoken &lt;coin_type|off&gt; - Set or clear the airdrop token for this group (admin).\n"
     "/setbuybot on|off - Toggle selected-token DEX buy announcements (admin).\n"
-    "/setbuyimage - Set custom buy media by replying to a photo or GIF (admin).\n"
+    "/setbuyimage - Set custom buy media by replying to a photo, GIF, or video (admin).\n"
     "/setminbuy &lt;USD amount&gt; - Set the minimum announced buy value (admin).\n\n"
     "<b>🗓️ Group Management</b>\n"
     "/calendar - Manage the group's event calendar (admin).\n"
