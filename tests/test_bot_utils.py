@@ -611,7 +611,7 @@ class TestSmartBuyerBadgePersistence(unittest.TestCase):
 
 
 class TestBuyAnnouncementMedia(unittest.TestCase):
-    def test_extracts_largest_photo_or_animation_file_id(self):
+    def test_extracts_photo_animation_video_and_media_documents(self):
         photo_message = SimpleNamespace(
             animation=None,
             photo=[
@@ -623,6 +623,31 @@ class TestBuyAnnouncementMedia(unittest.TestCase):
             animation=SimpleNamespace(file_id="animation-id"),
             photo=[],
         )
+        video_message = SimpleNamespace(
+            animation=None,
+            video=SimpleNamespace(file_id="video-id"),
+            photo=[],
+        )
+        video_document_message = SimpleNamespace(
+            animation=None,
+            video=None,
+            photo=[],
+            document=SimpleNamespace(
+                file_id="document-id",
+                mime_type="video/mp4",
+                file_name="buy-loop.mp4",
+            ),
+        )
+        unsupported_document_message = SimpleNamespace(
+            animation=None,
+            video=None,
+            photo=[],
+            document=SimpleNamespace(
+                file_id="text-id",
+                mime_type="text/plain",
+                file_name="notes.txt",
+            ),
+        )
 
         self.assertEqual(
             _buybot_media_from_message(photo_message),
@@ -631,6 +656,17 @@ class TestBuyAnnouncementMedia(unittest.TestCase):
         self.assertEqual(
             _buybot_media_from_message(animation_message),
             {"type": "animation", "file_id": "animation-id"},
+        )
+        self.assertEqual(
+            _buybot_media_from_message(video_message),
+            {"type": "video", "file_id": "video-id"},
+        )
+        self.assertEqual(
+            _buybot_media_from_message(video_document_message),
+            {"type": "document", "file_id": "document-id"},
+        )
+        self.assertIsNone(
+            _buybot_media_from_message(unsupported_document_message)
         )
 
     def test_sends_photo_with_announcement_as_caption(self):
@@ -698,6 +734,69 @@ class TestBuyAnnouncementMedia(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_sends_video_with_announcement_as_caption(self):
+        async def exercise():
+            original_db = bot.db
+            bot.db = _FakeDB(
+                {"buybot_media:42": {"type": "video", "file_id": "video-id"}}
+            )
+            telegram_bot = SimpleNamespace(
+                send_video=AsyncMock(),
+                send_message=AsyncMock(),
+            )
+            try:
+                await _send_buy_announcement(
+                    SimpleNamespace(bot=telegram_bot),
+                    42,
+                    "<b>CITY Buy!</b>",
+                )
+            finally:
+                bot.db = original_db
+
+            telegram_bot.send_video.assert_awaited_once_with(
+                chat_id=42,
+                video="video-id",
+                caption="<b>CITY Buy!</b>",
+                parse_mode=bot.ParseMode.HTML,
+            )
+            telegram_bot.send_message.assert_not_awaited()
+
+        asyncio.run(exercise())
+
+    def test_sends_media_document_with_announcement_as_caption(self):
+        async def exercise():
+            original_db = bot.db
+            bot.db = _FakeDB(
+                {
+                    "buybot_media:42": {
+                        "type": "document",
+                        "file_id": "document-id",
+                    }
+                }
+            )
+            telegram_bot = SimpleNamespace(
+                send_document=AsyncMock(),
+                send_message=AsyncMock(),
+            )
+            try:
+                await _send_buy_announcement(
+                    SimpleNamespace(bot=telegram_bot),
+                    42,
+                    "<b>CITY Buy!</b>",
+                )
+            finally:
+                bot.db = original_db
+
+            telegram_bot.send_document.assert_awaited_once_with(
+                chat_id=42,
+                document="document-id",
+                caption="<b>CITY Buy!</b>",
+                parse_mode=bot.ParseMode.HTML,
+            )
+            telegram_bot.send_message.assert_not_awaited()
+
+        asyncio.run(exercise())
+
     def test_setbuyimage_saves_and_removes_group_media(self):
         async def exercise():
             original_db = bot.db
@@ -733,6 +832,18 @@ class TestBuyAnnouncementMedia(unittest.TestCase):
                     SimpleNamespace(args=["off"]),
                 )
                 self.assertNotIn("buybot_media:42", fake_db)
+
+                message.reply_to_message = SimpleNamespace(
+                    animation=None,
+                    video=SimpleNamespace(file_id="video-id"),
+                    photo=[],
+                )
+                await setbuyimage_command(update, SimpleNamespace(args=[]))
+                self.assertEqual(
+                    fake_db["buybot_media:42"],
+                    {"type": "video", "file_id": "video-id"},
+                )
+                self.assertIn("video saved", reply_text.await_args.args[0])
             finally:
                 bot.db = original_db
                 bot.require_admin = original_require_admin
