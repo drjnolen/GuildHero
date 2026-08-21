@@ -338,6 +338,13 @@ except json.JSONDecodeError:
 
 
 # --- Helper Functions ---
+async def _reply_with_footer(message, text: str, **kwargs):
+    """Reply with the clickable Alpha City footer and no web-page preview."""
+    kwargs.setdefault("parse_mode", ParseMode.HTML)
+    kwargs["disable_web_page_preview"] = True
+    return await message.reply_text(text + FOOTER_HTML, **kwargs)
+
+
 def escape_markdown(text: str) -> str:
     """Escapes special characters for Telegram's MarkdownV2 parse mode."""
     escape_chars = r'_*[]()~`>#+-=|{}.!'
@@ -2128,7 +2135,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"👋 Welcome to the group, <b>{name}</b>!\n\n"
             f"Type /help to see what I can do!"
         )
-        await update.message.reply_text(welcome_text + FOOTER_HTML, parse_mode=ParseMode.HTML)
+        await _reply_with_footer(update.message, welcome_text)
 
 async def _parse_date_range(args):
     if not args: return None, None, None
@@ -2300,7 +2307,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("There was an error accessing the group information. Please try again from the group chat.")
             return ConversationHandler.END
 
-    await update.message.reply_text(HELP_TEXT + FOOTER_HTML, parse_mode='HTML')
+    await _reply_with_footer(update.message, HELP_TEXT)
     return ConversationHandler.END
 
 
@@ -2389,7 +2396,7 @@ async def public_score_command(update: Update, context: ContextTypes.DEFAULT_TYP
         safe_uname = html.escape(uname[:19])
         public_text += f"{medal}{idx:2d} | {safe_uname:<19} | {met['total']:7.1f}\n"
     public_text += '</pre>'
-    await update.message.reply_text(public_text + FOOTER_HTML, parse_mode=ParseMode.HTML)
+    await _reply_with_footer(update.message, public_text)
 
 
 async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2446,7 +2453,7 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         summary = await asyncio.to_thread(summarize_chat_history, transcript, days, topic)
 
         title = f"<b>Summary for {summary_title_context} on '{topic}':</b>\n\n" if topic else f"<b>Summary for {summary_title_context}:</b>\n\n"
-        await update.message.reply_text(title + summary + FOOTER_HTML, parse_mode=ParseMode.HTML)
+        await _reply_with_footer(update.message, title + summary)
 
     except (ValueError, IndexError):
         await update.message.reply_text(INVALID_FORMAT_MESSAGE)
@@ -2497,7 +2504,10 @@ async def bestof_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         best_of_digest = await asyncio.to_thread(get_best_of_messages, transcript, days)
         best_of_digest = best_of_digest.replace(' "</blockquote>', '</blockquote>')
 
-        await update.message.reply_text(f"🏆 <b>Best of {title_context}:</b>\n\n{best_of_digest}" + FOOTER_HTML, parse_mode=ParseMode.HTML)
+        await _reply_with_footer(
+            update.message,
+            f"🏆 <b>Best of {title_context}:</b>\n\n{best_of_digest}",
+        )
 
     except (ValueError, IndexError):
         await update.message.reply_text(INVALID_FORMAT_MESSAGE)
@@ -2567,7 +2577,7 @@ async def vibecheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<i>{html.escape(vibe_data.get('summary', ''))}</i>"
         )
 
-        await update.message.reply_text(response_text + FOOTER_HTML, parse_mode=ParseMode.HTML)
+        await _reply_with_footer(update.message, response_text)
 
     except (ValueError, IndexError):
         await update.message.reply_text(INVALID_FORMAT_MESSAGE)
@@ -3107,7 +3117,7 @@ async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Sent: {success_count} | ⏭️ Skipped (no wallet): {skip_count} | ❌ Failed: {fail_count}\n\n"
         f"<b>Details:</b>\n{results_text}"
     )
-    await update.message.reply_text(summary + FOOTER_HTML, parse_mode=ParseMode.HTML)
+    await _reply_with_footer(update.message, summary)
 
 
 async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3236,7 +3246,7 @@ async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Eligible wallets: {len(weighted_candidates)} / {RAFFLE_MAX_RANK}\n"
         f"Transaction: <code>{html.escape(tx_digest)}</code>"
     )
-    await update.message.reply_text(summary + FOOTER_HTML, parse_mode=ParseMode.HTML)
+    await _reply_with_footer(update.message, summary)
 
 
 async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3275,16 +3285,12 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💎 <b>24h Volume:</b> {format_large_number(price_data['volume_24h'])}"
     )
 
-    await update.message.reply_text(
-        response + FOOTER_HTML,
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
+    await _reply_with_footer(update.message, response)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Displays the help message with all available commands."""
-    await update.message.reply_text(HELP_TEXT + FOOTER_HTML, parse_mode='HTML')
+    await _reply_with_footer(update.message, HELP_TEXT)
 
 
 async def mybadges_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3308,7 +3314,7 @@ async def mybadges_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if badge:
             message += f"{badge['emoji']} <b>{badge['name']}</b>: {badge['description']}\n"
 
-    await update.message.reply_text(message + FOOTER_HTML, parse_mode=ParseMode.HTML)
+    await _reply_with_footer(update.message, message)
 
 async def allbadges_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Displays all available badges."""
@@ -3321,7 +3327,7 @@ async def allbadges_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for badge_id, badge in BADGES.items():
         message += f"{badge['emoji']} <b>{badge['name']}</b>: {badge['description']}\n"
 
-    await update.message.reply_text(message + FOOTER_HTML, parse_mode=ParseMode.HTML)
+    await _reply_with_footer(update.message, message)
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3344,7 +3350,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if stats['oldest_date']: 
         stats_text += f"📅 Date range: {stats['oldest_date']:%m/%d/%Y} - {stats['newest_date']:%m/%d/%Y}\n\n"
 
-    await update.message.reply_text(stats_text + top_users_text + FOOTER_HTML, parse_mode=ParseMode.HTML)
+    await _reply_with_footer(update.message, stats_text + top_users_text)
 
 async def mystats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Sends the user their personal stats as a reply in the current chat."""
@@ -3373,7 +3379,7 @@ async def mystats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{badge_text}"
     )
 
-    await update.message.reply_text(stats_message + FOOTER_HTML, parse_mode=ParseMode.HTML)
+    await _reply_with_footer(update.message, stats_message)
 
 
 async def calendar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3413,7 +3419,7 @@ async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = "🗓️ <b>Upcoming Events</b>\n\n"
     for event_date, event_text in upcoming_events:
         message += f"<b>{event_date.strftime('%B %d, %Y')}</b>\n- {html.escape(event_text)}\n\n"
-    await update.message.reply_text(message + FOOTER_HTML, parse_mode=ParseMode.HTML)
+    await _reply_with_footer(update.message, message)
 
 async def set_timezone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Sets the timezone for the chat."""
