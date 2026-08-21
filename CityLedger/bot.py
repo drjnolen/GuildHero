@@ -107,6 +107,7 @@ COINGECKO_SCORE_MARKET_CAP_BONUS = 125
 PRICE_CACHE_TTL = 60  # seconds – avoid repeated API hits for the same symbol
 _price_cache: dict[str, tuple[dict, float]] = {}
 DEXSCREENER_API_URL = "https://api.dexscreener.com"
+PRICE_REQUEST_TIMEOUT = 8.0
 TOKEN_VOLUME_CACHE_TTL = 60
 TOKEN_VOLUME_REQUEST_TIMEOUT = 5.0
 _token_volume_cache: dict[str, tuple[dict[str, Decimal] | None, float]] = {}
@@ -302,6 +303,11 @@ GENERAL_PRICE_ALIASES = {
 }
 
 ALL_PRICE_ALIASES = {**SUI_PRICE_ALIASES, **GENERAL_PRICE_ALIASES}
+
+SUI_DEXSCREENER_TOKEN_ADDRESSES = {
+    "city": "0x308fa16c7aead43e3a49a4ff2e76205ba2a12697234f4fe80a2da66515284060::city::CITY",
+    "manifest": "0xc466c28d87b3d5cd34f3d5c088751532d71a38d93a8aae4551dd56272cfb4355::manifest::MANIFEST",
+}
 
 # --- SUI Blockchain ---
 SUI_GRPC_URL = os.environ.get("SUI_GRPC_URL", DEFAULT_SUI_GRPC_URL)
@@ -1070,6 +1076,14 @@ def _positive_decimal(value) -> Decimal | None:
         return None
 
 
+def _finite_decimal(value) -> Decimal | None:
+    try:
+        decimal_value = Decimal(str(value))
+        return decimal_value if decimal_value.is_finite() else None
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
 def _nonnegative_decimal(value) -> Decimal | None:
     try:
         decimal_value = Decimal(str(value))
@@ -1702,117 +1716,253 @@ async def check_sui_buys(context: ContextTypes.DEFAULT_TYPE):
 
 
 # --- Price Lookup ---
-async def fetch_crypto_price(symbol: str) -> dict | None:
-    """Fetches cryptocurrency price data from CoinGecko free API.
+def _normalize_price_query(value: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
 
-    Optimised to use at most 2 API calls per unique symbol (1 for known SUI
-    aliases) and a 60-second in-memory cache to avoid 429 rate-limit errors
-    on the free CoinGecko tier.
+
+async def _fetch_coingecko_price(
+    client,
+    symbol: str,
+    normalized_query: str,
+) -> dict | None:
+    preferred_coin_id = ALL_PRICE_ALIASES.get(normalized_query)
+    search_coin_map: dict[str, tuple[dict, int]] = {}
+
+    if preferred_coin_id:
+        coin_ids = [preferred_coin_id]
+    else:
+        search_resp = await client.get(
+            f"{COINGECKO_API_URL}/search",
+            params={"query": symbol},
+            timeout=PRICE_REQUEST_TIMEOUT,
+        )
+        search_resp.raise_for_status()
+        coins = search_resp.json().get("coins", [])
+        if not coins:
+            return None
+
+        coin_ids = [coin["id"] for coin in coins[:10]]
+        search_coin_map = {
+            coin["id"]: (coin, index)
+            for index, coin in enumerate(coins[:10])
+        }
+
+    markets_resp = await client.get(
+        f"{COINGECKO_API_URL}/coins/markets",
+        params={
+            "vs_currency": "usd",
+            "ids": ",".join(coin_ids),
+            "price_change_percentage": "24h",
+            "order": "market_cap_desc",
+            "per_page": str(len(coin_ids)),
+            "page": "1",
+        },
+        timeout=PRICE_REQUEST_TIMEOUT,
+    )
+    markets_resp.raise_for_status()
+    markets: list[dict] = markets_resp.json()
+    if not markets:
+        return None
+
+    sui_coin_ids = set(SUI_PRICE_ALIASES.values())
+
+    def _score(market: dict) -> tuple:
+        coin_id = market["id"]
+        coin_symbol = market.get("symbol") or ""
+        coin_name = market.get("name") or ""
+        market_cap_rank = market.get("market_cap_rank")
+        _search_coin, search_index = search_coin_map.get(coin_id, ({}, None))
+
+        score = 0
+        if preferred_coin_id and coin_id == preferred_coin_id:
+            score += COINGECKO_SCORE_PREFERRED_ALIAS
+        if _normalize_price_query(coin_symbol) == normalized_query:
+            score += COINGECKO_SCORE_EXACT_SYMBOL_MATCH
+        if _normalize_price_query(coin_name) == normalized_query:
+            score += COINGECKO_SCORE_EXACT_NAME_MATCH
+        if _normalize_price_query(coin_id) == normalized_query:
+            score += COINGECKO_SCORE_EXACT_ID_MATCH
+        if coin_id in sui_coin_ids:
+            score += COINGECKO_SCORE_SUI_PLATFORM_MATCH
+        if normalized_query and normalized_query in _normalize_price_query(coin_symbol):
+            score += COINGECKO_SCORE_PARTIAL_SYMBOL_MATCH
+        if normalized_query and normalized_query in _normalize_price_query(coin_name):
+            score += COINGECKO_SCORE_PARTIAL_NAME_MATCH
+        if normalized_query and normalized_query in _normalize_price_query(coin_id):
+            score += COINGECKO_SCORE_PARTIAL_ID_MATCH
+        if search_index is not None:
+            score += max(0, COINGECKO_SCORE_SEARCH_ORDER_BONUS - search_index)
+        if isinstance(market_cap_rank, int) and market_cap_rank > 0:
+            score += max(
+                0,
+                COINGECKO_SCORE_MARKET_CAP_BONUS
+                - min(market_cap_rank, COINGECKO_SCORE_MARKET_CAP_BONUS),
+            )
+
+        return (
+            score,
+            isinstance(market_cap_rank, int),
+            -(market_cap_rank or COINGECKO_CANDIDATE_FALLBACK_RANK),
+            -(
+                COINGECKO_SCORE_SEARCH_ORDER_BONUS - search_index
+                if search_index is not None
+                else 0
+            ),
+        )
+
+    best = max(markets, key=_score, default=None)
+    if not best:
+        return None
+
+    return {
+        "name": best.get("name") or symbol,
+        "symbol": (best.get("symbol") or symbol).upper(),
+        "price": best.get("current_price") or 0,
+        "change_24h": best.get("price_change_percentage_24h") or 0,
+        "market_cap": best.get("market_cap") or 0,
+        "volume_24h": best.get("total_volume") or 0,
+    }
+
+
+async def _fetch_dexscreener_price(
+    client,
+    symbol: str,
+    normalized_query: str,
+) -> dict | None:
+    known_address = SUI_DEXSCREENER_TOKEN_ADDRESSES.get(normalized_query)
+    sui_only = normalized_query not in GENERAL_PRICE_ALIASES
+
+    if known_address:
+        response = await client.get(
+            f"{DEXSCREENER_API_URL}/token-pairs/v1/sui/"
+            f"{quote(known_address, safe='')}",
+            timeout=PRICE_REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        pairs = response.json()
+    else:
+        response = await client.get(
+            f"{DEXSCREENER_API_URL}/latest/dex/search",
+            params={"q": symbol},
+            timeout=PRICE_REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        pairs = payload.get("pairs", []) if isinstance(payload, dict) else []
+
+    candidates: list[tuple[tuple, dict]] = []
+    requested_address = canonicalize_sui_type(known_address) if known_address else None
+    raw_query = symbol.lower().strip()
+
+    for pair in pairs if isinstance(pairs, list) else []:
+        if not isinstance(pair, dict):
+            continue
+        if sui_only and str(pair.get("chainId") or "").lower() != "sui":
+            continue
+
+        base_token = pair.get("baseToken")
+        if not isinstance(base_token, dict):
+            continue
+        base_address = str(base_token.get("address") or "")
+        address_matches = (
+            canonicalize_sui_type(base_address) == requested_address
+            if requested_address
+            else base_address.lower() == raw_query
+        )
+        symbol_matches = (
+            _normalize_price_query(base_token.get("symbol")) == normalized_query
+        )
+        name_matches = (
+            _normalize_price_query(base_token.get("name")) == normalized_query
+        )
+        if requested_address and not address_matches:
+            continue
+        if not requested_address and not (
+            address_matches or symbol_matches or name_matches
+        ):
+            continue
+
+        price = _positive_decimal(pair.get("priceUsd"))
+        if price is None:
+            continue
+        liquidity_data = pair.get("liquidity")
+        volume_data = pair.get("volume")
+        change_data = pair.get("priceChange")
+        liquidity = (
+            _nonnegative_decimal(liquidity_data.get("usd"))
+            if isinstance(liquidity_data, dict)
+            else None
+        ) or Decimal(0)
+        volume_24h = (
+            _nonnegative_decimal(volume_data.get("h24"))
+            if isinstance(volume_data, dict)
+            else None
+        ) or Decimal(0)
+        market_cap = (
+            _nonnegative_decimal(pair.get("marketCap"))
+            or _nonnegative_decimal(pair.get("fdv"))
+            or Decimal(0)
+        )
+        change_24h = (
+            _finite_decimal(change_data.get("h24"))
+            if isinstance(change_data, dict)
+            else None
+        ) or Decimal(0)
+
+        result = {
+            "name": base_token.get("name") or symbol,
+            "symbol": (base_token.get("symbol") or symbol).upper(),
+            "price": price,
+            "change_24h": change_24h,
+            "market_cap": market_cap,
+            "volume_24h": volume_24h,
+        }
+        candidates.append(
+            (
+                (
+                    bool(address_matches),
+                    bool(symbol_matches),
+                    bool(name_matches),
+                    liquidity,
+                    volume_24h,
+                ),
+                result,
+            )
+        )
+
+    return max(candidates, key=lambda candidate: candidate[0], default=((), None))[1]
+
+
+async def fetch_crypto_price(symbol: str) -> dict | None:
+    """Fetch price data from CoinGecko, falling back to DEX Screener.
+
+    CoinGecko remains the primary source for established assets. Unresolved
+    assets are treated as Sui tokens by default, while common general-market
+    aliases may fall back to the strongest exact-match pool on any chain.
     """
     cache_key = symbol.lower().strip()
     cached = _price_cache.get(cache_key)
     if cached:
-        result, ts = cached
-        if time.monotonic() - ts < PRICE_CACHE_TTL:
+        result, cached_at = cached
+        if time.monotonic() - cached_at < PRICE_CACHE_TTL:
             return result
 
+    normalized_query = _normalize_price_query(symbol)
+    if not normalized_query:
+        return None
+
+    client = await get_shared_async_client()
     result = None
     try:
-        client = await get_shared_async_client()
-        normalized_query = re.sub(r"[^a-z0-9]+", "", symbol.lower())
-        preferred_coin_id = ALL_PRICE_ALIASES.get(normalized_query)
+        result = await _fetch_coingecko_price(client, symbol, normalized_query)
+    except Exception as exc:
+        logging.warning("CoinGecko price lookup failed for %s: %s", symbol, exc)
 
-        search_coin_map: dict[str, tuple[dict, int]] = {}
-
-        if preferred_coin_id:
-            coin_ids = [preferred_coin_id]
-        else:
-            search_resp = await client.get(
-                f"{COINGECKO_API_URL}/search",
-                params={"query": symbol},
-            )
-            search_resp.raise_for_status()
-            coins = search_resp.json().get("coins", [])
-
-            if not coins:
-                return None
-
-            coin_ids = [coin["id"] for coin in coins[:10]]
-            search_coin_map = {coin["id"]: (coin, i) for i, coin in enumerate(coins[:10])}
-
-        markets_resp = await client.get(
-            f"{COINGECKO_API_URL}/coins/markets",
-            params={
-                "vs_currency": "usd",
-                "ids": ",".join(coin_ids),
-                "price_change_percentage": "24h",
-                "order": "market_cap_desc",
-                "per_page": str(len(coin_ids)),
-                "page": "1",
-            },
-        )
-        markets_resp.raise_for_status()
-        markets: list[dict] = markets_resp.json()
-
-        if not markets:
-            return None
-
-        def _normalize(v: str | None) -> str:
-            return re.sub(r"[^a-z0-9]+", "", (v or "").lower())
-
-        _sui_coin_ids = set(SUI_PRICE_ALIASES.values())
-
-        def _score(market: dict) -> tuple:
-            coin_id = market["id"]
-            coin_symbol = market.get("symbol") or ""
-            coin_name = market.get("name") or ""
-            market_cap_rank = market.get("market_cap_rank")
-            search_coin, search_index = search_coin_map.get(coin_id, ({}, None))
-
-            score = 0
-            if preferred_coin_id and coin_id == preferred_coin_id:
-                score += COINGECKO_SCORE_PREFERRED_ALIAS
-            if _normalize(coin_symbol) == normalized_query:
-                score += COINGECKO_SCORE_EXACT_SYMBOL_MATCH
-            if _normalize(coin_name) == normalized_query:
-                score += COINGECKO_SCORE_EXACT_NAME_MATCH
-            if _normalize(coin_id) == normalized_query:
-                score += COINGECKO_SCORE_EXACT_ID_MATCH
-            if coin_id in _sui_coin_ids:
-                score += COINGECKO_SCORE_SUI_PLATFORM_MATCH
-            if normalized_query and normalized_query in _normalize(coin_symbol):
-                score += COINGECKO_SCORE_PARTIAL_SYMBOL_MATCH
-            if normalized_query and normalized_query in _normalize(coin_name):
-                score += COINGECKO_SCORE_PARTIAL_NAME_MATCH
-            if normalized_query and normalized_query in _normalize(coin_id):
-                score += COINGECKO_SCORE_PARTIAL_ID_MATCH
-            if search_index is not None:
-                score += max(0, COINGECKO_SCORE_SEARCH_ORDER_BONUS - search_index)
-            if isinstance(market_cap_rank, int) and market_cap_rank > 0:
-                score += max(0, COINGECKO_SCORE_MARKET_CAP_BONUS - min(market_cap_rank, COINGECKO_SCORE_MARKET_CAP_BONUS))
-
-            return (
-                score,
-                isinstance(market_cap_rank, int),
-                -(market_cap_rank or COINGECKO_CANDIDATE_FALLBACK_RANK),
-                -(COINGECKO_SCORE_SEARCH_ORDER_BONUS - search_index if search_index is not None else 0),
-            )
-
-        best = max(markets, key=_score, default=None)
-        if not best:
-            return None
-
-        result = {
-            "name": best.get("name") or symbol,
-            "symbol": (best.get("symbol") or symbol).upper(),
-            "price": best.get("current_price") or 0,
-            "change_24h": best.get("price_change_percentage_24h") or 0,
-            "market_cap": best.get("market_cap") or 0,
-            "volume_24h": best.get("total_volume") or 0,
-        }
-    except Exception as e:
-        logging.error(f"Error fetching price for {symbol}: {e}")
-        return None
+    if result is None:
+        try:
+            result = await _fetch_dexscreener_price(client, symbol, normalized_query)
+        except Exception as exc:
+            logging.warning("DEX Screener price lookup failed for %s: %s", symbol, exc)
 
     if result is not None:
         _price_cache[cache_key] = (result, time.monotonic())
