@@ -192,6 +192,132 @@ class TestPriceFetching(unittest.IsolatedAsyncioTestCase):
             self.assertIn("coins/markets", second_args[0])
             self.assertEqual(second_kwargs["params"]["ids"], "unknown-coin")
 
+    async def test_known_sui_tokens_fall_back_to_address_specific_dex_pairs(self):
+        for symbol in ("CITY", "MANIFEST"):
+            with self.subTest(symbol=symbol):
+                bot._price_cache.clear()
+                coin_type = bot.SUI_DEXSCREENER_TOKEN_ADDRESSES[symbol.lower()]
+                markets_response = MagicMock()
+                markets_response.json.return_value = []
+                markets_response.raise_for_status = MagicMock()
+
+                dex_response = MagicMock()
+                dex_response.json.return_value = [
+                    {
+                        "chainId": "sui",
+                        "baseToken": {
+                            "address": "0xspoof::coin::COIN",
+                            "name": symbol,
+                            "symbol": symbol,
+                        },
+                        "priceUsd": "999",
+                        "liquidity": {"usd": 99_000_000},
+                    },
+                    {
+                        "chainId": "sui",
+                        "baseToken": {
+                            "address": coin_type,
+                            "name": "Alpha City" if symbol == "CITY" else "MANIFEST",
+                            "symbol": symbol,
+                        },
+                        "priceUsd": "0.00042",
+                        "priceChange": {"h24": "-3.13"},
+                        "liquidity": {"usd": 23_000},
+                        "volume": {"h24": 674},
+                        "marketCap": 309_000,
+                    }
+                ]
+                dex_response.raise_for_status = MagicMock()
+                mock_client = AsyncMock()
+                mock_client.get.side_effect = [markets_response, dex_response]
+
+                with patch(
+                    "bot.get_shared_async_client",
+                    new=AsyncMock(return_value=mock_client),
+                ):
+                    result = await bot.fetch_crypto_price(symbol)
+
+                self.assertIsNotNone(result)
+                self.assertEqual(result["symbol"], symbol)
+                self.assertEqual(result["price"], Decimal("0.00042"))
+                self.assertEqual(result["change_24h"], Decimal("-3.13"))
+                dex_url = mock_client.get.await_args_list[-1].args[0]
+                self.assertIn("/token-pairs/v1/sui/", dex_url)
+                self.assertIn("%3A%3A", dex_url)
+
+    async def test_general_asset_uses_cross_chain_dex_fallback_on_provider_error(self):
+        dex_response = MagicMock()
+        dex_response.json.return_value = {
+            "pairs": [
+                {
+                    "chainId": "ethereum",
+                    "baseToken": {
+                        "address": "0xbtc",
+                        "name": "Bitcoin",
+                        "symbol": "BTC",
+                    },
+                    "priceUsd": "65000",
+                    "priceChange": {"h24": 1.25},
+                    "liquidity": {"usd": 5_000_000},
+                    "volume": {"h24": 2_000_000},
+                    "marketCap": 1_200_000_000_000,
+                }
+            ]
+        }
+        dex_response.raise_for_status = MagicMock()
+        mock_client = AsyncMock()
+        mock_client.get.side_effect = [RuntimeError("CoinGecko unavailable"), dex_response]
+
+        with patch(
+            "bot.get_shared_async_client",
+            new=AsyncMock(return_value=mock_client),
+        ):
+            result = await bot.fetch_crypto_price("BTC")
+
+        self.assertEqual(result["price"], Decimal("65000"))
+        self.assertIn("/latest/dex/search", mock_client.get.await_args_list[-1].args[0])
+
+    async def test_unknown_asset_dex_fallback_is_restricted_to_exact_sui_match(self):
+        search_response = MagicMock()
+        search_response.json.return_value = {"coins": []}
+        search_response.raise_for_status = MagicMock()
+        dex_response = MagicMock()
+        dex_response.json.return_value = {
+            "pairs": [
+                {
+                    "chainId": "solana",
+                    "baseToken": {"address": "sol", "name": "Mystery", "symbol": "MYSTERY"},
+                    "priceUsd": "99",
+                    "liquidity": {"usd": 10_000_000},
+                },
+                {
+                    "chainId": "sui",
+                    "baseToken": {"address": "0xsui", "name": "Mystery", "symbol": "MYSTERY"},
+                    "priceUsd": "0.25",
+                    "liquidity": {"usd": 10_000},
+                    "volume": {"h24": 500},
+                },
+                {
+                    "chainId": "sui",
+                    "baseToken": {"address": "0xother", "name": "Other", "symbol": "OTHER"},
+                    "priceUsd": "1000",
+                    "liquidity": {"usd": 20_000_000},
+                },
+            ]
+        }
+        dex_response.raise_for_status = MagicMock()
+        mock_client = AsyncMock()
+        mock_client.get.side_effect = [search_response, dex_response]
+
+        with patch(
+            "bot.get_shared_async_client",
+            new=AsyncMock(return_value=mock_client),
+        ):
+            result = await bot.fetch_crypto_price("MYSTERY")
+
+        self.assertEqual(result["price"], Decimal("0.25"))
+        self.assertEqual(result["symbol"], "MYSTERY")
+
     async def test_exact_sui_buy_valuation_only_fetches_sui_price(self):
         event = SimpleNamespace(
             amount=10_000_000_000,
