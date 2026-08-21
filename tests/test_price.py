@@ -235,6 +235,30 @@ class TestPriceFetching(unittest.IsolatedAsyncioTestCase):
             ["SUI", "CITY"],
         )
 
+    async def test_price_response_keeps_city_link_without_web_preview(self):
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(message=message)
+        context = SimpleNamespace(args=["SUI"])
+        price_data = {
+            "name": "Sui",
+            "symbol": "SUI",
+            "price": 1.5,
+            "change_24h": 2.0,
+            "market_cap": 1_000_000,
+            "volume_24h": 100_000,
+        }
+
+        with patch(
+            "bot.fetch_crypto_price",
+            new=AsyncMock(return_value=price_data),
+        ):
+            await bot.price_command(update, context)
+
+        final_reply = message.reply_text.await_args_list[-1]
+        self.assertIn(bot.FOOTER_HTML, final_reply.args[0])
+        self.assertIn("https://app.noodles.fi/coins/", final_reply.args[0])
+        self.assertTrue(final_reply.kwargs["disable_web_page_preview"])
+
     async def test_aggregates_unique_sui_pair_volume_and_caches_it(self):
         coin_type = "0xabc::city::CITY"
         pair = {

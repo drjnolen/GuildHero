@@ -3125,7 +3125,11 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💎 <b>24h Volume:</b> {format_large_number(price_data['volume_24h'])}"
     )
 
-    await update.message.reply_text(response + FOOTER_HTML, parse_mode=ParseMode.HTML)
+    await update.message.reply_text(
+        response + FOOTER_HTML,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
