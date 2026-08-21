@@ -72,6 +72,7 @@ from bot import (  # noqa: E402
     _format_buy_token_amount,
     _format_sui_value,
     _initialize_buybot_start_checkpoints,
+    _reply_with_footer,
     _send_buy_announcement,
     _updated_buybot_buyer_profile,
     _volume_including_current_buy,
@@ -233,6 +234,23 @@ class TestBuyAnnouncementFormatting(unittest.TestCase):
             bot.FOOTER_HTML,
         )
         self.assertNotIn("app.nexa.xyz", bot.FOOTER_HTML)
+
+    def test_footer_reply_keeps_link_and_disables_preview(self):
+        message = SimpleNamespace(reply_text=AsyncMock())
+
+        asyncio.run(
+            _reply_with_footer(
+                message,
+                "Result",
+                disable_web_page_preview=False,
+            )
+        )
+
+        reply = message.reply_text.await_args
+        self.assertEqual(reply.args[0], "Result" + bot.FOOTER_HTML)
+        self.assertIn("https://app.noodles.fi/coins/", reply.args[0])
+        self.assertTrue(reply.kwargs["disable_web_page_preview"])
+        self.assertEqual(reply.kwargs["parse_mode"], bot.ParseMode.HTML)
 
     def test_formats_smart_buyer_badges_below_emojis(self):
         text = _format_buy_announcement(
