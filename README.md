@@ -173,7 +173,7 @@ Exchange labels are inferred from known package/module names. Operators can add 
 export SUI_DEX_PACKAGES_JSON='{"0xPACKAGE_ID":"Exchange Name"}'
 ```
 
-The public Sui Foundation endpoint is the default. A dedicated gRPC provider endpoint is recommended for production polling; provider credentials can be passed through `SUI_GRPC_HEADERS_JSON`.
+The public Sui Foundation endpoint is the default. A dedicated gRPC provider endpoint is recommended for production streaming; provider credentials can be passed through `SUI_GRPC_HEADERS_JSON`. The tracker keeps one finalized-checkpoint subscription while active and sleeps without scanning the database when no groups have buy announcements enabled.
 
 ## Architecture
 
@@ -189,7 +189,7 @@ The bot uses a modular Python layout with a narrow Node.js chain boundary:
 
 Core integrations:
 - **python-telegram-bot** — Telegram Bot API framework
-- **OpenAI GPT-3.5** — AI-powered chat analysis and content generation
+- **OpenAI GPT-5 nano** — AI-powered chat analysis and content generation, with exact-request result caching and bounded prompt inputs
 - **PostgreSQL** — Persistent bot state plus normalized message history storage
 - **CoinGecko API** — Real-time cryptocurrency price data
 - **Mysten Sui SDK + gRPC v2** — Finalized checkpoint reads and programmable token transfers
