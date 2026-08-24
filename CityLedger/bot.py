@@ -14,6 +14,7 @@ import time
 import uuid
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from types import SimpleNamespace
 from urllib.parse import quote
 import pytz
 from ai_services import analyze_user_messages, summarize_chat_history, get_best_of_messages, get_vibe_check, generate_copypasta
@@ -80,6 +81,8 @@ MAX_MESSAGES_FOR_SUMMARY = 1000
 MAX_MESSAGES_TO_PROCESS = 1500
 # Maximum message count a user may request for AI commands.
 MAX_MESSAGES_INPUT_LIMIT = 5000
+LEADERBOARD_USER_MESSAGE_LIMIT = 200
+LEADERBOARD_USER_TRANSCRIPT_MAX_CHARS = 12000
 INVALID_FORMAT_MESSAGE = "Invalid format. Usage: /command #, or /command # topic. For example /command 100 or /command 500 Bitcoin"
 
 
@@ -124,7 +127,8 @@ _BUYBOT_SEEN_DIGEST_LIMIT = 500
 _BUYBOT_CHECKPOINT_BATCH_SIZE = 50
 _BUYBOT_MAX_CHECKPOINTS_PER_RUN = 250
 _BUYBOT_LIVE_GAP_LOOKBACK = 100
-_BUYBOT_POLL_SECONDS = 3
+_BUYBOT_SUBSCRIPTION_WAIT_MS = 5_000
+_BUYBOT_RETRY_SECONDS = 5
 _BUYBOT_EMOJI = "🔥"
 _BUYBOT_EMOJI_USD_STEP = Decimal("5")
 _BUYBOT_MAX_EMOJIS = 100
@@ -352,33 +356,24 @@ def escape_markdown(text: str) -> str:
 
 def get_stable_proportional_sample(messages, max_messages):
     """
-    If the message count exceeds max_messages, it returns a proportionally sampled list
-    from the entire period to ensure stability while maintaining representation.
+    Return a deterministic, evenly distributed sample from the entire period.
+
+    Deterministic sampling keeps repeated AI requests cacheable while retaining
+    chronological representation from high-volume chats.
     """
     if len(messages) <= max_messages:
         return messages, False  # Not sampled
 
-    daily_messages = defaultdict(list)
-    for msg in messages:
-        daily_messages[datetime.datetime.fromisoformat(msg['date']).date()].append(msg)
+    ordered = sorted(messages, key=lambda item: item["date"])
+    if max_messages <= 1:
+        return [ordered[-1]], True
 
-    sampled_messages = []
-    total_messages = len(messages)
-
-    sorted_days = sorted(daily_messages.keys())
-
-    for day in sorted_days:
-        day_msgs = daily_messages[day]
-        proportion = len(day_msgs) / total_messages
-        sample_size = int(proportion * max_messages)
-
-        # Ensure we sample at least one message if the day has any, to guarantee representation
-        if len(day_msgs) > 0 and sample_size == 0:
-            sample_size = 1
-
-        sampled_messages.extend(random.sample(day_msgs, min(len(day_msgs), sample_size)))
-
-    return sorted(sampled_messages, key=lambda x: x['date']), True  # Sampled
+    last_index = len(ordered) - 1
+    indexes = [
+        round(position * last_index / (max_messages - 1))
+        for position in range(max_messages)
+    ]
+    return [ordered[index] for index in indexes], True
 
 def get_proportionally_sampled_messages(messages):
     """
@@ -388,17 +383,11 @@ def get_proportionally_sampled_messages(messages):
     if len(messages) <= MAX_MESSAGES_FOR_SUMMARY:
         return messages
 
-    daily_messages = defaultdict(list)
-    for msg in messages:
-        daily_messages[datetime.datetime.fromisoformat(msg['date']).date()].append(msg)
-
-    sampled_messages = []
-    total_messages = len(messages)
-    for day, day_msgs in daily_messages.items():
-        sample_size = int(len(day_msgs) / total_messages * MAX_MESSAGES_FOR_SUMMARY)
-        sampled_messages.extend(random.sample(day_msgs, min(len(day_msgs), sample_size)))
-
-    return sorted(sampled_messages, key=lambda x: x['date'])
+    sampled_messages, _ = get_stable_proportional_sample(
+        messages,
+        MAX_MESSAGES_FOR_SUMMARY,
+    )
+    return sampled_messages
 
 def build_safe_transcript(messages, line_formatter, max_chars=12000):
     """Builds a transcript from messages, ensuring it doesn't exceed a character limit."""
@@ -407,11 +396,17 @@ def build_safe_transcript(messages, line_formatter, max_chars=12000):
 
     # Iterate in reverse to prioritize recent messages
     for msg in reversed(messages):
-        line = line_formatter(msg)
-        if char_count + len(line) + 1 > max_chars: # +1 for newline
+        line = str(line_formatter(msg))
+        remaining = max_chars - char_count
+        if remaining <= 0:
+            break
+        separator_size = 1 if transcript_lines else 0
+        if len(line) + separator_size > remaining:
+            if not transcript_lines:
+                transcript_lines.append(line[:max_chars])
             break
         transcript_lines.append(line)
-        char_count += len(line) + 1
+        char_count += len(line) + separator_size
 
     # Return in chronological order
     return "\n".join(reversed(transcript_lines))
@@ -577,10 +572,16 @@ def get_events_for_month(chat_id, year, month):
     return event_dates
 
 # --- Badge Awarding Logic ---
-async def award_badge(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, badge_id: str):
+async def award_badge(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_id: int,
+    badge_id: str,
+    known_badges: list[str] | None = None,
+):
     """Awards a badge to a user if they don't already have it."""
     badges_key = _get_badges_key(chat_id, user_id)
-    user_badges = db.get(badges_key, [])
+    user_badges = known_badges if known_badges is not None else db.get(badges_key, [])
 
     if badge_id not in user_badges:
         user_badges.append(badge_id)
@@ -603,43 +604,71 @@ async def award_badge(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id:
         )
 
 # --- Database Interaction Functions ---
+def _persist_message_state(
+    chat_id,
+    user_id,
+    username,
+    first_name,
+    last_name,
+    text,
+    date,
+    is_reply,
+    message_id,
+):
+    """Run the one-time migration check, then persist the hot path atomically."""
+
+    _ensure_messages_migrated(chat_id)
+    return db.record_message(
+        int(chat_id),
+        int(message_id),
+        int(user_id),
+        username,
+        first_name,
+        last_name,
+        text,
+        date,
+        is_reply,
+        user_key=_get_user_key(chat_id, user_id),
+        stats_key=_get_user_stats_key(chat_id, user_id),
+        achievements_key=_get_achievements_enabled_key(chat_id),
+        badges_key=_get_badges_key(chat_id, user_id),
+    )
+
+
 async def store_message_db(context: ContextTypes.DEFAULT_TYPE, chat_id, user_id, username, first_name, last_name, text, date, is_reply, message_id):
     try:
-        chat_id_str, user_id_str = str(chat_id), str(user_id)
-        _track_chat(chat_id)
-        _ensure_messages_migrated(chat_id)
-        user_key = _get_user_key(chat_id_str, user_id_str)
-        existing_user_data = db.get(user_key)
-        new_user_data = {"username": username, "first_name": first_name, "last_name": last_name}
-        if not existing_user_data or any(existing_user_data.get(k) != v for k, v in new_user_data.items()):
-            db[user_key] = {**new_user_data, "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+        result = await asyncio.to_thread(
+            _persist_message_state,
+            chat_id,
+            user_id,
+            username,
+            first_name,
+            last_name,
+            text,
+            date,
+            is_reply,
+            message_id,
+        )
+        if not result["inserted"]:
+            return
 
-        db.add_message(int(chat_id), int(message_id), int(user_id), username, text, date, is_reply)
-
-        stats_key = _get_user_stats_key(chat_id_str, user_id_str)
-        user_stats = db.get(stats_key, {"message_count": 0})
-        user_stats["message_count"] += 1
-        db[stats_key] = user_stats
-
-        if db.get(_get_achievements_enabled_key(chat_id), False):
+        if result["achievements_enabled"]:
+            user_stats = result["user_stats"] or {"message_count": 0}
+            user_badges = result["badges"]
             message_count = user_stats["message_count"]
             if message_count == 100:
-                await award_badge(context, chat_id, user_id, 'contributor_100')
+                await award_badge(context, chat_id, user_id, 'contributor_100', user_badges)
             elif message_count == 500:
-                await award_badge(context, chat_id, user_id, 'hero_500')
+                await award_badge(context, chat_id, user_id, 'hero_500', user_badges)
             elif message_count == 1000:
-                await award_badge(context, chat_id, user_id, 'godlike_1000')
+                await award_badge(context, chat_id, user_id, 'godlike_1000', user_badges)
 
-            if "first_seen" not in user_stats:
-                user_stats["first_seen"] = date.isoformat()
-                db[stats_key] = user_stats
-            else:
-                first_seen = datetime.datetime.fromisoformat(user_stats["first_seen"])
-                if first_seen.tzinfo is None:
-                    first_seen = first_seen.replace(tzinfo=datetime.timezone.utc)
-                now = date if date.tzinfo else date.replace(tzinfo=datetime.timezone.utc)
-                if (now - first_seen).days >= 30:
-                    await award_badge(context, chat_id, user_id, 'diamond_hands')
+            first_seen = datetime.datetime.fromisoformat(user_stats["first_seen"])
+            if first_seen.tzinfo is None:
+                first_seen = first_seen.replace(tzinfo=datetime.timezone.utc)
+            now = date if date.tzinfo else date.replace(tzinfo=datetime.timezone.utc)
+            if (now - first_seen).days >= 30 and "diamond_hands" not in user_badges:
+                await award_badge(context, chat_id, user_id, 'diamond_hands', user_badges)
 
     except Exception as e:
         logging.error(f"Error storing message from {username} in chat {chat_id}: {e}")
@@ -842,6 +871,72 @@ def _load_buybot_chat_tokens() -> dict[str, list[tuple[int, int | None]]]:
                 )
             )
     return dict(token_chats)
+
+
+def _get_buybot_runtime(application) -> dict:
+    runtime = application.bot_data.get("buybot_runtime")
+    if runtime is None:
+        runtime = {
+            "token_chats": None,
+            "config_generation": 0,
+            "config_changed": asyncio.Event(),
+            "config_lock": asyncio.Lock(),
+        }
+        application.bot_data["buybot_runtime"] = runtime
+    return runtime
+
+
+def _invalidate_buybot_config(context_or_application) -> None:
+    """Invalidate the active buy-bot config and wake the subscription task."""
+
+    application = getattr(
+        context_or_application,
+        "application",
+        context_or_application,
+    )
+    if application is None or not hasattr(application, "bot_data"):
+        return
+    runtime = _get_buybot_runtime(application)
+    runtime["token_chats"] = None
+    runtime["config_generation"] += 1
+    runtime["config_changed"].set()
+
+
+async def _get_cached_buybot_chat_tokens(application):
+    """Load active buy-bot chats once, refreshing only after admin changes."""
+
+    runtime = _get_buybot_runtime(application)
+    while True:
+        cached = runtime["token_chats"]
+        if cached is not None:
+            return cached
+
+        async with runtime["config_lock"]:
+            if runtime["token_chats"] is not None:
+                return runtime["token_chats"]
+            generation = runtime["config_generation"]
+            loaded = await asyncio.to_thread(_load_buybot_chat_tokens)
+            if generation == runtime["config_generation"]:
+                runtime["token_chats"] = loaded
+                return loaded
+
+
+async def _wait_for_buybot_config_change(application, timeout: float | None = None):
+    """Wait without losing an invalidation that races with the idle transition."""
+
+    runtime = _get_buybot_runtime(application)
+    if runtime["config_changed"].is_set():
+        return
+    try:
+        if timeout is None:
+            await runtime["config_changed"].wait()
+        else:
+            await asyncio.wait_for(
+                runtime["config_changed"].wait(),
+                timeout=timeout,
+            )
+    except asyncio.TimeoutError:
+        pass
 
 
 def _initialize_buybot_start_checkpoints(
@@ -1568,6 +1663,7 @@ async def _announce_checkpoint_buys(
                             _get_buybot_enabled_key(chat_id),
                             False,
                         )
+                        _invalidate_buybot_config(context)
                         logging.warning(f"Disabled buy bot for unreachable chat {chat_id}.")
                     else:
                         all_sent = False
@@ -1604,15 +1700,124 @@ async def _announce_and_advance_buybot_cursor(
     return True
 
 
+async def _process_live_buybot_checkpoints(
+    context,
+    service,
+    token_chats: dict[str, list[tuple[int, int]]],
+    checkpoints,
+    live_cursor,
+):
+    """Process subscription items and bounded gap recovery in order."""
+
+    live_cursor_key = _get_buybot_live_checkpoint_key()
+    for checkpoint in checkpoints:
+        if live_cursor is not None and checkpoint.sequence_number <= int(live_cursor):
+            continue
+
+        gap_start = checkpoint.sequence_number
+        if live_cursor is not None:
+            gap_start = max(
+                int(live_cursor) + 1,
+                checkpoint.sequence_number - _BUYBOT_LIVE_GAP_LOOKBACK,
+            )
+        if gap_start < checkpoint.sequence_number:
+            for sequence_numbers in _buybot_checkpoint_batches(
+                gap_start,
+                checkpoint.sequence_number - 1,
+            ):
+                gap_checkpoints = await service.get_checkpoints(sequence_numbers)
+                gap_by_sequence = {
+                    item.sequence_number: item for item in gap_checkpoints
+                }
+                for sequence_number in sequence_numbers:
+                    gap_checkpoint = gap_by_sequence.get(sequence_number)
+                    if gap_checkpoint is None:
+                        raise RuntimeError(
+                            f"Sui gRPC batch omitted checkpoint {sequence_number}."
+                        )
+                    if not await _announce_and_advance_buybot_cursor(
+                        context,
+                        gap_checkpoint,
+                        token_chats,
+                        live_cursor_key,
+                    ):
+                        return live_cursor, False
+                    live_cursor = gap_checkpoint.sequence_number
+
+        if not await _announce_and_advance_buybot_cursor(
+            context,
+            checkpoint,
+            token_chats,
+            live_cursor_key,
+        ):
+            return live_cursor, False
+        live_cursor = checkpoint.sequence_number
+
+    return live_cursor, True
+
+
+async def _advance_buybot_history(
+    context,
+    service,
+    token_chats: dict[str, list[tuple[int, int]]],
+    latest_sequence: int,
+    cursor,
+):
+    """Advance one bounded historical recovery batch behind the live stream."""
+
+    cursor_key = _get_buybot_checkpoint_key()
+    if cursor is None or int(cursor) > latest_sequence:
+        await asyncio.to_thread(db.__setitem__, cursor_key, latest_sequence)
+        return latest_sequence, True
+
+    earliest_active_checkpoint = min(
+        start_checkpoint
+        for chats in token_chats.values()
+        for _, start_checkpoint in chats
+    )
+    if int(cursor) < earliest_active_checkpoint:
+        cursor = earliest_active_checkpoint
+        await asyncio.to_thread(db.__setitem__, cursor_key, cursor)
+
+    end_sequence = min(
+        latest_sequence,
+        int(cursor) + _BUYBOT_MAX_CHECKPOINTS_PER_RUN,
+    )
+    for sequence_numbers in _buybot_checkpoint_batches(
+        int(cursor) + 1,
+        end_sequence,
+    ):
+        checkpoints = await service.get_checkpoints(sequence_numbers)
+        checkpoints_by_sequence = {
+            checkpoint.sequence_number: checkpoint for checkpoint in checkpoints
+        }
+        for sequence_number in sequence_numbers:
+            checkpoint = checkpoints_by_sequence.get(sequence_number)
+            if checkpoint is None:
+                raise RuntimeError(
+                    f"Sui gRPC batch omitted checkpoint {sequence_number}."
+                )
+            if not await _announce_and_advance_buybot_cursor(
+                context,
+                checkpoint,
+                token_chats,
+                cursor_key,
+            ):
+                return cursor, False
+            cursor = checkpoint.sequence_number
+
+    return cursor, True
+
+
 async def check_sui_buys(context: ContextTypes.DEFAULT_TYPE):
-    """Stream live buys first, then advance the durable historical cursor."""
+    """Run one compatibility cycle of the subscription-backed buy tracker."""
 
     lock = context.application.bot_data.setdefault("buybot_checkpoint_lock", asyncio.Lock())
     if lock.locked():
         return
 
     async with lock:
-        token_chats = await asyncio.to_thread(_load_buybot_chat_tokens)
+        token_chats = await _get_cached_buybot_chat_tokens(context.application)
         if not token_chats:
             return
 
@@ -1627,99 +1832,120 @@ async def check_sui_buys(context: ContextTypes.DEFAULT_TYPE):
             )
             subscribed = await service.get_subscribed_checkpoints(
                 max_items=100,
-                wait_ms=500,
+                wait_ms=_BUYBOT_SUBSCRIPTION_WAIT_MS,
             )
-            live_cursor_key = _get_buybot_live_checkpoint_key()
-            live_cursor = await asyncio.to_thread(db.get, live_cursor_key)
-            for checkpoint in subscribed:
-                if (
-                    live_cursor is not None
-                    and checkpoint.sequence_number <= int(live_cursor)
-                ):
+            live_cursor = await asyncio.to_thread(
+                db.get,
+                _get_buybot_live_checkpoint_key(),
+            )
+            live_cursor, succeeded = await _process_live_buybot_checkpoints(
+                context,
+                service,
+                token_chats,
+                subscribed,
+                live_cursor,
+            )
+            if not succeeded:
+                return
+            if subscribed:
+                latest_sequence = max(
+                    latest_sequence,
+                    max(item.sequence_number for item in subscribed),
+                )
+            cursor = await asyncio.to_thread(db.get, _get_buybot_checkpoint_key())
+            await _advance_buybot_history(
+                context,
+                service,
+                token_chats,
+                latest_sequence,
+                cursor,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logging.error(f"Sui buy tracker subscription cycle failed: {exc}")
+
+
+async def run_sui_buy_tracker(application):
+    """Continuously consume Sui checkpoints, sleeping when no chats are active."""
+
+    context = SimpleNamespace(application=application, bot=application.bot)
+    runtime = _get_buybot_runtime(application)
+    token_chats = None
+    live_cursor = None
+    history_cursor = None
+    latest_sequence = None
+    active_generation = None
+
+    while True:
+        try:
+            if (
+                token_chats is None
+                or runtime["config_changed"].is_set()
+                or active_generation != runtime["config_generation"]
+            ):
+                runtime["config_changed"].clear()
+                token_chats = await _get_cached_buybot_chat_tokens(application)
+                active_generation = runtime["config_generation"]
+                if not token_chats:
+                    token_chats = None
+                    await _wait_for_buybot_config_change(application)
                     continue
 
-                gap_start = checkpoint.sequence_number
-                if live_cursor is not None:
-                    gap_start = max(
-                        int(live_cursor) + 1,
-                        checkpoint.sequence_number - _BUYBOT_LIVE_GAP_LOOKBACK,
-                    )
-                if gap_start < checkpoint.sequence_number:
-                    for sequence_numbers in _buybot_checkpoint_batches(
-                        gap_start,
-                        checkpoint.sequence_number - 1,
-                    ):
-                        gap_checkpoints = await service.get_checkpoints(
-                            sequence_numbers
-                        )
-                        for gap_checkpoint in gap_checkpoints:
-                            if not await _announce_and_advance_buybot_cursor(
-                                context,
-                                gap_checkpoint,
-                                token_chats,
-                                live_cursor_key,
-                            ):
-                                return
-                            live_cursor = gap_checkpoint.sequence_number
-
-                if not await _announce_and_advance_buybot_cursor(
-                    context,
-                    checkpoint,
+                service = get_sui_service(SUI_GRPC_URL, SUI_GRPC_HEADERS)
+                latest = await service.get_latest_checkpoint()
+                latest_sequence = int(latest.sequence_number)
+                token_chats = await asyncio.to_thread(
+                    _initialize_buybot_start_checkpoints,
                     token_chats,
-                    live_cursor_key,
-                ):
-                    return
-                live_cursor = checkpoint.sequence_number
-
-            cursor = await asyncio.to_thread(db.get, _get_buybot_checkpoint_key())
-            if cursor is None or int(cursor) > latest_sequence:
-                await asyncio.to_thread(
-                    db.__setitem__,
-                    _get_buybot_checkpoint_key(),
                     latest_sequence,
                 )
-                return
-
-            earliest_active_checkpoint = min(
-                start_checkpoint
-                for chats in token_chats.values()
-                for _, start_checkpoint in chats
-            )
-            if int(cursor) < earliest_active_checkpoint:
-                cursor = earliest_active_checkpoint
-                await asyncio.to_thread(
-                    db.__setitem__,
-                    _get_buybot_checkpoint_key(),
-                    cursor,
+                live_cursor, history_cursor = await asyncio.gather(
+                    asyncio.to_thread(db.get, _get_buybot_live_checkpoint_key()),
+                    asyncio.to_thread(db.get, _get_buybot_checkpoint_key()),
                 )
 
-            end_sequence = min(
-                latest_sequence,
-                int(cursor) + _BUYBOT_MAX_CHECKPOINTS_PER_RUN,
+            subscribed = await service.get_subscribed_checkpoints(
+                max_items=100,
+                wait_ms=_BUYBOT_SUBSCRIPTION_WAIT_MS,
             )
-            for sequence_numbers in _buybot_checkpoint_batches(
-                int(cursor) + 1,
-                end_sequence,
-            ):
-                checkpoints = await service.get_checkpoints(sequence_numbers)
-                checkpoints_by_sequence = {
-                    checkpoint.sequence_number: checkpoint for checkpoint in checkpoints
-                }
-                for sequence_number in sequence_numbers:
-                    checkpoint = checkpoints_by_sequence.get(sequence_number)
-                    if checkpoint is None:
-                        raise RuntimeError(
-                            f"Sui gRPC batch omitted checkpoint {sequence_number}."
-                        )
-                    if not await _announce_and_advance_buybot_cursor(
-                        context,
-                        checkpoint,
-                        token_chats,
-                        _get_buybot_checkpoint_key(),
-                    ):
-                        return
+            live_cursor, succeeded = await _process_live_buybot_checkpoints(
+                context,
+                service,
+                token_chats,
+                subscribed,
+                live_cursor,
+            )
+            if not succeeded:
+                await _wait_for_buybot_config_change(
+                    application,
+                    timeout=_BUYBOT_RETRY_SECONDS,
+                )
+                continue
+
+            if subscribed:
+                latest_sequence = max(
+                    latest_sequence,
+                    max(item.sequence_number for item in subscribed),
+                )
+            history_cursor, _ = await _advance_buybot_history(
+                context,
+                service,
+                token_chats,
+                latest_sequence,
+                history_cursor,
+            )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            logging.error(f"Sui buy tracker checkpoint poll failed: {exc}")
+            logging.error(f"Sui buy tracker subscription loop failed: {exc}")
+            # Force checkpoint/cursor initialization to run again after any
+            # service or database failure. The active config remains cached.
+            token_chats = None
+            await _wait_for_buybot_config_change(
+                application,
+                timeout=_BUYBOT_RETRY_SECONDS,
+            )
 
 
 # --- Price Lookup ---
@@ -2188,10 +2414,23 @@ async def generate_leaderboard(context: ContextTypes.DEFAULT_TYPE, chat_id, star
     leaderboard = []
     for user_id, msgs in user_messages.items():
         username, n = msgs[0]["username"], len(msgs)
-        sample = random.sample(msgs, k=min(n, 200))
-        metrics = await asyncio.to_thread(analyze_user_messages, username, n, "\n".join(m["text"] for m in sample))
+        sample, _ = get_stable_proportional_sample(
+            msgs,
+            LEADERBOARD_USER_MESSAGE_LIMIT,
+        )
+        analysis_text = build_safe_transcript(
+            sample,
+            lambda message: message["text"],
+            max_chars=LEADERBOARD_USER_TRANSCRIPT_MAX_CHARS,
+        )
+        metrics = await asyncio.to_thread(
+            analyze_user_messages,
+            username,
+            n,
+            analysis_text,
+        )
         metrics["helpfulness"] += min(sum(1 for m in sample if m["is_reply"]) * 0.2, 20 - metrics["helpfulness"])
-        metrics["total"] = (sum(metrics.values()) / 4) * (math.log1p(min(n, 200)) * 1.37)
+        metrics["total"] = (sum(metrics.values()) / 4) * (math.log1p(min(n, LEADERBOARD_USER_MESSAGE_LIMIT)) * 1.37)
         leaderboard.append((username, metrics, n, user_id))
     leaderboard.sort(key=lambda x: x[1]["total"], reverse=True)
 
@@ -2704,6 +2943,7 @@ async def settoken_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         start_key = _get_buybot_start_checkpoint_key(chat_id)
         if start_key in db:
             del db[start_key]
+        _invalidate_buybot_config(context)
         await update.message.reply_text(
             "✅ The selected token has been cleared. Airdrops will fall back to SUI, and buy announcements are disabled."
         )
@@ -2714,6 +2954,7 @@ async def settoken_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         start_key = _get_buybot_start_checkpoint_key(chat_id)
         if start_key in db:
             del db[start_key]
+    _invalidate_buybot_config(context)
     await update.message.reply_text(
         f"✅ Airdrop token set to: <code>{html.escape(coin_type)}</code>",
         parse_mode=ParseMode.HTML,
@@ -2770,6 +3011,7 @@ async def setbuybot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         db[_get_buybot_enabled_key(chat_id)] = True
         db[start_key] = latest.sequence_number
+        _invalidate_buybot_config(context)
         await update.message.reply_text(
             f"✅ Buy announcements are enabled for <code>{html.escape(selected_token)}</code>.",
             parse_mode=ParseMode.HTML,
@@ -2778,6 +3020,7 @@ async def setbuybot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db[_get_buybot_enabled_key(chat_id)] = False
         if start_key in db:
             del db[start_key]
+        _invalidate_buybot_config(context)
         await update.message.reply_text("✅ Buy announcements are disabled.")
 
 
@@ -3810,7 +4053,21 @@ async def setup_bot_commands(application):
         application.bot.set_my_commands(private_commands, scope=BotCommandScopeAllPrivateChats()),
     )
 
+
+async def initialize_services(application):
+    await setup_bot_commands(application)
+    tracker_task = application.bot_data.get("buybot_tracker_task")
+    if tracker_task is None or tracker_task.done():
+        application.bot_data["buybot_tracker_task"] = asyncio.create_task(
+            run_sui_buy_tracker(application),
+            name="sui-buy-tracker",
+        )
+
 async def shutdown_services(application):
+    tracker_task = application.bot_data.get("buybot_tracker_task")
+    if tracker_task is not None and not tracker_task.done():
+        tracker_task.cancel()
+        await asyncio.gather(tracker_task, return_exceptions=True)
     await asyncio.gather(
         close_shared_async_client(),
         close_sui_service(),
@@ -3829,7 +4086,6 @@ def main():
 
     job_queue = application.job_queue
     job_queue.run_repeating(check_and_announce_events, interval=datetime.timedelta(minutes=30), first=10)
-    job_queue.run_repeating(check_sui_buys, interval=_BUYBOT_POLL_SECONDS, first=5)
 
 
     calendar_conv_handler = ConversationHandler(
@@ -3887,7 +4143,7 @@ def main():
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_message))
     application.add_error_handler(error_handler)
-    application.post_init = setup_bot_commands
+    application.post_init = initialize_services
     application.post_shutdown = shutdown_services
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)

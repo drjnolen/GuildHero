@@ -998,8 +998,15 @@ class TestGetStableProportionalSample(unittest.TestCase):
         msgs = self._make_messages(300, datetime.datetime(2024, 1, 1))
         result, was_sampled = get_stable_proportional_sample(msgs, 50)
         self.assertTrue(was_sampled)
-        # Allow a slight overage because each day gets at least 1 message.
-        self.assertLessEqual(len(result), 60)
+        self.assertEqual(len(result), 50)
+
+    def test_sampling_is_deterministic(self):
+        msgs = self._make_messages(300, datetime.datetime(2024, 1, 1))
+
+        first, _ = get_stable_proportional_sample(msgs, 50)
+        second, _ = get_stable_proportional_sample(msgs, 50)
+
+        self.assertEqual(first, second)
 
     def test_result_is_chronologically_ordered(self):
         msgs = self._make_messages(200, datetime.datetime(2024, 3, 1))
@@ -1011,6 +1018,249 @@ class TestGetStableProportionalSample(unittest.TestCase):
         result, was_sampled = get_stable_proportional_sample([], 50)
         self.assertEqual(result, [])
         self.assertFalse(was_sampled)
+
+
+class TestBoundedAITranscripts(unittest.TestCase):
+    def test_transcript_never_exceeds_character_limit(self):
+        messages = [
+            {"text": "older message"},
+            {"text": "x" * 100},
+        ]
+
+        transcript = bot.build_safe_transcript(
+            messages,
+            lambda message: message["text"],
+            max_chars=32,
+        )
+
+        self.assertEqual(len(transcript), 32)
+        self.assertEqual(transcript, "x" * 32)
+
+    def test_leaderboard_user_input_is_bounded_and_repeatable(self):
+        async def exercise():
+            original_messages = bot.get_messages_by_date_range
+            original_analyze = bot.analyze_user_messages
+            captured = []
+            messages = [
+                {
+                    "user_id": 1,
+                    "username": "alice",
+                    "text": f"message-{index}-" + ("x" * 100),
+                    "date": (
+                        datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+                        + datetime.timedelta(minutes=index)
+                    ).isoformat(),
+                    "is_reply": False,
+                }
+                for index in range(300)
+            ]
+
+            bot.get_messages_by_date_range = lambda *_args: messages
+
+            def analyze(_username, _count, transcript):
+                captured.append(transcript)
+                return {
+                    "quality": 10,
+                    "tone": 10,
+                    "helpfulness": 10,
+                    "humor": 10,
+                }
+
+            bot.analyze_user_messages = analyze
+            try:
+                args = (
+                    SimpleNamespace(),
+                    42,
+                    datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc),
+                    datetime.datetime(2024, 1, 2, tzinfo=datetime.timezone.utc),
+                    "01/01/2024",
+                    "01/02/2024",
+                )
+                await bot.generate_leaderboard(*args)
+                await bot.generate_leaderboard(*args)
+            finally:
+                bot.get_messages_by_date_range = original_messages
+                bot.analyze_user_messages = original_analyze
+
+            return captured
+
+        captured = asyncio.run(exercise())
+
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(captured[0], captured[1])
+        self.assertLessEqual(
+            len(captured[0]),
+            bot.LEADERBOARD_USER_TRANSCRIPT_MAX_CHARS,
+        )
+
+
+class TestMessagePersistenceHotPath(unittest.TestCase):
+    def test_migrates_once_then_uses_one_record_call_per_message(self):
+        original_db = bot.db
+        fake_db = MagicMock()
+        fake_db.has_messages.return_value = False
+        fake_db.get.return_value = []
+        fake_db.record_message.return_value = {"inserted": True}
+        bot.db = fake_db
+        bot._migrated_chats.discard(42)
+        try:
+            bot._persist_message_state(
+                42,
+                7,
+                "alice",
+                "Alice",
+                None,
+                "first",
+                datetime.datetime.now(datetime.timezone.utc),
+                False,
+                1,
+            )
+            fake_db.reset_mock()
+
+            bot._persist_message_state(
+                42,
+                7,
+                "alice",
+                "Alice",
+                None,
+                "second",
+                datetime.datetime.now(datetime.timezone.utc),
+                False,
+                2,
+            )
+        finally:
+            bot._migrated_chats.discard(42)
+            bot.db = original_db
+
+        fake_db.record_message.assert_called_once()
+        fake_db.has_messages.assert_not_called()
+        fake_db.get.assert_not_called()
+        fake_db.enroll_chat.assert_not_called()
+
+
+class TestBuyBotRuntimeEfficiency(unittest.TestCase):
+    def test_configuration_is_cached_until_invalidated(self):
+        async def exercise():
+            original_loader = bot._load_buybot_chat_tokens
+            loader = MagicMock(
+                return_value={"0xabc::coin::COIN": [(42, 100)]}
+            )
+            bot._load_buybot_chat_tokens = loader
+            application = SimpleNamespace(bot_data={})
+            try:
+                first = await bot._get_cached_buybot_chat_tokens(application)
+                second = await bot._get_cached_buybot_chat_tokens(application)
+                bot._invalidate_buybot_config(application)
+                third = await bot._get_cached_buybot_chat_tokens(application)
+            finally:
+                bot._load_buybot_chat_tokens = original_loader
+            return loader.call_count, first, second, third
+
+        call_count, first, second, third = asyncio.run(exercise())
+
+        self.assertEqual(call_count, 2)
+        self.assertEqual(first, second)
+        self.assertEqual(second, third)
+
+    def test_idle_tracker_loads_configuration_once_and_waits(self):
+        async def exercise():
+            original_loader = bot._load_buybot_chat_tokens
+            loader = MagicMock(return_value={})
+            bot._load_buybot_chat_tokens = loader
+            application = SimpleNamespace(bot_data={}, bot=SimpleNamespace())
+            task = asyncio.create_task(bot.run_sui_buy_tracker(application))
+            try:
+                await asyncio.sleep(0.05)
+                first_count = loader.call_count
+                await asyncio.sleep(0.05)
+                second_count = loader.call_count
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                bot._load_buybot_chat_tokens = original_loader
+            return first_count, second_count
+
+        first_count, second_count = asyncio.run(exercise())
+
+        self.assertEqual(first_count, 1)
+        self.assertEqual(second_count, 1)
+
+    def test_active_tracker_fetches_latest_only_when_config_is_loaded(self):
+        async def exercise():
+            original_db = bot.db
+            original_loader = bot._load_buybot_chat_tokens
+            original_get_service = bot.get_sui_service
+            fake_db = MagicMock()
+            fake_db.get.return_value = 100
+            service = SimpleNamespace(
+                get_latest_checkpoint=AsyncMock(
+                    return_value=SimpleNamespace(sequence_number=100)
+                ),
+                get_subscribed_checkpoints=AsyncMock(
+                    side_effect=[[], [], asyncio.CancelledError()]
+                ),
+            )
+            bot.db = fake_db
+            bot._load_buybot_chat_tokens = MagicMock(
+                return_value={"0xabc::coin::COIN": [(42, 100)]}
+            )
+            bot.get_sui_service = lambda *_args: service
+            application = SimpleNamespace(bot_data={}, bot=SimpleNamespace())
+            try:
+                task = asyncio.create_task(bot.run_sui_buy_tracker(application))
+                await asyncio.gather(task, return_exceptions=True)
+            finally:
+                bot.db = original_db
+                bot._load_buybot_chat_tokens = original_loader
+                bot.get_sui_service = original_get_service
+            return service
+
+        service = asyncio.run(exercise())
+
+        self.assertEqual(service.get_latest_checkpoint.await_count, 1)
+        self.assertEqual(service.get_subscribed_checkpoints.await_count, 3)
+
+    def test_tracker_reinitializes_after_startup_service_failure(self):
+        async def exercise():
+            original_db = bot.db
+            original_loader = bot._load_buybot_chat_tokens
+            original_get_service = bot.get_sui_service
+            original_retry = bot._BUYBOT_RETRY_SECONDS
+            service = SimpleNamespace(
+                get_latest_checkpoint=AsyncMock(
+                    side_effect=[
+                        RuntimeError("temporary"),
+                        SimpleNamespace(sequence_number=100),
+                    ]
+                ),
+                get_subscribed_checkpoints=AsyncMock(
+                    side_effect=asyncio.CancelledError()
+                ),
+            )
+            loader = MagicMock(
+                return_value={"0xabc::coin::COIN": [(42, 100)]}
+            )
+            fake_db = MagicMock()
+            fake_db.get.return_value = 100
+            bot.db = fake_db
+            bot._load_buybot_chat_tokens = loader
+            bot.get_sui_service = lambda *_args: service
+            bot._BUYBOT_RETRY_SECONDS = 0
+            application = SimpleNamespace(bot_data={}, bot=SimpleNamespace())
+            try:
+                task = asyncio.create_task(bot.run_sui_buy_tracker(application))
+                await asyncio.gather(task, return_exceptions=True)
+            finally:
+                bot.db = original_db
+                bot._load_buybot_chat_tokens = original_loader
+                bot.get_sui_service = original_get_service
+                bot._BUYBOT_RETRY_SECONDS = original_retry
+            return service, loader
+
+        service, loader = asyncio.run(exercise())
+
+        self.assertEqual(service.get_latest_checkpoint.await_count, 2)
+        self.assertEqual(loader.call_count, 1)
 
 
 # ---------------------------------------------------------------------------

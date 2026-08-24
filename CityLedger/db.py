@@ -7,6 +7,7 @@ messages and enrolled chats.
 
 import logging
 import os
+import threading
 from datetime import datetime, timezone
 
 import psycopg2
@@ -40,6 +41,11 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_sent_at
     ON messages (chat_id, sent_at DESC, message_id DESC);
 """
 
+_CREATE_MESSAGES_USER_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_messages_chat_user
+    ON messages (chat_id, user_id, sent_at DESC, message_id DESC);
+"""
+
 _CREATE_ENROLLED_CHATS_TABLE = """
 CREATE TABLE IF NOT EXISTS enrolled_chats (
     chat_id BIGINT PRIMARY KEY,
@@ -54,6 +60,8 @@ class PostgresKV:
     def __init__(self, database_url: str):
         self._database_url = database_url
         self._conn = None
+        self._enrolled_chat_ids: set[int] = set()
+        self._enrolled_chat_lock = threading.Lock()
         self._ensure_schema()
 
     def _get_conn(self):
@@ -81,6 +89,7 @@ class PostgresKV:
                 cur.execute(_CREATE_KV_TABLE)
                 cur.execute(_CREATE_MESSAGES_TABLE)
                 cur.execute(_CREATE_MESSAGES_INDEX)
+                cur.execute(_CREATE_MESSAGES_USER_INDEX)
                 cur.execute(_CREATE_ENROLLED_CHATS_TABLE)
         self._execute_with_retry(_op)
 
@@ -143,20 +152,29 @@ class PostgresKV:
         return self._execute_with_retry(_op)
 
     def enroll_chat(self, chat_id: int):
-        def _op(conn):
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO enrolled_chats (chat_id) VALUES (%s) ON CONFLICT (chat_id) DO NOTHING",
-                    (chat_id,),
-                )
-        self._execute_with_retry(_op)
+        chat_id = int(chat_id)
+        with self._enrolled_chat_lock:
+            if chat_id in self._enrolled_chat_ids:
+                return
+
+            def _op(conn):
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO enrolled_chats (chat_id) VALUES (%s) ON CONFLICT (chat_id) DO NOTHING",
+                        (chat_id,),
+                    )
+            self._execute_with_retry(_op)
+            self._enrolled_chat_ids.add(chat_id)
 
     def get_enrolled_chat_ids(self) -> list[int]:
         def _op(conn):
             with conn.cursor() as cur:
                 cur.execute("SELECT chat_id FROM enrolled_chats ORDER BY chat_id")
                 return [row[0] for row in cur.fetchall()]
-        return self._execute_with_retry(_op)
+        chat_ids = self._execute_with_retry(_op)
+        with self._enrolled_chat_lock:
+            self._enrolled_chat_ids.update(chat_ids)
+        return chat_ids
 
     def has_messages(self, chat_id: int) -> bool:
         def _op(conn):
@@ -184,6 +202,140 @@ class PostgresKV:
                     (chat_id, message_id, user_id, username, text, sent_at, is_reply),
                 )
         self._execute_with_retry(_op)
+
+    def record_message(
+        self,
+        chat_id: int,
+        message_id: int,
+        user_id: int,
+        username: str | None,
+        first_name: str | None,
+        last_name: str | None,
+        text: str,
+        sent_at: datetime,
+        is_reply: bool,
+        *,
+        user_key: str,
+        stats_key: str,
+        achievements_key: str,
+        badges_key: str,
+    ) -> dict:
+        """Persist a message and related hot-path state in one DB round trip."""
+
+        chat_id = int(chat_id)
+        message_id = int(message_id)
+        user_id = int(user_id)
+        if sent_at.tzinfo is None:
+            sent_at = sent_at.replace(tzinfo=timezone.utc)
+
+        user_data = psycopg2.extras.Json(
+            {
+                "username": username,
+                "first_name": first_name,
+                "last_name": last_name,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        initial_stats = psycopg2.extras.Json(
+            {
+                "message_count": 1,
+                "first_seen": sent_at.isoformat(),
+            }
+        )
+
+        def _op(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    WITH enrolled AS (
+                        INSERT INTO enrolled_chats (chat_id)
+                        VALUES (%s)
+                        ON CONFLICT (chat_id) DO NOTHING
+                    ),
+                    upserted_user AS (
+                        INSERT INTO kv_store (key, value)
+                        VALUES (%s, %s)
+                        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                        WHERE kv_store.value->>'username'
+                                  IS DISTINCT FROM EXCLUDED.value->>'username'
+                           OR kv_store.value->>'first_name'
+                                  IS DISTINCT FROM EXCLUDED.value->>'first_name'
+                           OR kv_store.value->>'last_name'
+                                  IS DISTINCT FROM EXCLUDED.value->>'last_name'
+                    ),
+                    inserted_message AS (
+                        INSERT INTO messages (
+                            chat_id, message_id, user_id, username, text,
+                            sent_at, is_reply
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (chat_id, message_id) DO NOTHING
+                        RETURNING 1
+                    ),
+                    updated_stats AS (
+                        INSERT INTO kv_store (key, value)
+                        SELECT %s, %s FROM inserted_message
+                        ON CONFLICT (key) DO UPDATE SET value = jsonb_set(
+                            CASE
+                                WHEN kv_store.value ? 'first_seen'
+                                    THEN kv_store.value
+                                ELSE kv_store.value || jsonb_build_object(
+                                    'first_seen', EXCLUDED.value->'first_seen'
+                                )
+                            END,
+                            '{message_count}',
+                            to_jsonb(
+                                COALESCE(
+                                    (kv_store.value->>'message_count')::BIGINT,
+                                    0
+                                ) + 1
+                            ),
+                            true
+                        )
+                        RETURNING value
+                    )
+                    SELECT
+                        EXISTS(SELECT 1 FROM inserted_message),
+                        (SELECT value FROM updated_stats),
+                        COALESCE(
+                            (SELECT value FROM kv_store WHERE key = %s),
+                            'false'::jsonb
+                        ),
+                        COALESCE(
+                            (SELECT value FROM kv_store WHERE key = %s),
+                            '[]'::jsonb
+                        )
+                    """,
+                    (
+                        chat_id,
+                        user_key,
+                        user_data,
+                        chat_id,
+                        message_id,
+                        user_id,
+                        username,
+                        text,
+                        sent_at,
+                        is_reply,
+                        stats_key,
+                        initial_stats,
+                        achievements_key,
+                        badges_key,
+                    ),
+                )
+                inserted, stats, achievements_enabled, badges = cur.fetchone()
+
+            return {
+                "inserted": bool(inserted),
+                "user_stats": stats,
+                "achievements_enabled": bool(achievements_enabled),
+                "badges": list(badges or []),
+            }
+
+        result = self._execute_with_retry(_op)
+        with self._enrolled_chat_lock:
+            self._enrolled_chat_ids.add(chat_id)
+        return result
 
     def migrate_legacy_messages(self, chat_id: int, messages: list[dict]):
         if not messages:
