@@ -1034,8 +1034,9 @@ def _classify_buy_badges(
     profile: dict | None,
     usd_value: Decimal | None,
     purchase_date: datetime.date,
+    pre_purchase_balance: int | None = None,
 ) -> list[str]:
-    """Classify a buy using only history recorded before this transaction."""
+    """Classify a buy using recorded history and inferred on-chain holdings."""
 
     profile = profile if isinstance(profile, dict) else {}
     try:
@@ -1047,7 +1048,12 @@ def _classify_buy_badges(
     value = _positive_decimal(usd_value)
     if value is not None and value >= _BUYBOT_WHALE_USD_THRESHOLD:
         badges.append("whale")
-    badges.append("first_time" if buy_count == 0 else "returning")
+    if buy_count > 0 or (
+        pre_purchase_balance is not None and pre_purchase_balance > 0
+    ):
+        badges.append("returning")
+    elif pre_purchase_balance == 0:
+        badges.append("first_time")
 
     observed_dates = set()
     for raw_date in profile.get("buy_dates", []) or []:
@@ -1061,6 +1067,36 @@ def _classify_buy_badges(
     ):
         badges.append("three_day_streak")
     return badges
+
+
+async def _get_pre_purchase_token_balance(event, coin_type: str) -> int | None:
+    """Infer holdings before a finalized buy from the wallet's current balance."""
+
+    try:
+        purchased_amount = int(event.amount)
+        post_purchase_balance = int(
+            await sui_get_total_balance(event.wallet, coin_type)
+        )
+    except Exception as exc:
+        logging.warning(
+            "Unable to verify pre-purchase holdings for %s in %s: %s",
+            event.wallet,
+            coin_type,
+            exc,
+        )
+        return None
+
+    if purchased_amount <= 0 or post_purchase_balance < purchased_amount:
+        logging.info(
+            "Cannot infer pre-purchase holdings for %s in %s: balance %s is "
+            "below finalized purchase amount %s",
+            event.wallet,
+            coin_type,
+            post_purchase_balance,
+            purchased_amount,
+        )
+        return None
+    return post_purchase_balance - purchased_amount
 
 
 def _updated_buybot_buyer_profile(
@@ -1488,6 +1524,7 @@ def _format_buy_announcement(
     lines = [
         f"🟢 <b>{symbol} Buy!</b>",
         _format_buy_emojis(valuation.get("usd")),
+        "",
     ]
     badge_text = [
         f"{_BUYBOT_BADGES[badge][0]} <b>{_BUYBOT_BADGES[badge][1]}</b>"
@@ -1498,16 +1535,15 @@ def _format_buy_announcement(
         lines.append(" · ".join(badge_text))
     lines.extend(
         [
-            "",
-            f"<b>Amount:</b> {_format_buy_token_amount(event.amount, amount_config['decimals'])} {symbol}",
+            f"🪙 <b>Purchased:</b> {_format_buy_token_amount(event.amount, amount_config['decimals'])} {symbol}",
             (
-                f"<b>Value:</b> {_format_sui_value(valuation.get('sui'))} SUI"
+                f"💸 <b>Spent:</b> {_format_sui_value(valuation.get('sui'))} SUI"
                 f" / {_format_usd_value(valuation.get('usd'))} USD"
             ),
-            f"<b>Buyer:</b> {_wallet_link(event.wallet)}",
-            f"<b>Market Cap:</b> {_format_volume_usd(valuation.get('market_cap'))}",
-            f"<b>24h Volume:</b> {_format_volume_usd(volume.get('h24'))}",
-            f"<b>1h Volume:</b> {_format_volume_usd(volume.get('h1'))}",
+            f"👤 <b>Buyer:</b> {_wallet_link(event.wallet)}",
+            f"📈 <b>Market Cap:</b> {_format_volume_usd(valuation.get('market_cap'))}",
+            f"📊 <b>24h Volume:</b> {_format_volume_usd(volume.get('h24'))}",
+            f"⏱️ <b>1h Volume:</b> {_format_volume_usd(volume.get('h1'))}",
         ]
     )
     if event.sender and event.sender.lower() != event.wallet.lower():
@@ -1598,9 +1634,10 @@ async def _announce_checkpoint_buys(
                 continue
             if coin_type not in amount_configs:
                 amount_configs[coin_type] = await get_coin_amount_config(coin_type)
-            valuation, volume = await asyncio.gather(
+            valuation, volume, pre_purchase_balance = await asyncio.gather(
                 _get_buy_valuation(event, amount_configs[coin_type]),
                 fetch_token_volume(coin_type),
+                _get_pre_purchase_token_balance(event, coin_type),
             )
             display_volume = _volume_including_current_buy(
                 volume,
@@ -1642,6 +1679,7 @@ async def _announce_checkpoint_buys(
                     buyer_profile,
                     valuation.get("usd"),
                     purchase_date,
+                    pre_purchase_balance,
                 )
                 text = _format_buy_announcement(
                     event,

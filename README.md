@@ -146,11 +146,11 @@ Rolling USD volume comes from [DEX Screener](https://docs.dexscreener.com/api/re
 Buyer badges are tracked separately for each group, selected token, and wallet:
 
 - 🐋 **Whale Buy** — purchase value meets `BUYBOT_WHALE_USD_THRESHOLD` (default: $100)
-- 🆕 **First-Time Buyer** — the first buy GuildHero observes after this feature is deployed
-- 💎 **Returning Holder** — GuildHero has previously observed the wallet buy that token
+- 🆕 **First-Time Buyer** — the wallet's inferred on-chain token balance before the finalized purchase is zero
+- 💎 **Returning Holder** — the wallet held the token before the purchase or GuildHero previously observed it buying that token
 - 🔥 **Three-Day Streak** — the wallet buys on three consecutive UTC calendar days
 
-Buyer history is saved only after Telegram accepts the announcement, so delivery retries do not create false returning-buyer or streak badges.
+GuildHero verifies holdings with Sui RPC once per detected purchase and infers the pre-purchase balance by subtracting the finalized token receipt. If the balance is unavailable or inconsistent, the holder-status badge is omitted instead of claiming the buyer is new. Buyer history is saved only after Telegram accepts the announcement, so delivery retries do not create false returning-buyer or streak badges.
 
 To enable it in a group:
 

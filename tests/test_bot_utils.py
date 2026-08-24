@@ -118,9 +118,9 @@ class TestBuyAnnouncementFormatting(unittest.TestCase):
             valuation,
         )
         self.assertTrue(text.startswith("🟢 <b>CITY Buy!</b>\n🔥\n"))
-        self.assertIn("<b>Value:</b> 2 SUI / $3.00 USD", text)
-        self.assertIn("<b>1h Volume:</b> N/A", text)
-        self.assertIn("<b>24h Volume:</b> N/A", text)
+        self.assertIn("💸 <b>Spent:</b> 2 SUI / $3.00 USD", text)
+        self.assertIn("⏱️ <b>1h Volume:</b> N/A", text)
+        self.assertIn("📊 <b>24h Volume:</b> N/A", text)
         self.assertNotIn("<b>Exchange:</b>", text)
 
     def test_market_cap_uses_finalized_buy_price_and_on_chain_supply(self):
@@ -147,9 +147,9 @@ class TestBuyAnnouncementFormatting(unittest.TestCase):
                 "market_cap": market_cap,
             },
         )
-        self.assertIn("<b>Market Cap:</b> $2.00B", text)
+        self.assertIn("📈 <b>Market Cap:</b> $2.00B", text)
         self.assertIn(
-            '<b>Buyer:</b> <a href="https://suivision.xyz/account/'
+            '👤 <b>Buyer:</b> <a href="https://suivision.xyz/account/'
             '0xe41234567890abcdef1234567890abcdef1234567890abcdef1234567898989a">'
             "0xe4...989a</a>",
             text,
@@ -206,7 +206,7 @@ class TestBuyAnnouncementFormatting(unittest.TestCase):
             valuation,
         )
         self.assertTrue(text.startswith("🟢 <b>CITY Buy!</b>\n🔥🔥🔥🔥🔥\n"))
-        self.assertIn("<b>Value:</b> 5 SUI / $20.00 USD", text)
+        self.assertIn("💸 <b>Spent:</b> 5 SUI / $20.00 USD", text)
 
     def test_adds_one_emoji_for_each_five_dollars(self):
         self.assertEqual(_buy_emoji_count(None), 1)
@@ -223,8 +223,8 @@ class TestBuyAnnouncementFormatting(unittest.TestCase):
             {"symbol": "CITY", "decimals": 9},
             {"sui": Decimal("2.5"), "usd": Decimal("4")},
         )
-        self.assertIn("<b>Amount:</b> 1,235 CITY", text)
-        self.assertIn("<b>Value:</b> 3 SUI / $4.00 USD", text)
+        self.assertIn("🪙 <b>Purchased:</b> 1,235 CITY", text)
+        self.assertIn("💸 <b>Spent:</b> 3 SUI / $4.00 USD", text)
 
     def test_footer_uses_noodles_city_link(self):
         self.assertIn(
@@ -265,11 +265,13 @@ class TestBuyAnnouncementFormatting(unittest.TestCase):
             text.startswith(
                 "🟢 <b>CITY Buy!</b>\n"
                 "🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥\n"
+                "\n"
                 "🐋 <b>Whale Buy</b> · 🆕 <b>First-Time Buyer</b>\n"
+                "🪙 <b>Purchased:</b> 10 CITY\n"
             )
         )
-        self.assertIn("<b>1h Volume:</b> $1.23K", text)
-        self.assertIn("<b>24h Volume:</b> $9.88M", text)
+        self.assertIn("⏱️ <b>1h Volume:</b> $1.23K", text)
+        self.assertIn("📊 <b>24h Volume:</b> $9.88M", text)
         self.assertNotIn("<b>Exchange:</b>", text)
 
     def test_formats_zero_and_large_volume(self):
@@ -319,6 +321,7 @@ class TestSmartBuyerBadges(unittest.TestCase):
             {},
             Decimal("100"),
             datetime.date(2026, 7, 27),
+            0,
         )
 
         self.assertEqual(badges, ["whale", "first_time"])
@@ -331,6 +334,66 @@ class TestSmartBuyerBadges(unittest.TestCase):
         )
 
         self.assertEqual(badges, ["returning"])
+
+    def test_existing_on_chain_balance_is_a_returning_holder(self):
+        badges = _classify_buy_badges(
+            {},
+            Decimal("20"),
+            datetime.date(2026, 7, 27),
+            5_000_000_000,
+        )
+
+        self.assertEqual(badges, ["returning"])
+
+    def test_unknown_on_chain_balance_does_not_claim_first_time_buyer(self):
+        badges = _classify_buy_badges(
+            {},
+            Decimal("20"),
+            datetime.date(2026, 7, 27),
+        )
+
+        self.assertEqual(badges, [])
+
+    def test_infers_pre_purchase_balance_from_finalized_wallet_balance(self):
+        async def exercise(wallet_balance):
+            original = bot.sui_get_total_balance
+            bot.sui_get_total_balance = AsyncMock(return_value=wallet_balance)
+            event = SimpleNamespace(amount=10_000, wallet="0xbuyer")
+            try:
+                balance = await bot._get_pre_purchase_token_balance(
+                    event,
+                    "0xabc::city::CITY",
+                )
+                awaited = bot.sui_get_total_balance.await_args
+            finally:
+                bot.sui_get_total_balance = original
+            return balance, awaited
+
+        balance, awaited = asyncio.run(exercise(15_000))
+
+        self.assertEqual(balance, 5_000)
+        self.assertEqual(awaited.args, ("0xbuyer", "0xabc::city::CITY"))
+
+    def test_uncertain_pre_purchase_balance_is_not_classified(self):
+        async def exercise(*, wallet_balance=None, error=None):
+            original = bot.sui_get_total_balance
+            bot.sui_get_total_balance = AsyncMock(
+                return_value=wallet_balance,
+                side_effect=error,
+            )
+            event = SimpleNamespace(amount=10_000, wallet="0xbuyer")
+            try:
+                return await bot._get_pre_purchase_token_balance(
+                    event,
+                    "0xabc::city::CITY",
+                )
+            finally:
+                bot.sui_get_total_balance = original
+
+        self.assertIsNone(asyncio.run(exercise(wallet_balance=9_999)))
+        self.assertIsNone(
+            asyncio.run(exercise(error=RuntimeError("RPC unavailable")))
+        )
 
     def test_third_consecutive_utc_day_earns_streak(self):
         profile = {
@@ -510,13 +573,14 @@ class TestNameGuardIntegration(unittest.TestCase):
 
 class TestSmartBuyerBadgePersistence(unittest.TestCase):
     def test_records_profile_only_after_successful_announcement(self):
-        async def exercise(send_error=None):
+        async def exercise(send_error=None, wallet_balance=10_000_000_000):
             originals = {
                 "db": bot.db,
                 "detect_buy": bot.detect_buy,
                 "get_coin_amount_config": bot.get_coin_amount_config,
                 "_get_buy_valuation": bot._get_buy_valuation,
                 "fetch_token_volume": bot.fetch_token_volume,
+                "sui_get_total_balance": bot.sui_get_total_balance,
                 "_send_buy_announcement": bot._send_buy_announcement,
             }
             event = SimpleNamespace(
@@ -541,6 +605,7 @@ class TestSmartBuyerBadgePersistence(unittest.TestCase):
             bot.fetch_token_volume = AsyncMock(
                 return_value={"h1": Decimal("500"), "h24": Decimal("2500")}
             )
+            bot.sui_get_total_balance = AsyncMock(return_value=wallet_balance)
             bot._send_buy_announcement = send_announcement
             try:
                 all_sent = await bot._announce_checkpoint_buys(
@@ -559,8 +624,8 @@ class TestSmartBuyerBadgePersistence(unittest.TestCase):
         announcement = send_announcement.await_args.args[2]
         self.assertIn("🐋 <b>Whale Buy</b>", announcement)
         self.assertIn("🆕 <b>First-Time Buyer</b>", announcement)
-        self.assertIn("<b>24h Volume:</b> $2.65K", announcement)
-        self.assertIn("<b>1h Volume:</b> $650.00", announcement)
+        self.assertIn("📊 <b>24h Volume:</b> $2.65K", announcement)
+        self.assertIn("⏱️ <b>1h Volume:</b> $650.00", announcement)
         buyer_keys = [
             key for key in fake_db if key.startswith("buybot_buyer:42:")
         ]
@@ -576,6 +641,13 @@ class TestSmartBuyerBadgePersistence(unittest.TestCase):
         )
         self.assertNotIn("buybot_seen:42", failed_db)
 
+        _, _, returning_announcement = asyncio.run(
+            exercise(wallet_balance=15_000_000_000)
+        )
+        returning_text = returning_announcement.await_args.args[2]
+        self.assertIn("💎 <b>Returning Holder</b>", returning_text)
+        self.assertNotIn("🆕 <b>First-Time Buyer</b>", returning_text)
+
     def test_suppresses_buy_below_group_minimum(self):
         async def exercise():
             originals = {
@@ -584,6 +656,7 @@ class TestSmartBuyerBadgePersistence(unittest.TestCase):
                 "get_coin_amount_config": bot.get_coin_amount_config,
                 "_get_buy_valuation": bot._get_buy_valuation,
                 "fetch_token_volume": bot.fetch_token_volume,
+                "sui_get_total_balance": bot.sui_get_total_balance,
                 "_send_buy_announcement": bot._send_buy_announcement,
             }
             event = SimpleNamespace(
@@ -606,6 +679,9 @@ class TestSmartBuyerBadgePersistence(unittest.TestCase):
                 return_value={"sui": Decimal("2"), "usd": Decimal("4.99")}
             )
             bot.fetch_token_volume = AsyncMock(return_value=None)
+            bot.sui_get_total_balance = AsyncMock(
+                return_value=event.amount,
+            )
             bot._send_buy_announcement = send_announcement
             try:
                 all_sent = await bot._announce_checkpoint_buys(
