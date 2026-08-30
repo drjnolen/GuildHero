@@ -3157,7 +3157,7 @@ async def setbuyimage_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def setemoji_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set, inspect, or reset the group's buy-size emoji."""
+    """Set the group's buy-size emoji."""
 
     if update.effective_chat.type not in {"group", "supergroup"}:
         await update.message.reply_text(
@@ -3169,32 +3169,15 @@ async def setemoji_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
     args = context.args or []
-    if not args:
-        current = await asyncio.to_thread(_get_buybot_emoji, chat_id)
-        await update.message.reply_text(
-            f"Buybot emoji: {current}\n\n"
-            "Use /setemoji 🚀 to choose one emoji for this group.\n"
-            "Use /setemoji reset to restore the default 🔥."
-        )
-        return
-
-    key = _get_buybot_emoji_key(chat_id)
-    if len(args) == 1 and args[0].lower() in {"reset", "off", "default"}:
-        # Saving the default avoids a non-atomic read/delete of the setting.
-        await asyncio.to_thread(db.__setitem__, key, _BUYBOT_EMOJI)
-        await update.message.reply_text("✅ Buybot emoji reset to 🔥 for this group.")
-        return
-
     selected = _normalize_buybot_emoji(args[0]) if len(args) == 1 else None
     if selected is None:
         await update.message.reply_text(
-            "❌ Send exactly one Unicode emoji, for example /setemoji 🚀. "
-            "Use /setemoji reset to restore 🔥."
+            "❌ Send exactly one Unicode emoji, for example /setemoji 🚀."
         )
         return
 
     await asyncio.to_thread(_track_chat, chat_id)
-    await asyncio.to_thread(db.__setitem__, key, selected)
+    await asyncio.to_thread(db.__setitem__, _get_buybot_emoji_key(chat_id), selected)
     await update.message.reply_text(f"✅ Buybot emoji set to {selected} for this group.")
 
 

@@ -1026,42 +1026,33 @@ class TestBuybotEmoji(unittest.IsolatedAsyncioTestCase):
             message=SimpleNamespace(reply_text=self.reply),
         )
 
-    async def test_saves_reports_and_resets_only_this_group(self):
+    async def test_saves_and_replaces_only_this_groups_emoji(self):
         self.fake_db["buybot_emoji:99"] = "💎"
-        await bot.setemoji_command(self.update, SimpleNamespace(args=[]))
-        self.assertIn("Buybot emoji: 🔥", self.reply.await_args.args[0])
-        self.assertNotIn("buybot_emoji:42", self.fake_db)
-
         await bot.setemoji_command(self.update, SimpleNamespace(args=["🚀"]))
         self.assertEqual(self.fake_db["buybot_emoji:42"], "🚀")
         self.assertEqual(bot._get_buybot_emoji(42), "🚀")
         self.assertEqual(bot._get_buybot_emoji(99), "💎")
         self.assertEqual(bot._get_buybot_emoji(100), "🔥")
-        await bot.setemoji_command(self.update, SimpleNamespace(args=[]))
-        self.assertIn("Buybot emoji: 🚀", self.reply.await_args.args[0])
-
-        for reset in ("reset", "OFF", "default"):
-            self.fake_db["buybot_emoji:42"] = "🚀"
-            await bot.setemoji_command(self.update, SimpleNamespace(args=[reset]))
-            self.assertEqual(bot._get_buybot_emoji(42), "🔥")
-            self.assertEqual(bot._get_buybot_emoji(99), "💎")
+        await bot.setemoji_command(self.update, SimpleNamespace(args=["🔥"]))
+        self.assertEqual(bot._get_buybot_emoji(42), "🔥")
+        self.assertEqual(bot._get_buybot_emoji(99), "💎")
 
     async def test_rejects_invalid_input_without_overwriting_setting(self):
         self.fake_db["buybot_emoji:42"] = "💎"
         for args in (
-            ["hello"], ["🚀", "💎"], ["🚀💎"], ["<b>🚀</b>"], ["reset", "extra"]
+            [], ["reset"], ["off"], ["default"], ["hello"],
+            ["🚀", "💎"], ["🚀💎"], ["<b>🚀</b>"],
         ):
             with self.subTest(args=args):
                 await bot.setemoji_command(self.update, SimpleNamespace(args=args))
                 self.assertIn("exactly one Unicode emoji", self.reply.await_args.args[0])
                 self.assertEqual(bot._get_buybot_emoji(42), "💎")
 
-    async def test_non_admin_cannot_read_change_or_reset_setting(self):
+    async def test_non_admin_cannot_change_setting(self):
         self.admin.return_value = False
         self.fake_db["buybot_emoji:42"] = "💎"
-        for args in ([], ["🚀"], ["reset"]):
-            await bot.setemoji_command(self.update, SimpleNamespace(args=args))
-        self.assertEqual(self.admin.await_count, 3)
+        await bot.setemoji_command(self.update, SimpleNamespace(args=["🚀"]))
+        self.admin.assert_awaited_once()
         self.assertEqual(self.fake_db["buybot_emoji:42"], "💎")
         self.reply.assert_not_awaited()
 
