@@ -13,7 +13,7 @@ import unittest
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BOT_DIR = PROJECT_ROOT / "CityLedger"
@@ -1000,14 +1000,154 @@ class TestBuyAnnouncementMedia(unittest.TestCase):
 
             self.assertIn("setbuybot", group_names)
             self.assertIn("setbuyimage", group_names)
+            self.assertIn("setemoji", group_names)
             self.assertIn("setminbuy", group_names)
             self.assertIn("nameguard", group_names)
             self.assertNotIn("setbuybot", private_names)
             self.assertNotIn("setbuyimage", private_names)
+            self.assertNotIn("setemoji", private_names)
             self.assertNotIn("setminbuy", private_names)
             self.assertNotIn("nameguard", private_names)
 
         asyncio.run(exercise())
+
+
+class TestBuybotEmoji(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.fake_db = _FakeDB()
+        self.admin = AsyncMock(return_value=True)
+        for name, value in (("db", self.fake_db), ("require_admin", self.admin)):
+            patcher = patch.object(bot, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.reply = AsyncMock()
+        self.update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=42, type="supergroup"),
+            message=SimpleNamespace(reply_text=self.reply),
+        )
+
+    async def test_saves_reports_and_resets_only_this_group(self):
+        self.fake_db["buybot_emoji:99"] = "💎"
+        await bot.setemoji_command(self.update, SimpleNamespace(args=[]))
+        self.assertIn("Buybot emoji: 🔥", self.reply.await_args.args[0])
+        self.assertNotIn("buybot_emoji:42", self.fake_db)
+
+        await bot.setemoji_command(self.update, SimpleNamespace(args=["🚀"]))
+        self.assertEqual(self.fake_db["buybot_emoji:42"], "🚀")
+        self.assertEqual(bot._get_buybot_emoji(42), "🚀")
+        self.assertEqual(bot._get_buybot_emoji(99), "💎")
+        self.assertEqual(bot._get_buybot_emoji(100), "🔥")
+        await bot.setemoji_command(self.update, SimpleNamespace(args=[]))
+        self.assertIn("Buybot emoji: 🚀", self.reply.await_args.args[0])
+
+        for reset in ("reset", "OFF", "default"):
+            self.fake_db["buybot_emoji:42"] = "🚀"
+            await bot.setemoji_command(self.update, SimpleNamespace(args=[reset]))
+            self.assertEqual(bot._get_buybot_emoji(42), "🔥")
+            self.assertEqual(bot._get_buybot_emoji(99), "💎")
+
+    async def test_rejects_invalid_input_without_overwriting_setting(self):
+        self.fake_db["buybot_emoji:42"] = "💎"
+        for args in (
+            ["hello"], ["🚀", "💎"], ["🚀💎"], ["<b>🚀</b>"], ["reset", "extra"]
+        ):
+            with self.subTest(args=args):
+                await bot.setemoji_command(self.update, SimpleNamespace(args=args))
+                self.assertIn("exactly one Unicode emoji", self.reply.await_args.args[0])
+                self.assertEqual(bot._get_buybot_emoji(42), "💎")
+
+    async def test_non_admin_cannot_read_change_or_reset_setting(self):
+        self.admin.return_value = False
+        self.fake_db["buybot_emoji:42"] = "💎"
+        for args in ([], ["🚀"], ["reset"]):
+            await bot.setemoji_command(self.update, SimpleNamespace(args=args))
+        self.assertEqual(self.admin.await_count, 3)
+        self.assertEqual(self.fake_db["buybot_emoji:42"], "💎")
+        self.reply.assert_not_awaited()
+
+    async def test_private_chat_cannot_change_setting(self):
+        self.update.effective_chat.type = "private"
+        await bot.setemoji_command(self.update, SimpleNamespace(args=["🚀"]))
+        self.admin.assert_not_awaited()
+        self.assertNotIn("buybot_emoji:42", self.fake_db)
+        self.assertIn("Use /setemoji in the group", self.reply.await_args.args[0])
+
+    async def test_accepts_compound_unicode_emojis(self):
+        for selected in ("🚀", "❤️", "👍🏽", "🇺🇸", "👨‍👩‍👧‍👦", "1️⃣"):
+            with self.subTest(selected=selected):
+                await bot.setemoji_command(self.update, SimpleNamespace(args=[selected]))
+                self.assertEqual(bot._get_buybot_emoji(42), selected)
+                self.assertEqual(
+                    bot._format_buy_emojis(Decimal("10"), selected), selected * 3
+                )
+
+    async def test_invalid_saved_values_fall_back_to_flames(self):
+        for invalid in (None, 123, {}, "", "text", "<b>🚀</b>", "🚀🚀", "🚀\u200d"):
+            with self.subTest(invalid=invalid):
+                self.fake_db["buybot_emoji:42"] = invalid
+                self.assertEqual(bot._get_buybot_emoji(42), "🔥")
+                self.assertEqual(
+                    bot._format_buy_emojis(Decimal("10"), invalid), "🔥🔥🔥"
+                )
+
+    async def test_large_buys_keep_default_size_budget_and_count_multiplier(self):
+        for selected in ("🚀", "❤️", "👍🏽", "🇺🇸", "👨‍👩‍👧‍👦"):
+            with self.subTest(selected=selected):
+                row = bot._format_buy_emojis(Decimal("1000"), selected)
+                repeated, multiplier = row.split(" ")
+                self.assertLessEqual(
+                    len(repeated.encode("utf-16-le")),
+                    len(("🔥" * 100).encode("utf-16-le")),
+                )
+                self.assertEqual(multiplier, "<b>×201</b>")
+                self.assertEqual(repeated, selected * repeated.count(selected))
+        self.assertEqual(bot._format_buy_emojis(Decimal("10")), "🔥🔥🔥")
+
+    async def test_checkpoint_uses_each_groups_emoji_in_text_and_media(self):
+        await bot.setemoji_command(self.update, SimpleNamespace(args=["🚀"]))
+        self.fake_db["buybot_emoji:43"] = "💎"
+        self.fake_db["buybot_media:43"] = {"type": "photo", "file_id": "buy-photo"}
+        event = SimpleNamespace(
+            amount=10_000_000_000,
+            sui_spent=1_000_000_000,
+            wallet="0xbuyer",
+            sender="0xbuyer",
+            digest="EmojiBuy",
+            timestamp={"seconds": "1785126600", "nanos": 0},
+        )
+        telegram_bot = SimpleNamespace(send_message=AsyncMock(), send_photo=AsyncMock())
+        with (
+            patch.object(bot, "detect_buy", return_value=event),
+            patch.object(
+                bot, "get_coin_amount_config",
+                AsyncMock(return_value={"symbol": "CITY", "decimals": 9}),
+            ),
+            patch.object(
+                bot, "_get_buy_valuation",
+                AsyncMock(return_value={"sui": Decimal("2"), "usd": Decimal("10")}),
+            ),
+            patch.object(bot, "fetch_token_volume", AsyncMock(return_value=None)),
+            patch.object(bot, "sui_get_total_balance", AsyncMock(return_value=event.amount)),
+        ):
+            all_sent = await bot._announce_checkpoint_buys(
+                SimpleNamespace(bot=telegram_bot),
+                SimpleNamespace(sequence_number=11, transactions=[object()]),
+                {"0xabc::city::CITY": [(42, 10), (43, 10), (44, 10)]},
+            )
+
+        self.assertTrue(all_sent)
+        texts = {
+            call.kwargs["chat_id"]: call.kwargs["text"]
+            for call in telegram_bot.send_message.await_args_list
+        }
+        self.assertTrue(texts[42].startswith("🟢 <b>CITY Buy!</b>\n🚀🚀🚀\n\n"))
+        self.assertTrue(texts[44].startswith("🟢 <b>CITY Buy!</b>\n🔥🔥🔥\n\n"))
+        photo = telegram_bot.send_photo.await_args.kwargs
+        self.assertEqual(photo["chat_id"], 43)
+        self.assertEqual(photo["photo"], "buy-photo")
+        self.assertTrue(photo["caption"].startswith("🟢 <b>CITY Buy!</b>\n💎💎💎\n\n"))
+        for text in (*texts.values(), photo["caption"]):
+            self.assertIn("🆕 <b>First-Time Buyer</b>\n🪙 <b>Purchased:</b>", text)
 
 
 # ---------------------------------------------------------------------------
