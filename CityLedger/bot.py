@@ -16,6 +16,7 @@ from collections import defaultdict
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from types import SimpleNamespace
 from urllib.parse import quote
+from emoji import is_emoji
 import pytz
 from ai_services import analyze_user_messages, summarize_chat_history, get_best_of_messages, get_vibe_check, generate_copypasta
 from buy_tracker import canonicalize_sui_type, detect_buy
@@ -478,6 +479,10 @@ def _get_buybot_start_checkpoint_key(chat_id):
 
 def _get_buybot_media_key(chat_id):
     return f"buybot_media:{chat_id}"
+
+
+def _get_buybot_emoji_key(chat_id):
+    return f"buybot_emoji:{chat_id}"
 
 
 def _get_buybot_minimum_usd_key(chat_id):
@@ -1448,10 +1453,29 @@ def _buy_emoji_count(usd_value: Decimal | None) -> int:
     return 1 + int(value // _BUYBOT_EMOJI_USD_STEP)
 
 
-def _format_buy_emojis(usd_value: Decimal | None) -> str:
+def _normalize_buybot_emoji(value) -> str | None:
+    """Accept one Unicode emoji, including supported multi-codepoint sequences."""
+
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    return candidate if is_emoji(candidate) else None
+
+
+def _get_buybot_emoji(chat_id: int) -> str:
+    return _normalize_buybot_emoji(db.get(_get_buybot_emoji_key(chat_id))) or _BUYBOT_EMOJI
+
+
+def _format_buy_emojis(usd_value: Decimal | None, buy_emoji: str | None = None) -> str:
+    buy_emoji = _normalize_buybot_emoji(buy_emoji) or _BUYBOT_EMOJI
     count = _buy_emoji_count(usd_value)
-    shown = min(count, _BUYBOT_MAX_EMOJIS)
-    emojis = _BUYBOT_EMOJI * shown
+    # Keep compound emoji within the same UTF-16 size budget as the default
+    # flame row, so customization does not overflow Telegram media captions.
+    emoji_units = len(buy_emoji.encode("utf-16-le")) // 2
+    default_units = len(_BUYBOT_EMOJI.encode("utf-16-le")) // 2
+    size_limit = max(1, _BUYBOT_MAX_EMOJIS * default_units // emoji_units)
+    shown = min(count, _BUYBOT_MAX_EMOJIS, size_limit)
+    emojis = html.escape(buy_emoji) * shown
     if count > shown:
         emojis += f" <b>×{count:,}</b>"
     return emojis
@@ -1515,6 +1539,7 @@ def _format_buy_announcement(
     valuation: dict[str, Decimal | None] | None = None,
     badges: list[str] | None = None,
     volume: dict[str, Decimal] | None = None,
+    buy_emoji: str | None = None,
 ) -> str:
     valuation = valuation or {"sui": None, "usd": None}
     volume = volume or {}
@@ -1523,7 +1548,7 @@ def _format_buy_announcement(
     tx_url = f"{SUI_EXPLORER_TX_URL.rstrip('/')}/{event.digest}"
     lines = [
         f"🟢 <b>{symbol} Buy!</b>",
-        _format_buy_emojis(valuation.get("usd")),
+        _format_buy_emojis(valuation.get("usd"), buy_emoji),
         "",
     ]
     badge_text = [
@@ -1627,6 +1652,7 @@ async def _announce_checkpoint_buys(
     all_sent = True
     amount_configs: dict[str, dict] = {}
     minimums_by_chat: dict[int, Decimal | None] = {}
+    emojis_by_chat: dict[int, str] = {}
     for transaction in checkpoint.transactions or []:
         for coin_type, chats in token_chats.items():
             event = detect_buy(transaction, coin_type, SUI_DEX_PACKAGES)
@@ -1681,12 +1707,17 @@ async def _announce_checkpoint_buys(
                     purchase_date,
                     pre_purchase_balance,
                 )
+                if chat_id not in emojis_by_chat:
+                    emojis_by_chat[chat_id] = await asyncio.to_thread(
+                        _get_buybot_emoji, chat_id
+                    )
                 text = _format_buy_announcement(
                     event,
                     amount_configs[coin_type],
                     valuation,
                     badges,
                     display_volume,
+                    buy_emoji=emojis_by_chat[chat_id],
                 )
                 try:
                     await _send_buy_announcement(context, chat_id, text)
@@ -3125,6 +3156,31 @@ async def setbuyimage_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
+async def setemoji_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set the group's buy-size emoji."""
+
+    if update.effective_chat.type not in {"group", "supergroup"}:
+        await update.message.reply_text(
+            "Use /setemoji in the group whose buy announcements you want to customize."
+        )
+        return
+    if not await require_admin(update, context):
+        return
+
+    chat_id = update.effective_chat.id
+    args = context.args or []
+    selected = _normalize_buybot_emoji(args[0]) if len(args) == 1 else None
+    if selected is None:
+        await update.message.reply_text(
+            "❌ Send exactly one Unicode emoji, for example /setemoji 🚀."
+        )
+        return
+
+    await asyncio.to_thread(_track_chat, chat_id)
+    await asyncio.to_thread(db.__setitem__, _get_buybot_emoji_key(chat_id), selected)
+    await update.message.reply_text(f"✅ Buybot emoji set to {selected} for this group.")
+
+
 async def setminbuy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Set, inspect, or remove a group's minimum announced buy value in USD."""
 
@@ -4058,6 +4114,7 @@ async def setup_bot_commands(application):
         BotCommand("settoken", "Set airdrop token (admin)"),
         BotCommand("setbuybot", "Toggle selected-token buy announcements (admin)"),
         BotCommand("setbuyimage", "Set a custom buy image, GIF, or video (admin)"),
+        BotCommand("setemoji", "Set this group's buybot emoji (admin)"),
         BotCommand("setminbuy", "Set minimum announced buy value in USD (admin)"),
         BotCommand("mybadges", "View your earned badges"),
         BotCommand("allbadges", "See all available badges"),
@@ -4164,6 +4221,7 @@ def main():
     application.add_handler(CommandHandler("settoken", settoken_command))
     application.add_handler(CommandHandler("setbuybot", setbuybot_command))
     application.add_handler(CommandHandler("setbuyimage", setbuyimage_command))
+    application.add_handler(CommandHandler("setemoji", setemoji_command))
     application.add_handler(CommandHandler("setminbuy", setminbuy_command))
     application.add_handler(CommandHandler("setwelcome", setwelcome_command))
     application.add_handler(CommandHandler("nameguard", nameguard_command))
