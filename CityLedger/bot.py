@@ -24,6 +24,13 @@ from airdrop_runner import execute_batches, reconcile_batches
 from scoring import contribution_messages, contribution_total, score_transcript, validate_scores
 from buy_tracker import canonicalize_sui_type, detect_buy
 from db import db
+from subscriptions import (
+    has_group_access, initialize_subscriptions, premium_group_feature,
+    require_group_access, subscribe_command, subscription_command,
+    subscription_callback, precheckout_callback, successful_payment_callback,
+    refunded_payment_callback, terms_command, paysupport_command,
+)
+from subscription_updates import BillingUpdateProcessor
 from http_clients import close_shared_async_client, get_shared_async_client
 from sui_service import (
     DEFAULT_SUI_GRPC_URL,
@@ -64,6 +71,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
     ConversationHandler,
+    PreCheckoutQueryHandler,
 )
 from telegram.request import HTTPXRequest
 from telegram_utils import HELP_TEXT, normalize_wallet_address, require_admin, sanitize_html_for_telegram, user_is_admin
@@ -648,6 +656,8 @@ def _persist_message_state(
 
 
 async def store_message_db(context: ContextTypes.DEFAULT_TYPE, chat_id, user_id, username, first_name, last_name, text, date, is_reply, message_id):
+    if not await has_group_access(context, chat_id):
+        return
     try:
         result = await asyncio.to_thread(
             _persist_message_state,
@@ -2389,6 +2399,10 @@ async def check_and_announce_events(context: ContextTypes.DEFAULT_TYPE):
 # --- Core Bot Logic ---
 async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text or update.message.from_user.is_bot: return
+    # Check before inspecting text, migrations, user stats, or message writes.
+    # A cached entitlement keeps free chat traffic off the database hot path.
+    if not await has_group_access(context, update.effective_chat.id):
+        return
     text = update.message.text.strip()
     if text.startswith('/') or len(text.split()) < 3: return
     user = update.message.from_user
@@ -2523,6 +2537,8 @@ async def _parse_date_range(args):
         return None, None, None
 
 async def generate_leaderboard(context: ContextTypes.DEFAULT_TYPE, chat_id, start_date, end_date, start_str, end_str, export=False):
+    if not await has_group_access(context, chat_id):
+        return None, 'Group access is inactive. Use /subscribe in the group.'
     filtered_messages = await asyncio.to_thread(get_messages_by_date_range, chat_id, start_date, end_date)
     if not filtered_messages: return None, "No messages found in this date range."
 
@@ -2531,6 +2547,8 @@ async def generate_leaderboard(context: ContextTypes.DEFAULT_TYPE, chat_id, star
     if not user_messages: return None, "No eligible messages found."
     leaderboard = []
     for user_id, msgs in user_messages.items():
+        if not await has_group_access(context, chat_id):
+            return None, 'Group access expired during scoring. Use /subscribe in the group.'
         username, n = msgs[0]["username"], len(msgs)
         unique, activity_count, active_days = contribution_messages(msgs)
         analysis_text = score_transcript(
@@ -2665,6 +2683,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+@premium_group_feature
 async def score_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update, context):
         return
@@ -2712,6 +2731,7 @@ async def score_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@premium_group_feature
 async def public_score_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update, context):
         return
@@ -2753,6 +2773,7 @@ async def public_score_command(update: Update, context: ContextTypes.DEFAULT_TYP
     await _reply_with_footer(update.message, public_text)
 
 
+@premium_group_feature
 async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generates an AI-powered summary of recent chat activity."""
     if not context.args or not context.args[0].isdigit():
@@ -2812,6 +2833,7 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except (ValueError, IndexError):
         await update.message.reply_text(INVALID_FORMAT_MESSAGE)
 
+@premium_group_feature
 async def bestof_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generates a 'Best Of' digest of recent messages."""
     if not context.args or not context.args[0].isdigit():
@@ -2867,6 +2889,7 @@ async def bestof_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(INVALID_FORMAT_MESSAGE)
 
 
+@premium_group_feature
 async def vibecheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Analyzes the sentiment of recent chat activity."""
     if not context.args or not context.args[0].isdigit():
@@ -2937,6 +2960,7 @@ async def vibecheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(INVALID_FORMAT_MESSAGE)
 
 
+@premium_group_feature
 async def copypasta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generates a copypasta based on the user's message history."""
     user_id = update.effective_user.id
@@ -3008,6 +3032,7 @@ async def nameguard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+@premium_group_feature
 async def setachievements_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Allows admins to toggle achievement tracking on or off."""
     if not await require_admin(update, context):
@@ -3381,6 +3406,7 @@ async def _report_airdrop(message, run):
         await _reply_with_footer(message, chunk)
 
 
+@premium_group_feature
 async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send equal or tiered leaderboard rewards in bounded atomic PTBs."""
     if not await require_admin(update, context):
@@ -3497,6 +3523,7 @@ async def _airdrop_command_locked(update, context):
     await _report_airdrop(update.message, run)
 
 
+@premium_group_feature
 async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Picks a weighted winner from a replied leaderboard and airdrops the prize."""
     if not await require_admin(update, context):
@@ -3670,6 +3697,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply_with_footer(update.message, HELP_TEXT)
 
 
+@premium_group_feature
 async def mybadges_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Displays the user's earned badges."""
     chat_id = update.effective_chat.id
@@ -3707,6 +3735,7 @@ async def allbadges_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply_with_footer(update.message, message)
 
 
+@premium_group_feature
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _track_chat(update.effective_chat.id)
     stats = await asyncio.to_thread(get_chat_stats, update.effective_chat.id)
@@ -3729,6 +3758,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await _reply_with_footer(update.message, stats_text + top_users_text)
 
+@premium_group_feature
 async def mystats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Sends the user their personal stats as a reply in the current chat."""
     chat_id = update.effective_chat.id
@@ -4075,6 +4105,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id != score_params['requester_id']:
             await query.answer('❌ Only the requester can use these buttons.', show_alert=True)
             return
+        if not await require_group_access(update, context, score_params['chat_id']):
+            return
+        if not await user_is_admin(context, score_params['chat_id'], user_id):
+            await query.edit_message_text('❌ Only current group administrators can generate a leaderboard.')
+            return
         await query.edit_message_text('🔍 Generating leaderboard...')
         try:
             result, error = await generate_leaderboard(
@@ -4121,6 +4156,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer('❌ Only the requester can download the CSV.', show_alert=True)
             return
 
+        if not await require_group_access(update, context, leaderboard_data['chat_id']):
+            return
+
         csv_data = leaderboard_data['csv_data']
         raw_data = leaderboard_data['raw_data']
         if not csv_data:
@@ -4139,6 +4177,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def setup_bot_commands(application):
     commands = [
+        BotCommand('subscribe', 'Subscribe this group with Telegram Stars'),
+        BotCommand('subscription', 'Group access and renewal status'),
+        BotCommand('terms', 'Group subscription terms'),
+        BotCommand('paysupport', 'Payment and refund support'),
         BotCommand("start", "Show help and command list"),
         BotCommand("help", "Show help and command list"),
         BotCommand("score", "Generate detailed leaderboard (admin only)"),
@@ -4171,6 +4213,9 @@ async def setup_bot_commands(application):
         BotCommand("cancel", "Cancel current operation")
     ]
     private_commands = [
+        BotCommand('subscription', 'How to manage group subscriptions'),
+        BotCommand('terms', 'Group subscription terms'),
+        BotCommand('paysupport', 'Payment and refund support'),
         BotCommand("start", "Show help and command list"),
         BotCommand("help", "Show help and command list"),
         BotCommand("price", "Crypto price: /price <symbol>"),
@@ -4190,6 +4235,7 @@ async def setup_bot_commands(application):
 
 
 async def initialize_services(application):
+    await initialize_subscriptions(application)
     await setup_bot_commands(application)
     tracker_task = application.bot_data.get("buybot_tracker_task")
     if tracker_task is None or tracker_task.done():
@@ -4217,7 +4263,17 @@ def main():
 
     # Set custom timeouts to make the bot more resilient to network issues
     request = HTTPXRequest(read_timeout=30.0, connect_timeout=30.0)
-    application = Application.builder().token(token).request(request).build()
+    application = Application.builder().token(token).request(request).concurrent_updates(BillingUpdateProcessor()).build()
+
+    # Billing updates must not be consumed by wallet/calendar conversations.
+    application.add_handler(PreCheckoutQueryHandler(precheckout_callback), group=-1)
+    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback), group=-1)
+    application.add_handler(MessageHandler(filters.StatusUpdate.REFUNDED_PAYMENT, refunded_payment_callback), group=-1)
+    application.add_handler(CommandHandler('subscribe', subscribe_command))
+    application.add_handler(CommandHandler('subscription', subscription_command))
+    application.add_handler(CommandHandler('terms', terms_command))
+    application.add_handler(CommandHandler('paysupport', paysupport_command))
+    application.add_handler(CallbackQueryHandler(subscription_callback, pattern=r'^(?:(subscribe|unsubscribe):-[1-9][0-9]*|subagree:-[1-9][0-9]*:[0-9]+:[0-9]+)$'))
 
     job_queue = application.job_queue
     job_queue.run_repeating(check_and_announce_events, interval=datetime.timedelta(minutes=30), first=10)
