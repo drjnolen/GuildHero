@@ -4,6 +4,67 @@ An all-in-one Telegram community management and engagement bot built for crypto-
 
 ## Features
 
+### Group access and subscriptions
+
+Chat tracking and history-dependent features are **off by default**. A group gets
+full access if its numeric ID is in `PREMIUM_WHITELIST_CHAT_IDS` or it has an
+unexpired Telegram Stars subscription. Empty whitelist means no complimentary
+groups. Existing stored history is not deleted by this change.
+
+- **/subscribe** — Show an inline subscription button. A group admin accepts the
+  terms and opens a recurring Stars invoice; one subscription covers one group.
+- **/subscription** — Show the group ID, access status, paid expiration, and a
+  cancel-renewal button restricted to the original payer.
+- **/terms** — Subscription, renewal, message-storage, and AI-data-use terms.
+- **/paysupport** — Contact the operator about payments, refunds, or deletion.
+
+The default is **250 Stars every 30 days**, targeting roughly US$4.99 for the
+buyer. Stars prices vary by platform, country, and taxes; this is not a guaranteed
+USD conversion or the operator's net revenue. Telegram currently requires a
+30-day period for recurring bot invoices. `SUBSCRIPTION_PRICE_STARS` changes the
+price of new orders only; existing renewals retain their saved invoice price.
+See [Telegram Stars payments](https://core.telegram.org/bots/payments-stars) and
+[recurring invoices](https://core.telegram.org/bots/api#createlinvoicelink).
+
+| Without paid/whitelisted access | With paid/whitelisted access |
+| --- | --- |
+| Welcome messages, Name Guard, calendar/events, price lookup, buy tracker/media/emoji, wallet registration/configuration | All free features plus message history, `/summarize`, `/bestof`, `/vibecheck`, `/copypasta`, `/score`, `/publicscore`, `/stats`, `/mystats`, `/mybadges`, achievement tracking, leaderboard CSV exports, `/airdrop` and `/raffle` |
+
+`/airdrop` and `/raffle` are gated because they consume AI-generated leaderboards;
+their existing admin, wallet, and transaction checks remain unchanged. The generic
+`/allbadges` catalog remains available under its existing achievement-toggle rules.
+Free groups still retain configuration, calendar events, wallets, and buy-tracker
+state needed for their free features; these are not ordinary chat-message tracking.
+
+**Before deploying this release:**
+
+1. Add your complimentary groups to the hosting provider's
+   `PREMIUM_WHITELIST_CHAT_IDS` environment secret (comma/whitespace-separated
+   negative numeric group IDs). `/subscription` displays the current group ID.
+   Group names/usernames, private user IDs, and wildcards are not accepted.
+2. Set `PAYMENT_SUPPORT_URL` to a real HTTPS contact page or Telegram support DM
+   such as `https://t.me/YourSupportUsername`. Checkout is disabled until this is
+   set. Review the built-in `/terms` text and ensure you can handle refund and
+   data-deletion requests before taking payments.
+3. Set `SUBSCRIPTION_PRICE_STARS` if you want a price other than 250. Restart after
+   changing configuration; none of these secrets should be committed to Git.
+4. Back up PostgreSQL, deploy, then exercise the checklist in
+   [subscription operations](SUBSCRIPTIONS.md). Three additive billing tables
+   are created at startup; no existing records or toggles are removed.
+
+On expiry the bot stops collecting messages, updating chat stats/badges, and
+running history commands, including old leaderboard buttons. Canceling renewal
+does not remove already-paid access. Previously stored history is retained and
+can be used again after reactivation; messages skipped during an inactive period
+cannot be backfilled. Membership in one paid group never unlocks AI in DMs or
+another group. Whitelisted groups keep full access without a payment lookup.
+
+Access checks use a bounded 60-second cache (including denials) rather than a
+database query per message. Actual expiration is checked on every update; it is
+never extended by the cache. Payment/refund events invalidate the affected group
+immediately in the running process. Other replicas can take up to 60 seconds to
+observe a change; operate this polling bot as one replica.
+
 ### 🤖 AI Analysis
 - **/summarize** `<#>` `[topic]` — AI-powered summary of recent chat messages, optionally filtered by topic
 - **/bestof** `<#>` — Curated digest of the best messages (Most Humorous, Most Degen, Best Alpha, Most Helpful)
