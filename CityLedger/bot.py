@@ -4195,7 +4195,12 @@ async def setup_bot_commands(application):
 
 
 async def initialize_services(application):
-    await initialize_subscriptions(application)
+    try:
+        await initialize_subscriptions(application)
+    except Exception:
+        # Billing configuration/schema failures must not disable independent
+        # services such as buy announcements. Access checks still fail closed.
+        logging.exception('Subscription initialization failed; continuing with independent bot services')
     await setup_bot_commands(application)
     tracker_task = application.bot_data.get("buybot_tracker_task")
     if tracker_task is None or tracker_task.done():

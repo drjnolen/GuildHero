@@ -1347,6 +1347,19 @@ class TestMessagePersistenceHotPath(unittest.TestCase):
 
 
 class TestPremiumFeatureGates(unittest.IsolatedAsyncioTestCase):
+    async def test_buy_tracker_starts_when_subscription_setup_fails(self):
+        for error in (ValueError('invalid subscription configuration'), RuntimeError('billing schema unavailable')):
+            with self.subTest(error=error), \
+                    patch.object(bot, 'initialize_subscriptions', AsyncMock(side_effect=error)), \
+                    patch.object(bot, 'setup_bot_commands', AsyncMock()) as commands, \
+                    patch.object(bot, 'run_sui_buy_tracker', AsyncMock()) as tracker:
+                application = SimpleNamespace(bot_data={})
+                with self.assertLogs(level='ERROR'):
+                    await bot.initialize_services(application)
+                await application.bot_data['buybot_tracker_task']
+                commands.assert_awaited_once_with(application)
+                tracker.assert_awaited_once_with(application)
+
     def update(self):
         message = SimpleNamespace(
             text='normal group chat message', from_user=SimpleNamespace(is_bot=False),
