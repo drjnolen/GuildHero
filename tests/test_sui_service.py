@@ -87,6 +87,44 @@ class SuiServiceHelpersTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_stream_failure_polls_then_resumes_subscription(self):
+        async def exercise():
+            service = SuiGrpcService("https://example.invalid")
+            service._request = AsyncMock(side_effect=[
+                RuntimeError("Sui SDK request failed: terminated"),
+                {"sequenceNumber": "61"},
+                {"sequenceNumber": "61", "transactions": [{"digest": "polled"}]},
+                {"checkpoints": [{"sequenceNumber": "62", "transactions": []}]},
+            ])
+            with patch("CityLedger.sui_service.asyncio.sleep", new_callable=AsyncMock) as sleep:
+                checkpoints = await service.get_subscribed_checkpoints()
+                sleep.assert_awaited_once_with(5.0)
+            self.assertEqual(checkpoints[0].sequence_number, 61)
+            self.assertEqual(checkpoints[0].transactions[0]["digest"], "polled")
+            resumed = await service.get_subscribed_checkpoints()
+            self.assertEqual(resumed[0].sequence_number, 62)
+            self.assertEqual([call.args[0] for call in service._request.await_args_list],
+                             ["subscribedCheckpoints", "latestCheckpoint", "checkpoint", "subscribedCheckpoints"])
+        asyncio.run(exercise())
+
+    def test_stream_cancellation_does_not_poll(self):
+        async def exercise():
+            service = SuiGrpcService("https://example.invalid")
+            service._request = AsyncMock(side_effect=asyncio.CancelledError)
+            with self.assertRaises(asyncio.CancelledError):
+                await service.get_subscribed_checkpoints()
+            self.assertEqual(service._request.await_count, 1)
+        asyncio.run(exercise())
+
+    def test_polling_failure_is_reported_for_outer_backoff(self):
+        async def exercise():
+            service = SuiGrpcService("https://example.invalid")
+            service._request = AsyncMock(side_effect=[RuntimeError("terminated"), RuntimeError("offline")])
+            with patch("CityLedger.sui_service.asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaisesRegex(RuntimeError, "offline"):
+                    await service.get_subscribed_checkpoints()
+        asyncio.run(exercise())
+
     def test_request_timeout_restarts_stuck_bridge(self):
         async def exercise():
             service = SuiGrpcService("https://example.invalid")

@@ -35,6 +35,7 @@ const SUBSCRIPTION_BATCH_LIMIT = 100;
 const SUBSCRIPTION_QUEUE_LIMIT = 500;
 const SUBSCRIPTION_WAIT_LIMIT_MS = 5_000;
 const checkpointSubscriptionStates = new WeakMap();
+const pendingTransferResults = new WeakMap();
 
 function requiredString(value, name) {
   if (typeof value !== 'string' || value.trim() === '') {
@@ -113,10 +114,10 @@ function createCheckpointSubscription(client) {
     error: null,
     pump: null,
   };
-  checkpointSubscriptionStates.set(client, state);
   const call = client.subscriptionService.subscribeCheckpoints({
     readMask: CHECKPOINT_READ_MASK,
   });
+  checkpointSubscriptionStates.set(client, state);
 
   state.pump = (async () => {
     try {
@@ -145,10 +146,6 @@ function createCheckpointSubscription(client) {
       for (const waiter of state.waiters.splice(0)) {
         clearTimeout(waiter.timer);
         waiter.reject(error);
-      }
-    } finally {
-      if (checkpointSubscriptionStates.get(client) === state) {
-        checkpointSubscriptionStates.delete(client);
       }
     }
   })();
@@ -180,7 +177,14 @@ async function getSubscribedCheckpoints(client, maxItems, waitMs) {
   const state =
     checkpointSubscriptionStates.get(client) ??
     createCheckpointSubscription(client);
-  const first = await waitForSubscribedCheckpoint(state, waitMs);
+  let first;
+  try {
+    first = await waitForSubscribedCheckpoint(state, waitMs);
+  } catch (error) {
+    // Drain buffered checkpoints before discarding a disconnected stream.
+    checkpointSubscriptionStates.delete(client);
+    throw error;
+  }
   if (!first) {
     return [];
   }
@@ -195,7 +199,15 @@ async function getSubscribedCheckpoints(client, maxItems, waitMs) {
 }
 
 export function sanitizeError(error) {
-  const message = error instanceof Error ? error.message : String(error);
+  const raw = error instanceof Error ? error.message : String(error);
+  // Decode valid runs even when the provider truncates a percent escape.
+  const message = raw.replace(/(?:%[0-9a-f]{2})+/gi, (encoded) => {
+    try {
+      return decodeURIComponent(encoded);
+    } catch {
+      return encoded;
+    }
+  });
   return message
     .replace(/suiprivkey1[0-9a-z]+/gi, '[redacted private key]')
     .replace(/\b[0-9a-f]{64}\b/gi, '[redacted 32-byte value]')
@@ -410,6 +422,15 @@ export async function handleRequest(request, client) {
       };
     }
     case 'transfer': {
+      const pending = pendingTransferResults.get(client);
+      if (pending) {
+        try {
+          await client.waitForTransaction({ result: pending, timeout: 10_000 });
+          pendingTransferResults.delete(client);
+        } catch {
+          throw new Error('Previous transfer is still awaiting indexing; this transfer was not submitted.');
+        }
+      }
       const keypair = keypairFromPrivateKeyHex(params.privateKeyHex);
       const transaction = buildTransferTransaction(params);
 
@@ -418,6 +439,16 @@ export async function handleRequest(request, client) {
         client,
       });
       const executed = result.Transaction ?? result.FailedTransaction;
+      if (executed?.digest) {
+        pendingTransferResults.set(client, result);
+        try {
+          await client.waitForTransaction({ result, timeout: 10_000 });
+          pendingTransferResults.delete(client);
+        } catch {
+          // Execution already finished. Preserve its outcome and block the next
+          // send until indexing catches up instead of inviting a duplicate payout.
+        }
+      }
       if (!executed?.status?.success) {
         throw new Error(
           `Transaction failed: ${executed?.status?.error?.message ?? 'unknown execution error'}`,

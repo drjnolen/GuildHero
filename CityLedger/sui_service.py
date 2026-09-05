@@ -240,14 +240,22 @@ class SuiGrpcService:
     ) -> list[SuiCheckpoint]:
         """Drain finalized checkpoints from the official live gRPC stream."""
 
-        result = await self._request(
-            "subscribedCheckpoints",
-            {
-                "maxItems": int(max_items),
-                "waitMs": int(wait_ms),
-            },
-            timeout=max(15.0, (int(wait_ms) / 1_000) + 5.0),
-        )
+        try:
+            result = await self._request(
+                "subscribedCheckpoints",
+                {
+                    "maxItems": int(max_items),
+                    "waitMs": int(wait_ms),
+                },
+                timeout=max(15.0, (int(wait_ms) / 1_000) + 5.0),
+            )
+        except RuntimeError as exc:
+            logging.warning("Sui checkpoint stream unavailable; polling before reconnect: %s", exc)
+            # Keep live gap recovery and historical scanning running even when
+            # the provider repeatedly closes its streaming connection.
+            await asyncio.sleep(5.0)
+            latest = await self.get_latest_checkpoint()
+            return [await self.get_checkpoint(latest.sequence_number)]
         return [
             self._checkpoint_from_result(checkpoint)
             for checkpoint in result.get("checkpoints") or []
