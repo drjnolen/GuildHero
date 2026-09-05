@@ -71,6 +71,10 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
+# HTTP request URLs include the Telegram bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 # Conversation states
 SELECTING_ACTION, AWAITING_EVENT_TEXT, AWAITING_WALLET, AWAITING_AIRDROP_PRIVATE_KEY = range(4)
 

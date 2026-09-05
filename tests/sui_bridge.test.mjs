@@ -381,3 +381,97 @@ test('redacts private key material in errors', () => {
   assert.doesNotMatch(sanitized, /verysecret/);
   assert.match(sanitized, /redacted/);
 });
+
+test('decodes truncated provider errors before redaction', () => {
+  assert.equal(sanitizeError(new Error('Error%20checking%20objects%2')), 'Error checking objects%2');
+  assert.doesNotMatch(sanitizeError(new Error('suiprivkey1%61%62%63')), /suiprivkey1/);
+});
+
+test('drains buffered checkpoints after termination before reconnecting', async () => {
+  let connections = 0;
+  const client = { subscriptionService: { subscribeCheckpoints() {
+    connections++;
+    return { responses: { async *[Symbol.asyncIterator]() {
+      for (const sequenceNumber of [301n, 302n, 303n]) {
+        yield { checkpoint: { sequenceNumber, transactions: [] } };
+      }
+      throw new Error('terminated');
+    } } };
+  } } };
+  const request = { method: 'subscribedCheckpoints', params: { maxItems: 1, waitMs: 100 } };
+  for (const expected of ['301', '302', '303']) {
+    const result = await handleRequest(request, client);
+    assert.equal(result.checkpoints[0].sequenceNumber, expected);
+  }
+  assert.equal(connections, 1);
+  await assert.rejects(handleRequest(request, client), /terminated/);
+  assert.equal((await handleRequest(request, client)).checkpoints[0].sequenceNumber, '301');
+  assert.equal(connections, 2);
+});
+
+const transferRequest = { method: 'transfer', params: {
+  privateKeyHex: '1'.repeat(64), recipient: '0x1', amount: '1',
+  coinType: '0x2::sui::SUI', gasBudget: '50000000',
+} };
+
+test('waits for indexing before returning a successful transfer', async (t) => {
+  const result = { Transaction: { digest: 'paid', status: { success: true } } };
+  t.mock.method(Object.getPrototypeOf(keypairFromPrivateKeyHex('1'.repeat(64))),
+    'signAndExecuteTransaction', async () => result);
+  let release;
+  let entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  const client = { waitForTransaction: async (options) => {
+    assert.equal(options.result, result);
+    entered();
+    await new Promise(resolve => { release = resolve; });
+  } };
+  let completed = false;
+  const transfer = handleRequest(transferRequest, client).then(value => { completed = true; return value; });
+  await started;
+  assert.equal(completed, false);
+  release();
+  assert.deepEqual(await transfer, { digest: 'paid' });
+});
+
+test('indexing timeout preserves success and blocks new sends until recovery', async (t) => {
+  let sends = 0;
+  t.mock.method(Object.getPrototypeOf(keypairFromPrivateKeyHex('1'.repeat(64))),
+    'signAndExecuteTransaction', async () => {
+      sends++;
+      return { Transaction: { digest: `paid-${sends}`, status: { success: true } } };
+    });
+  let indexed = false;
+  const client = { waitForTransaction: async () => {
+    if (!indexed) throw new Error('timeout');
+  } };
+  assert.deepEqual(await handleRequest(transferRequest, client), { digest: 'paid-1' });
+  await assert.rejects(handleRequest(transferRequest, client), /not submitted/);
+  assert.equal(sends, 1);
+  indexed = true;
+  assert.deepEqual(await handleRequest(transferRequest, client), { digest: 'paid-2' });
+  assert.equal(sends, 2);
+});
+
+test('does not retry an ambiguous submission failure', async (t) => {
+  let sends = 0;
+  t.mock.method(Object.getPrototypeOf(keypairFromPrivateKeyHex('1'.repeat(64))),
+    'signAndExecuteTransaction', async () => { sends++; throw new Error('network timeout'); });
+  await assert.rejects(handleRequest(transferRequest, {}), /network timeout/);
+  assert.equal(sends, 1);
+});
+
+test('retries subscription creation after a synchronous transport error', async () => {
+  let attempts = 0;
+  const client = { subscriptionService: { subscribeCheckpoints() {
+    attempts++;
+    if (attempts === 1) throw new Error('transport unavailable');
+    return { responses: { async *[Symbol.asyncIterator]() {
+      yield { checkpoint: { sequenceNumber: 401n, transactions: [] } };
+    } } };
+  } } };
+  const request = { method: 'subscribedCheckpoints', params: { waitMs: 100 } };
+  await assert.rejects(handleRequest(request, client), /transport unavailable/);
+  assert.equal((await handleRequest(request, client)).checkpoints[0].sequenceNumber, '401');
+  assert.equal(attempts, 2);
+});
