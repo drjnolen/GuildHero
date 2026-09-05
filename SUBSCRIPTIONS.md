@@ -16,6 +16,12 @@ backups. New ordinary messages are ignored before text inspection, migration, or
 history/stat writes when access is inactive. Private ordinary messages are also
 ignored; explicit wallet and configuration conversations continue to work.
 
+Subscription initialization errors are logged without preventing independent
+services, including the buy tracker, from starting. Fix the billing configuration
+or schema error and restart to restore billing. Buybot commands and announcements
+do not consult group subscription status; unpaid groups need no whitelist entry
+to retain their buybot settings and announcements.
+
 All AI commands, chat stats/badges, leaderboard exports, and leaderboard-based
 airdrop/raffle operations check the source group's access. Expiration is rechecked
 between users during long scoring jobs. Work already submitted to the AI provider
