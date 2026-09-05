@@ -49,11 +49,18 @@ Thanks for your interest in contributing!  This guide covers how to set up the p
 
 ```bash
 python -m unittest discover -s tests -v
+python -m unittest discover -s billing_tests -v
 npm run check:sui
 npm run test:sui
 ```
 
 Tests live in the `tests/` directory. They mock all external services (database, OpenAI, Telegram API, and Sui) and run fully offline.
+
+Run `billing_tests/` separately: it uses real Telegram SDK types with mocked I/O.
+Set `TEST_DATABASE_URL` to a disposable PostgreSQL database for its transaction
+tests, or leave it unset to skip those tests locally. GitHub Actions runs them
+against PostgreSQL 16. See [SUBSCRIPTIONS.md](SUBSCRIPTIONS.md) for billing rollout
+and Telegram test-environment checks.
 
 ---
 

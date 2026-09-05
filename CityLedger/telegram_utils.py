@@ -7,6 +7,13 @@ from telegram import Update
 
 HELP_TEXT = (
     "Hello! I'm an all-in-one community management and leaderboard bot. Here's what I can do:\n\n"
+    "<b>⭐ Group Access</b>\n"
+    "Chat tracking, AI analysis, stats, badge progress, and leaderboard-based rewards require an active group subscription or operator whitelist.\n"
+    "/subscribe - An admin can subscribe for the whole group with Stars.\n"
+    "/subscription - View this group's ID, access, and renewal status.\n"
+    "/terms - Read subscription and data-use terms.\n"
+    "/paysupport - Contact the operator about payments or refunds.\n"
+    "New chat history is collected only while access is active. Ordinary private messages are not tracked.\n\n"
     "<b>🤖 AI Analysis</b>\n"
     "/summarize &lt;number&gt; - Get an AI summary of the last number of messages.\n"
     "/bestof &lt;number&gt; - See the best messages from the last number of posts.\n"

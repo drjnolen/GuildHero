@@ -1283,8 +1283,9 @@ class TestBoundedAITranscripts(unittest.TestCase):
                     "01/01/2024",
                     "01/02/2024",
                 )
-                await bot.generate_leaderboard(*args)
-                await bot.generate_leaderboard(*args)
+                with patch.object(bot, 'has_group_access', AsyncMock(return_value=True)):
+                    await bot.generate_leaderboard(*args)
+                    await bot.generate_leaderboard(*args)
             finally:
                 bot.get_messages_by_date_range = original_messages
                 bot.analyze_user_messages = original_analyze
@@ -1343,6 +1344,100 @@ class TestMessagePersistenceHotPath(unittest.TestCase):
         fake_db.has_messages.assert_not_called()
         fake_db.get.assert_not_called()
         fake_db.enroll_chat.assert_not_called()
+
+
+class TestPremiumFeatureGates(unittest.IsolatedAsyncioTestCase):
+    async def test_buy_tracker_starts_when_subscription_setup_fails(self):
+        for error in (ValueError('invalid subscription configuration'), RuntimeError('billing schema unavailable')):
+            with self.subTest(error=error), \
+                    patch.object(bot, 'initialize_subscriptions', AsyncMock(side_effect=error)), \
+                    patch.object(bot, 'setup_bot_commands', AsyncMock()) as commands, \
+                    patch.object(bot, 'run_sui_buy_tracker', AsyncMock()) as tracker:
+                application = SimpleNamespace(bot_data={})
+                with self.assertLogs(level='ERROR'):
+                    await bot.initialize_services(application)
+                await application.bot_data['buybot_tracker_task']
+                commands.assert_awaited_once_with(application)
+                tracker.assert_awaited_once_with(application)
+
+    def update(self):
+        message = SimpleNamespace(
+            text='normal group chat message', from_user=SimpleNamespace(is_bot=False),
+            reply_text=AsyncMock(),
+        )
+        return SimpleNamespace(
+            effective_chat=SimpleNamespace(id=-100), effective_message=message,
+            message=message, effective_user=SimpleNamespace(id=7),
+        )
+
+    async def test_free_chat_does_not_persist_or_scan_message_text(self):
+        update = self.update()
+        update.message.text = MagicMock()
+        with patch.object(bot, 'has_group_access', AsyncMock(return_value=False)), \
+                patch.object(bot, 'store_message_db', AsyncMock()) as persist:
+            await bot.store_message(update, SimpleNamespace())
+        persist.assert_not_awaited()
+        update.message.text.strip.assert_not_called()
+        update.message.reply_text.assert_not_awaited()
+
+    async def test_storage_entry_point_also_denies_inactive_groups(self):
+        with patch.object(bot, 'has_group_access', AsyncMock(return_value=False)), \
+                patch.object(bot, '_persist_message_state') as persist:
+            await bot.store_message_db(SimpleNamespace(), -100, 7, 'user', 'User', None, 'text', None, False, 1)
+        persist.assert_not_called()
+
+    async def test_history_commands_stop_before_database_admin_checks_or_ai(self):
+        import subscriptions
+        commands = (
+            bot.score_command, bot.public_score_command, bot.summarize_command,
+            bot.bestof_command, bot.vibecheck_command, bot.copypasta_command,
+            bot.stats_command, bot.mystats_command, bot.mybadges_command,
+            bot.setachievements_command, bot.airdrop_command, bot.raffle_command,
+        )
+        for command in commands:
+            with self.subTest(command=command.__name__), \
+                    patch.object(subscriptions, 'has_group_access', AsyncMock(return_value=False)), \
+                    patch.object(bot, 'db') as database, \
+                    patch.object(bot, 'require_admin', AsyncMock()) as admin:
+                update = self.update()
+                context = SimpleNamespace(bot_data={
+                    'group_access': SimpleNamespace(config=SimpleNamespace(stars=250))
+                })
+                await command(update, context)
+                database.assert_not_called()
+                self.assertEqual(database.mock_calls, [])
+                admin.assert_not_awaited()
+                update.message.reply_text.assert_awaited_once()
+                self.assertIn('reply_markup', update.message.reply_text.call_args.kwargs)
+
+    async def test_existing_score_buttons_cannot_bypass_expired_access(self):
+        for prefix, state_key, state in (
+            ('score_private_', 'score_requests', dict(requester_id=7, chat_id=-100)),
+            ('export_csv_', 'score_results', dict(requester_id=7, chat_id=-100)),
+        ):
+            update = self.update()
+            update.callback_query = SimpleNamespace(
+                data=prefix + 'token', from_user=SimpleNamespace(id=7),
+                answer=AsyncMock(), edit_message_text=AsyncMock(),
+            )
+            context = SimpleNamespace(application=SimpleNamespace(bot_data={state_key: {'token': state}}))
+            with patch.object(bot, 'require_group_access', AsyncMock(return_value=False)) as gate, \
+                    patch.object(bot, 'generate_leaderboard', AsyncMock()) as score, \
+                    patch.object(bot, 'generate_csv_from_leaderboard', AsyncMock()) as export:
+                await bot.button_callback(update, context)
+                gate.assert_awaited_once_with(update, context, -100)
+                score.assert_not_awaited()
+                export.assert_not_awaited()
+
+    async def test_expiry_stops_remaining_user_scoring_calls(self):
+        messages = [dict(user_id=7, username='u', text='hello', is_reply=False)]
+        with patch.object(bot, 'has_group_access', AsyncMock(side_effect=[True, False])), \
+                patch.object(bot, 'get_messages_by_date_range', return_value=messages), \
+                patch.object(bot, 'analyze_user_messages') as analyze:
+            result, error = await bot.generate_leaderboard(SimpleNamespace(), -100, None, None, '', '')
+        self.assertIsNone(result)
+        self.assertIn('expired', error)
+        analyze.assert_not_called()
 
 
 class TestBuyBotRuntimeEfficiency(unittest.TestCase):
