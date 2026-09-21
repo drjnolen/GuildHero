@@ -1557,7 +1557,6 @@ def _format_buy_announcement(
     valuation = valuation or {"sui": None, "usd": None}
     volume = volume or {}
     symbol = html.escape(amount_config["symbol"])
-    digest = html.escape(event.digest)
     tx_url = f"{SUI_EXPLORER_TX_URL.rstrip('/')}/{event.digest}"
     lines = [
         f"🟢 <b>{symbol} Buy!</b>",
@@ -1586,13 +1585,8 @@ def _format_buy_announcement(
     )
     if event.sender and event.sender.lower() != event.wallet.lower():
         lines.append(f"<b>Transaction sender:</b> {_wallet_link(event.sender)}")
-    lines.extend(
-        [
-            f'<a href="{html.escape(tx_url, quote=True)}">View transaction</a>',
-            f"<code>{digest}</code>",
-        ]
-    )
-    return "\n".join(lines) + FOOTER_HTML
+    lines.append(f'<a href="{html.escape(tx_url, quote=True)}">View transaction</a>')
+    return "\n".join(lines) + '\n\n<a href="https://alphacity.tech">Alphacity.tech</a>'
 
 
 async def _send_buy_announcement(context, chat_id: int, text: str) -> None:
