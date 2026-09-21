@@ -319,6 +319,51 @@ export function buildTransferTransaction(params) {
   return transaction;
 }
 
+export function buildBatchTransferTransaction(params) {
+  if (!Array.isArray(params.recipients) || !params.recipients.length || params.recipients.length > 25) {
+    throw new Error('A batch must contain 1 to 25 recipients.');
+  }
+  const transaction = new Transaction();
+  let total = 0n;
+  for (const item of params.recipients) {
+    const recipient = requiredString(item.recipient, 'recipient');
+    if (!/^0x[0-9a-f]{64}$/i.test(recipient)) throw new Error('Invalid recipient address.');
+    const amount = requiredUnsignedInteger(item.amount, 'amount');
+    total += amount;
+    if (total > (1n << 64n) - 1n) throw new Error('Batch total exceeds u64.');
+    transaction.transferObjects([
+      transaction.coin({ balance: amount, type: requiredString(params.coinType, 'coinType') }),
+    ], recipient);
+  }
+  // Leave gas estimation to the SDK; preparation enforces the configured cap.
+  return transaction;
+}
+
+async function waitForPreviousTransfer(client) {
+  const pending = pendingTransferResults.get(client);
+  if (!pending) return;
+  try {
+    await client.waitForTransaction({ result: pending, timeout: 10_000 });
+    pendingTransferResults.delete(client);
+  } catch {
+    throw new Error('Previous transfer is still awaiting indexing; this transfer was not submitted.');
+  }
+}
+
+async function recordExecution(result, client) {
+  const executed = result.Transaction ?? result.FailedTransaction;
+  if (!executed?.digest) throw new Error('Missing transaction outcome. Check the saved digest before retrying.');
+  pendingTransferResults.set(client, result);
+  try {
+    await client.waitForTransaction({ result, timeout: 10_000 });
+    pendingTransferResults.delete(client);
+  } catch {
+    // Preserve a known execution outcome despite indexing delays.
+  }
+  return { digest: executed.digest, success: executed.status.success,
+    error: executed.status.error?.message ?? null };
+}
+
 export function keypairFromPrivateKeyHex(privateKeyHex) {
   const normalized = requiredString(privateKeyHex, 'privateKeyHex');
   if (!/^[0-9a-f]{64}$/i.test(normalized)) {
@@ -420,6 +465,38 @@ export async function handleRequest(request, client) {
             }
           : null,
       };
+    }
+    case 'prepareBatch': {
+      await waitForPreviousTransfer(client);
+      const keypair = keypairFromPrivateKeyHex(params.privateKeyHex);
+      const transaction = buildBatchTransferTransaction(params);
+      transaction.setSender(keypair.toSuiAddress());
+      const bytes = await transaction.build({ client });
+      const budget = BigInt(transaction.getData().gasData.budget);
+      if (budget > requiredUnsignedInteger(params.gasBudget, 'gasBudget')) {
+        throw new Error('Estimated batch gas exceeds SUI_GAS_BUDGET; no transfer submitted.');
+      }
+      const simulation = await client.simulateTransaction({ transaction: bytes });
+      const simulated = simulation.Transaction ?? simulation.FailedTransaction;
+      if (!simulated?.status?.success) {
+        throw new Error(`Batch simulation failed: ${simulated?.status?.error?.message ?? 'unknown error'}`);
+      }
+      const { signature } = await keypair.signTransaction(bytes);
+      return { bytes: Buffer.from(bytes).toString('base64'), signature,
+        digest: await transaction.getDigest(), gasBudget: budget.toString() };
+    }
+    case 'executeBatch': {
+      const result = await client.executeTransaction({
+        transaction: Buffer.from(requiredString(params.bytes, 'bytes'), 'base64'),
+        signatures: [requiredString(params.signature, 'signature')],
+      });
+      return recordExecution(result, client);
+    }
+    case 'transactionStatus': {
+      const result = await client.waitForTransaction({
+        digest: requiredString(params.digest, 'digest'), timeout: 10_000,
+      });
+      return recordExecution(result, client);
     }
     case 'transfer': {
       const pending = pendingTransferResults.get(client);

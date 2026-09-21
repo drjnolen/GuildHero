@@ -81,7 +81,7 @@ pip install -r requirements.txt
 | `AIRDROP_ENCRYPTION_KEY` | No | 32-byte hex key used to encrypt per-group airdrop private keys at rest (required for `/setairdropwallet`) |
 | `SUI_GRPC_URL` | No | Sui gRPC v2 endpoint (defaults to `https://fullnode.mainnet.sui.io:443`) |
 | `SUI_GRPC_HEADERS_JSON` | No | JSON object containing provider headers such as an API key |
-| `SUI_GAS_BUDGET` | No | Maximum gas budget per airdrop transfer in MIST (default: `50000000`) |
+| `SUI_GAS_BUDGET` | No | Maximum gas budget per airdrop batch (or raffle transfer) in MIST (default: `50000000`) |
 | `SUI_EXPLORER_TX_URL` | No | Explorer transaction URL prefix used in buy announcements |
 | `SUI_EXPLORER_ADDRESS_URL` | No | Explorer account URL prefix used for buyer and sender links |
 | `BUYBOT_WHALE_USD_THRESHOLD` | No | USD purchase value that earns the Whale Buy badge (default: `100`) |
@@ -107,6 +107,19 @@ python main.py
 ### SUI Airdrop Setup
 
 The `/airdrop` command uses Mysten's official TypeScript SDK, Sui gRPC v2, and programmable transaction blocks. The SDK's `tx.coin()` intent draws from the sender's address balance and owned coin objects, then transfers the selected token to each recipient. **No custom smart contract or Move package needs to be deployed.**
+
+Airdrops use up to 25 recipients per atomic PTB, with simulation and SDK gas estimation capped by `SUI_GAS_BUDGET`. Balance preflight reserves that cap per batch, not per recipient. Batches execute sequentially and wait for indexing between transactions. Each batch has one shared transaction digest; if it fails onchain, none of its recipients are paid (gas may still be charged).
+
+Reply to a `/score` leaderboard:
+
+- `/airdrop 10 10000` — 10,000 tokens each for ranks 1–10.
+- `/airdrop 1-5:30k 6-10:15k` — 30,000 each for ranks 1–5, 15,000 each for ranks 6–10.
+- `/airdrop 1:50k 2-5:30k 6-10:15k` — a separate first-place prize.
+- `/airdrop status` or `/airdrop status <id>` — reconcile and display saved receipts; never sends or resumes payments.
+
+Amounts support decimal notation and `k`/`m` suffixes (thousand/million), using the token's decimals. Tiers must be consecutive, ordered, and start at rank 1, up to rank 1,000. Only ranks present in the leaderboard are selected. Missing/invalid wallets are skipped without promoting lower ranks or reallocating rewards.
+
+Batch membership, amounts, sender, and transaction digests are saved to PostgreSQL. Digests are stored before submission; signatures and private keys are not stored in the run journal. On a failure or uncertain submission, processing stops and remaining batches stay unsent. Status checks look up the original digest instead of retrying payment. An unresolved batch blocks new airdrops in that group until it is confirmed or an operator reconciles the saved record against the chain. A crash between saving a digest and submitting may therefore require operator intervention. There is no automatic resume; a fresh command is a new payout, so inspect prior receipts first. Run a single bot instance per sender wallet; locks do not coordinate independent deployments.
 
 To enable airdrops:
 

@@ -1571,5 +1571,82 @@ class TestFormatDetailedLeaderboard(unittest.TestCase):
         self.assertIn("Leaderboard", text)
 
 
+class TestBatchedAirdropCommand(unittest.IsolatedAsyncioTestCase):
+    async def test_tiered_command_preserves_ranks_when_wallet_is_missing(self):
+        leaderboard = [(f"user{i}", {}, 1, str(i)) for i in range(1, 11)]
+        store = {}
+        message = SimpleNamespace(message_id=101, reply_to_message=SimpleNamespace(message_id=99),
+                                  reply_text=AsyncMock())
+        update = SimpleNamespace(effective_chat=SimpleNamespace(id=42), message=message)
+        context = SimpleNamespace(args=['1-5:30k', '6-10:15k'],
+                                  application=SimpleNamespace(bot_data={}))
+        service = AsyncMock()
+        service.transfer_batch.return_value = {'success': True, 'digest': 'batch-digest'}
+        wallets = lambda chat, user: None if user == 3 else {'wallet_address': '0x' + f'{user:064x}'}
+        with patch.object(bot, 'db', store), \
+             patch.object(bot, 'get_sui_service', return_value=service), \
+             patch.object(bot, 'require_admin', new=AsyncMock(return_value=True)), \
+             patch.object(bot, '_get_leaderboard_messages', return_value={(42, 99): leaderboard}), \
+             patch.object(bot, 'get_coin_amount_config', new=AsyncMock(return_value={'decimals': 9, 'symbol': 'TOKEN'})), \
+             patch.object(bot, 'get_wallet', side_effect=wallets), \
+             patch.object(bot, 'resolve_airdrop_sender', return_value={'wallet_address': 'sender', 'private_key_hex': 'secret'}), \
+             patch.object(bot, 'preflight_airdrop', new=AsyncMock()) as preflight, \
+             patch.object(bot, '_report_airdrop', new=AsyncMock()):
+            await bot.airdrop_command(update, context)
+            recipients = service.transfer_batch.await_args.args[0]
+            self.assertEqual([item['rank'] for item in recipients], [1, 2, 4, 5, 6, 7, 8, 9, 10])
+            self.assertEqual(int(recipients[3]['amount']), 30000 * 10**9)
+            self.assertEqual(int(recipients[4]['amount']), 15000 * 10**9)
+            self.assertEqual(preflight.await_args.kwargs['total_amount'], 195000 * 10**9)
+            self.assertEqual(preflight.await_args.kwargs['batch_count'], 1)
+            # Redelivery of the same Telegram command displays its saved result.
+            await bot.airdrop_command(update, context)
+            self.assertEqual(service.transfer_batch.await_count, 1)
+        self.assertEqual(store['airdrop_run:42:101']['batches'][0]['status'], 'sent')
+
+    async def test_unconfirmed_previous_batch_blocks_new_payout(self):
+        store = {'airdrop_latest:42': '100', 'airdrop_run:42:100': {
+            'batches': [{'status': 'unknown', 'digest': 'unconfirmed'}]}}
+        message = SimpleNamespace(message_id=101, reply_to_message=SimpleNamespace(message_id=99),
+                                  reply_text=AsyncMock())
+        update = SimpleNamespace(effective_chat=SimpleNamespace(id=42), message=message)
+        context = SimpleNamespace(args=['10', '10000'], application=SimpleNamespace(bot_data={}))
+        service = AsyncMock()
+        service.transaction_status.side_effect = RuntimeError('not found')
+        with patch.object(bot, 'db', store), \
+             patch.object(bot, 'get_sui_service', return_value=service), \
+             patch.object(bot, 'require_admin', new=AsyncMock(return_value=True)), \
+             patch.object(bot, '_get_leaderboard_messages', return_value={(42, 99): [('user', {}, 1, '1')]}):
+            await bot.airdrop_command(update, context)
+        service.transfer_batch.assert_not_called()
+        self.assertIn('unconfirmed batch', message.reply_text.await_args.args[0])
+
+    async def test_large_report_is_split_at_complete_lines(self):
+        run = {'id': '1', 'coin_type': 'coin', 'decimals': 0, 'symbol': 'T', 'skipped': [],
+               'batches': [{'status': 'sent', 'digest': str(i), 'recipients': [
+                   {'rank': i * 25 + n, 'username': 'name<&', 'amount': '30'} for n in range(25)]}
+                   for i in range(40)]}
+        with patch.object(bot, '_reply_with_footer', new=AsyncMock()) as reply, \
+             patch.object(bot, 'format_token_amount', side_effect=lambda amount, decimals: str(amount)):
+            await bot._report_airdrop(None, run)
+        self.assertGreater(reply.await_count, 1)
+        texts = [call.args[1] for call in reply.await_args_list]
+        self.assertTrue(all(len(text) <= 3401 for text in texts))
+        self.assertIn('name&lt;&amp;', ''.join(texts))
+        self.assertIn('Confirmed total: 30000 T', ''.join(texts))
+
+    async def test_batch_preflight_reserves_gas_per_batch(self):
+        with patch.object(bot, 'sui_get_total_balance', new=AsyncMock(return_value=10**15)), \
+             patch.object(bot, 'SUI_GAS_BUDGET', 50):
+            result = await bot.preflight_airdrop('sender', 30, 0, bot.DEFAULT_SUI_COIN_TYPE,
+                                                total_amount=450, batch_count=2)
+            self.assertEqual(result['required_sui_balance'], 550)
+            self.assertEqual(result['required_token_balance'], 0)
+            result = await bot.preflight_airdrop('sender', 30, 0, 'custom',
+                                                total_amount=450, batch_count=2)
+            self.assertEqual(result['required_sui_balance'], 100)
+            self.assertEqual(result['required_token_balance'], 450)
+
+
 if __name__ == "__main__":
     unittest.main()
