@@ -284,6 +284,24 @@ class SuiGrpcService:
         )
         return result.get("coinMetadata")
 
+    async def transfer_batch(self, recipients, coin_type, sender_private_key_hex, gas_budget, before_submit):
+        """Persist the prepared digest before submission; never automatically resend."""
+        async with self._transfer_lock:
+            prepared = await self._request("prepareBatch", {
+                "recipients": [{"recipient": item["wallet"], "amount": str(item["amount"])} for item in recipients],
+                "coinType": coin_type,
+                "privateKeyHex": sender_private_key_hex,
+                "gasBudget": str(gas_budget),
+            }, timeout=90.0)
+            # If storage fails, do not submit. Keep signatures/keys out of storage.
+            await before_submit(prepared["digest"])
+            return await self._request("executeBatch", {
+                "bytes": prepared["bytes"], "signature": prepared["signature"],
+            }, timeout=90.0)
+
+    async def transaction_status(self, digest):
+        return await self._request("transactionStatus", {"digest": digest}, timeout=30.0)
+
     async def transfer_token(
         self,
         recipient: str,

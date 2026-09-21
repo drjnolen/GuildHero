@@ -125,6 +125,33 @@ class SuiServiceHelpersTests(unittest.TestCase):
                     await service.get_subscribed_checkpoints()
         asyncio.run(exercise())
 
+    def test_batch_does_not_submit_if_journal_write_fails(self):
+        async def exercise():
+            service = SuiGrpcService("https://example.invalid")
+            service._request = AsyncMock(return_value={"digest": "prepared", "bytes": "AQID", "signature": "signed"})
+            persist = AsyncMock(side_effect=RuntimeError("database unavailable"))
+            with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+                await service.transfer_batch([{"wallet": "recipient", "amount": "30"}], "coin", "secret", 50, persist)
+            self.assertEqual(service._request.await_count, 1)
+            self.assertEqual(service._request.await_args.args[0], "prepareBatch")
+        asyncio.run(exercise())
+
+    def test_batch_saves_digest_before_execution(self):
+        async def exercise():
+            service = SuiGrpcService("https://example.invalid")
+            persist = AsyncMock()
+            async def request(method, params, timeout):
+                if method == "prepareBatch":
+                    self.assertEqual(params["recipients"], [{"recipient": "recipient", "amount": "30"}])
+                    return {"digest": "prepared", "bytes": "AQID", "signature": "signed"}
+                persist.assert_awaited_once_with("prepared")
+                self.assertEqual(params, {"bytes": "AQID", "signature": "signed"})
+                return {"digest": "prepared", "success": True}
+            service._request = AsyncMock(side_effect=request)
+            result = await service.transfer_batch([{"wallet": "recipient", "amount": 30}], "coin", "secret", 50, persist)
+            self.assertTrue(result["success"])
+        asyncio.run(exercise())
+
     def test_request_timeout_restarts_stuck_bridge(self):
         async def exercise():
             service = SuiGrpcService("https://example.invalid")

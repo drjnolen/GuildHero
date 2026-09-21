@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { Transaction } from '@mysten/sui/transactions';
 
 import {
   buildTransferTransaction,
+  buildBatchTransferTransaction,
   handleRequest,
   keypairFromPrivateKeyHex,
   mapCheckpoint,
@@ -474,4 +476,88 @@ test('retries subscription creation after a synchronous transport error', async 
   await assert.rejects(handleRequest(request, client), /transport unavailable/);
   assert.equal((await handleRequest(request, client)).checkpoints[0].sequenceNumber, '401');
   assert.equal(attempts, 2);
+});
+
+const batchParams = {
+  privateKeyHex: '1'.repeat(64), coinType: '0xabc::token::TOKEN', gasBudget: '50000000',
+  recipients: [
+    { recipient: `0x${'1'.repeat(64)}`, amount: '30000000000000' },
+    { recipient: `0x${'2'.repeat(64)}`, amount: '15000000000000' },
+  ],
+};
+
+test('builds different batch rewards into one PTB for SUI and custom tokens', () => {
+  for (const coinType of ['0x2::sui::SUI', batchParams.coinType]) {
+    const tx = buildBatchTransferTransaction({ ...batchParams, coinType });
+    const commands = tx.getData().commands;
+    assert.equal(commands.filter(command => command.$kind === 'TransferObjects').length, 2);
+    assert.deepEqual(commands.filter(command => command.$kind === '$Intent')
+      .map(command => command.$Intent.data.balance), [30000000000000n, 15000000000000n]);
+    assert.equal(tx.getData().gasData.budget, null);
+  }
+});
+
+test('rejects oversized, empty, invalid-address, and overflowing batches', () => {
+  for (const recipients of [[], Array(26).fill(batchParams.recipients[0]),
+    [{ recipient: 'bad', amount: '1' }],
+    [{ ...batchParams.recipients[0], amount: '0' }],
+    [{ ...batchParams.recipients[0], amount: '18446744073709551616' }]]) {
+    assert.throws(() => buildBatchTransferTransaction({ ...batchParams, recipients }));
+  }
+});
+
+function mockBatchBuild(t, budget = 1000) {
+  t.mock.method(Transaction.prototype, 'build', async function () {
+    this.setGasBudget(budget);
+    return new Uint8Array([1, 2, 3]);
+  });
+  t.mock.method(Transaction.prototype, 'getDigest', async () => 'prepared-digest');
+}
+
+test('prepares and simulates a batch without submitting it', async (t) => {
+  mockBatchBuild(t);
+  let simulated = false;
+  const client = {
+    simulateTransaction: async ({ transaction }) => {
+      assert.deepEqual(transaction, new Uint8Array([1, 2, 3]));
+      simulated = true;
+      return { Transaction: { status: { success: true } } };
+    },
+    executeTransaction: () => assert.fail('Preparation must not submit'),
+  };
+  const result = await handleRequest({ method: 'prepareBatch', params: batchParams }, client);
+  assert.equal(simulated, true);
+  assert.equal(result.digest, 'prepared-digest');
+  assert.equal(result.gasBudget, '1000');
+  assert.equal(result.bytes, 'AQID');
+  assert.equal(typeof result.signature, 'string');
+});
+
+test('gas cap and simulation failures stop batch preparation', async (t) => {
+  mockBatchBuild(t);
+  await assert.rejects(handleRequest({ method: 'prepareBatch',
+    params: { ...batchParams, gasBudget: '999' } }, {}), /gas exceeds/);
+  const client = { simulateTransaction: async () => ({ FailedTransaction: {
+    status: { success: false, error: { message: 'denied' } },
+  } }) };
+  await assert.rejects(handleRequest({ method: 'prepareBatch', params: batchParams }, client), /simulation failed: denied/);
+});
+
+test('executeBatch submits exact prepared bytes once and waits for indexing', async () => {
+  let calls = 0;
+  const client = {
+    executeTransaction: async ({ transaction, signatures }) => {
+      calls++;
+      assert.deepEqual([...transaction], [1, 2, 3]);
+      assert.deepEqual(signatures, ['signature']);
+      return { Transaction: { digest: 'prepared-digest', status: { success: true } } };
+    },
+    waitForTransaction: async () => {},
+  };
+  const result = await handleRequest({ method: 'executeBatch', params: {
+    bytes: 'AQID', signature: 'signature',
+  } }, client);
+  assert.equal(result.success, true);
+  assert.equal(result.digest, 'prepared-digest');
+  assert.equal(calls, 1);
 });
