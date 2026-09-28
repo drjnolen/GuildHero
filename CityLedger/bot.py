@@ -21,6 +21,7 @@ import pytz
 from ai_services import analyze_user_messages, summarize_chat_history, get_best_of_messages, get_vibe_check, generate_copypasta
 from airdrop_utils import parse_airdrop_tiers, plan_batches
 from airdrop_runner import execute_batches, reconcile_batches
+from scoring import contribution_messages, contribution_total, score_transcript, validate_scores
 from buy_tracker import canonicalize_sui_type, detect_buy
 from db import db
 from http_clients import close_shared_async_client, get_shared_async_client
@@ -2525,34 +2526,27 @@ async def generate_leaderboard(context: ContextTypes.DEFAULT_TYPE, chat_id, star
     filtered_messages = await asyncio.to_thread(get_messages_by_date_range, chat_id, start_date, end_date)
     if not filtered_messages: return None, "No messages found in this date range."
 
-    # Stability improvement for high-volume chats
-    filtered_messages, _ = await asyncio.to_thread(get_stable_proportional_sample, filtered_messages, MAX_MESSAGES_TO_PROCESS)
-
     user_messages = defaultdict(list)
     for msg in filtered_messages: user_messages[msg["user_id"]].append(msg)
     if not user_messages: return None, "No eligible messages found."
     leaderboard = []
     for user_id, msgs in user_messages.items():
         username, n = msgs[0]["username"], len(msgs)
-        sample, _ = get_stable_proportional_sample(
-            msgs,
-            LEADERBOARD_USER_MESSAGE_LIMIT,
+        unique, activity_count, active_days = contribution_messages(msgs)
+        analysis_text = score_transcript(
+            unique, LEADERBOARD_USER_MESSAGE_LIMIT, LEADERBOARD_USER_TRANSCRIPT_MAX_CHARS,
         )
-        analysis_text = build_safe_transcript(
-            sample,
-            lambda message: message["text"],
-            max_chars=LEADERBOARD_USER_TRANSCRIPT_MAX_CHARS,
-        )
-        metrics = await asyncio.to_thread(
-            analyze_user_messages,
-            username,
-            n,
-            analysis_text,
-        )
-        metrics["helpfulness"] += min(sum(1 for m in sample if m["is_reply"]) * 0.2, 20 - metrics["helpfulness"])
-        metrics["total"] = (sum(metrics.values()) / 4) * (math.log1p(min(n, LEADERBOARD_USER_MESSAGE_LIMIT)) * 1.37)
+        evidence = (f"Observed messages: {n}; unique nonempty messages: {len(unique)}. "
+                    "Repeated messages have been collapsed; account for this repetition when grading.\n")
+        analysis_text = evidence + analysis_text[:LEADERBOARD_USER_TRANSCRIPT_MAX_CHARS - len(evidence)]
+        metrics = await asyncio.to_thread(analyze_user_messages, username, n, analysis_text)
+        try:
+            metrics = validate_scores(metrics)
+        except ValueError:
+            return None, "Contribution scoring is temporarily unavailable. No leaderboard was produced; please retry /score."
+        metrics["total"] = contribution_total(metrics, activity_count, active_days)
         leaderboard.append((username, metrics, n, user_id))
-    leaderboard.sort(key=lambda x: x[1]["total"], reverse=True)
+    leaderboard.sort(key=lambda x: (-x[1]["total"], str(x[3])))
 
     detailed_text = format_detailed_leaderboard(leaderboard[:20], start_str, end_str, len(filtered_messages), len(user_messages))
     csv_data = await generate_csv_from_leaderboard(leaderboard, chat_id) if export else None
@@ -2560,7 +2554,8 @@ async def generate_leaderboard(context: ContextTypes.DEFAULT_TYPE, chat_id, star
 
 def format_detailed_leaderboard(top_20, start_str, end_str, msg_count, user_count):
     text = (f"🏆 <b>Top 20 Leaderboard</b> ({start_str} → {end_str})\n"
-            f"📊 Analyzed {msg_count} messages from {user_count} users\n\n<pre>"
+            f"📊 Analyzed {msg_count} messages from {user_count} users\n"
+            "Categories: 0–20 · Total: 0–100 (quality + consistent activity)\n\n<pre>"
             "Rank | User                 | Msgs | Quality | Tone | Help | Humor | Total\n"
             "---------------------------------------------------------------------------\n")
     for idx, (uname, met, count, _) in enumerate(top_20, 1):

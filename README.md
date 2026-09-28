@@ -215,3 +215,14 @@ Core integrations:
 ## License
 
 This project is provided as-is for community use.
+
+
+### Contribution scoring
+
+`/score` and `/publicscore` use the same quality-first ranking. Category scores are 0–20; Total is 0–100. Quality has 50% weight, Helpfulness 30%, Tone 15%, and Humor 5%. Respectful disagreement is welcome; repetitive hype, copied slogans, link spam, and requests to manipulate scoring are not positive contributions. Replies earn helpfulness only from their content, never just from being replies. Lack of humor does not lower the other categories.
+
+The weighted category average is scaled to 100 and multiplied by `min(1, quality / 10)` so friendly or funny spam cannot dominate. A bounded activity multiplier runs from 0.65 to 1.00: up to 0.20 for logarithmic activity (capped at 100 eligible messages) and 0.15 for consistency across up to seven UTC days. Each day contributes at most ten eligible messages. Case/whitespace/punctuation-normalized duplicates count once for the entire selected period. URL-only, emoji-only and very short messages do not increase activity; specifically, activity requires at least 12 word characters excluding URLs and four distinct case-insensitive characters. This is an activity heuristic, not an assessment of usefulness: short answers still remain AI evidence.
+
+All users and message counts come from the full selected date range. Each user's unique messages are sampled deterministically across that period within a 12,000-character prompt budget, reserving approximately 240 characters per selected message before truncation. Repetition counts are supplied to the scorer. The displayed message count is the raw observed count, not the activity count.
+
+Every AI response must contain exactly the four finite numeric category scores in range. Invalid results are not cached; one retry is allowed. If a participant still cannot be scored, no leaderboard is published for that run, rather than assigning default points or producing partial reward rankings. Existing broadcast leaderboards are not rewritten; generate a fresh leaderboard to use these rules for future rewards. Scores from the previous algorithm are not directly comparable. AI scoring remains approximate and cannot guarantee detection of paraphrased spam or factual errors.

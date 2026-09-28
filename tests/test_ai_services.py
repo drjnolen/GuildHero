@@ -86,15 +86,29 @@ class TestAIServiceCaching(unittest.TestCase):
             ),
         ]
 
-        fallback = ai_services.analyze_user_messages("alice", 1, "same")
         recovered = ai_services.analyze_user_messages("alice", 1, "same")
-
-        self.assertEqual(
-            fallback,
-            {"quality": 8, "tone": 10, "helpfulness": 8, "humor": 8},
-        )
+        cached = ai_services.analyze_user_messages("alice", 1, "same")
         self.assertEqual(recovered["quality"], 1)
+        self.assertEqual(cached, recovered)
         self.assertEqual(self.create.call_count, 2)
+
+    def test_invalid_scores_are_retried_and_not_cached(self):
+        for content in [
+            '{"quality": 10, "tone": 60, "helpfulness": 10, "humor": 10}',
+            '{"quality": 10, "tone": 10, "helpfulness": 10, "humor": 10, "total": 999}',
+            '{"quality": true, "tone": 10, "helpfulness": 10, "humor": 10}',
+            '{"quality": NaN, "tone": 10, "helpfulness": 10, "humor": 10}',
+        ]:
+            with self.subTest(content=content):
+                ai_services.clear_ai_result_cache()
+                self.create.reset_mock()
+                self.create.return_value = _completion(content)
+                self.assertIsNone(ai_services.analyze_user_messages('alice', 1, 'evidence'))
+                self.assertEqual(self.create.call_count, 2)
+                self.create.return_value = _completion('{"quality": 10, "tone": 18, "helpfulness": 10, "humor": 0}')
+                self.assertEqual(ai_services.analyze_user_messages('alice', 1, 'evidence')['tone'], 18)
+                self.assertEqual(self.create.call_count, 3)
+
 
     def test_concurrent_identical_requests_share_one_api_call(self):
         def create_completion(**_kwargs):
