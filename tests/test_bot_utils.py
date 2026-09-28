@@ -1695,5 +1695,35 @@ class TestBuyButtons(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(api.send_message.await_args.kwargs['reply_markup'], 'keyboard')
 
 
+class TestQualityLeaderboard(unittest.IsolatedAsyncioTestCase):
+    async def test_full_counts_and_quiet_user_survive_busy_chat(self):
+        messages = [{"user_id": 1, "username": "busy", "text": "Repeated hype to the moon",
+                     "date": "2026-09-01T00:00:00+00:00", "is_reply": True} for _ in range(1600)]
+        messages.insert(777, {"user_id": 2, "username": "quiet", "text": "Here is a useful detailed answer",
+                              "date": "2026-09-01T00:01:00+00:00", "is_reply": False})
+        metrics = dict(quality=12, tone=12, helpfulness=12, humor=0)
+        with patch.object(bot, 'get_messages_by_date_range', return_value=messages), \
+             patch.object(bot, 'analyze_user_messages', return_value=metrics) as analyze:
+            result, error = await bot.generate_leaderboard(None, 42, None, None, 'start', 'end')
+        self.assertIsNone(error)
+        self.assertEqual(analyze.call_count, 2)
+        rows = {row[0]: row for row in result[2]}
+        self.assertEqual(rows['busy'][2], 1600)
+        self.assertEqual(rows['quiet'][2], 1)
+        self.assertEqual(rows['busy'][1]['helpfulness'], 12)
+        self.assertEqual(rows['busy'][1]['total'], rows['quiet'][1]['total'])
+        self.assertNotIn('total', metrics)
+
+    async def test_unavailable_or_invalid_scoring_never_publishes_partial_rankings(self):
+        message = {"user_id": 1, "username": "alice", "text": "A useful detailed explanation",
+                   "date": "2026-09-01T00:00:00+00:00", "is_reply": False}
+        for response in [None, dict(quality=10, tone=60, helpfulness=10, humor=10)]:
+            with patch.object(bot, 'get_messages_by_date_range', return_value=[message]), \
+                 patch.object(bot, 'analyze_user_messages', return_value=response):
+                result, error = await bot.generate_leaderboard(None, 42, None, None, 'start', 'end')
+            self.assertIsNone(result)
+            self.assertIn('No leaderboard', error)
+
+
 if __name__ == "__main__":
     unittest.main()
