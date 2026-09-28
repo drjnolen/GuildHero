@@ -1648,5 +1648,52 @@ class TestBatchedAirdropCommand(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result['required_token_balance'], 450)
 
 
+class TestBuyButtons(unittest.IsolatedAsyncioTestCase):
+    def test_links_preserve_token_case_and_referral_for_each_group(self):
+        with patch.object(bot, 'InlineKeyboardButton', side_effect=lambda text, url: (text, url)), \
+             patch.object(bot, 'InlineKeyboardMarkup', side_effect=lambda rows: rows), \
+             patch.object(bot, '_token_chart_cache', {}):
+            for token in ['0xabc::city::CITY', '0xdef::other::Other']:
+                row = bot._buy_announcement_keyboard(token)[0]
+                self.assertEqual(row[0], ('📊 Chart', f'https://dexscreener.com/sui/{token}'))
+                self.assertEqual(row[1], ('🔄 Buy', f'https://flowx.finance/swap/SUI-{token}?ref=city&fee=25'))
+
+    def test_chart_selects_matching_sui_market_with_most_liquidity(self):
+        token = '0xabc::city::CITY'
+        def pair(address, liquidity, chain='sui', base=token):
+            return {'chainId': chain, 'baseToken': {'address': base},
+                    'pairAddress': address, 'liquidity': {'usd': liquidity}}
+        selected = '0x' + '2' * 64
+        pairs = [pair('0x' + '1' * 64, 100), pair(selected, 200),
+                 pair('0x' + '3' * 64, 9999, chain='solana'),
+                 pair('0x' + '4' * 64, 9999, base='0xdef::coin::COIN'),
+                 pair('https://example.invalid', 9999)]
+        self.assertEqual(bot._select_buy_chart_url(pairs, token), f'https://dexscreener.com/sui/{selected}')
+
+    async def test_buttons_on_text_and_every_media_type(self):
+        for media_type in [None, 'photo', 'animation', 'video', 'document']:
+            with self.subTest(media_type=media_type):
+                api = SimpleNamespace(**{f'send_{kind}': AsyncMock() for kind in
+                                         ['message', 'photo', 'animation', 'video', 'document']})
+                media = {'type': media_type, 'file_id': 'file'} if media_type else None
+                with patch.object(bot, '_get_buybot_media', return_value=media), \
+                     patch.object(bot, '_buy_announcement_keyboard', return_value='keyboard') as keyboard:
+                    await bot._send_buy_announcement(SimpleNamespace(bot=api), 42, 'Buy!', coin_type='coin')
+                keyboard.assert_called_once_with('coin')
+                sent = getattr(api, f"send_{media_type or 'message'}").await_args
+                self.assertEqual(sent.kwargs['reply_markup'], 'keyboard')
+
+    async def test_media_fallback_keeps_buttons(self):
+        class BadRequest(Exception):
+            pass
+        api = SimpleNamespace(send_photo=AsyncMock(side_effect=BadRequest('invalid file')),
+                              send_message=AsyncMock())
+        with patch.object(bot, '_get_buybot_media', return_value={'type': 'photo', 'file_id': 'bad'}), \
+             patch.object(bot, '_clear_buybot_media'), \
+             patch.object(bot, '_buy_announcement_keyboard', return_value='keyboard'):
+            await bot._send_buy_announcement(SimpleNamespace(bot=api), 42, 'Buy!', coin_type='coin')
+        self.assertEqual(api.send_message.await_args.kwargs['reply_markup'], 'keyboard')
+
+
 if __name__ == "__main__":
     unittest.main()

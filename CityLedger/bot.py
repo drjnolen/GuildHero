@@ -1333,7 +1333,9 @@ async def fetch_token_volume(coin_type: str) -> dict[str, Decimal] | None:
             timeout=TOKEN_VOLUME_REQUEST_TIMEOUT,
         )
         response.raise_for_status()
-        result = _aggregate_token_volumes(response.json(), coin_type)
+        pairs = response.json()
+        result = _aggregate_token_volumes(pairs, coin_type)
+        _token_chart_cache[cache_key] = (_select_buy_chart_url(pairs, coin_type), time.monotonic())
     except Exception as exc:
         logging.warning(
             "Unable to fetch Sui token volume for %s: %s",
@@ -1589,15 +1591,52 @@ def _format_buy_announcement(
     return "\n".join(lines) + '\n\n<a href="https://alphacity.tech">Alphacity.tech</a>'
 
 
-async def _send_buy_announcement(context, chat_id: int, text: str) -> None:
+_token_chart_cache: dict[str, tuple[str, float]] = {}
+
+
+def _select_buy_chart_url(pairs, coin_type: str) -> str:
+    fallback = f"https://dexscreener.com/sui/{quote(coin_type, safe=':')}"
+    candidates = []
+    for pair in pairs if isinstance(pairs, list) else []:
+        if not isinstance(pair, dict) or pair.get("chainId") != "sui":
+            continue
+        base = pair.get("baseToken") or {}
+        if not isinstance(base, dict) or canonicalize_sui_type(base.get("address")) != canonicalize_sui_type(coin_type):
+            continue
+        address = str(pair.get("pairAddress") or "")
+        if not re.fullmatch(r"0x[0-9a-fA-F]{64}", address):
+            continue
+        liquidity = pair.get("liquidity") or {}
+        usd = _nonnegative_decimal(liquidity.get("usd")) if isinstance(liquidity, dict) else None
+        candidates.append((usd or Decimal(0), address))
+    if not candidates:
+        return fallback
+    return f"https://dexscreener.com/sui/{max(candidates)[1]}"
+
+
+def _buy_announcement_keyboard(coin_type: str):
+    chart_url = _select_buy_chart_url([], coin_type)
+    cached = _token_chart_cache.get(canonicalize_sui_type(coin_type))
+    if cached and time.monotonic() - cached[1] < TOKEN_VOLUME_CACHE_TTL:
+        chart_url = cached[0]
+    buy_url = f"https://flowx.finance/swap/SUI-{quote(coin_type, safe=':')}?ref=city&fee=25"
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📊 Chart", url=chart_url),
+        InlineKeyboardButton("🔄 Buy", url=buy_url),
+    ]])
+
+
+async def _send_buy_announcement(context, chat_id: int, text: str, coin_type: str | None = None) -> None:
     """Send one text or media-caption announcement using group customization."""
 
+    button_options = {"reply_markup": _buy_announcement_keyboard(coin_type)} if coin_type else {}
     media = await asyncio.to_thread(_get_buybot_media, chat_id)
     if not media:
         await context.bot.send_message(
             chat_id=chat_id,
             text=text,
             parse_mode=ParseMode.HTML,
+            **button_options,
             disable_web_page_preview=True,
         )
         return
@@ -1609,6 +1648,7 @@ async def _send_buy_announcement(context, chat_id: int, text: str) -> None:
                 photo=media["file_id"],
                 caption=text,
                 parse_mode=ParseMode.HTML,
+                **button_options,
             )
         elif media["type"] == "animation":
             await context.bot.send_animation(
@@ -1616,6 +1656,7 @@ async def _send_buy_announcement(context, chat_id: int, text: str) -> None:
                 animation=media["file_id"],
                 caption=text,
                 parse_mode=ParseMode.HTML,
+                **button_options,
             )
         elif media["type"] == "video":
             await context.bot.send_video(
@@ -1623,6 +1664,7 @@ async def _send_buy_announcement(context, chat_id: int, text: str) -> None:
                 video=media["file_id"],
                 caption=text,
                 parse_mode=ParseMode.HTML,
+                **button_options,
             )
         else:
             await context.bot.send_document(
@@ -1630,6 +1672,7 @@ async def _send_buy_announcement(context, chat_id: int, text: str) -> None:
                 document=media["file_id"],
                 caption=text,
                 parse_mode=ParseMode.HTML,
+                **button_options,
             )
     except Exception as exc:
         if exc.__class__.__name__ != "BadRequest":
@@ -1645,6 +1688,7 @@ async def _send_buy_announcement(context, chat_id: int, text: str) -> None:
             chat_id=chat_id,
             text=text,
             parse_mode=ParseMode.HTML,
+            **button_options,
             disable_web_page_preview=True,
         )
 
@@ -1727,7 +1771,7 @@ async def _announce_checkpoint_buys(
                     buy_emoji=emojis_by_chat[chat_id],
                 )
                 try:
-                    await _send_buy_announcement(context, chat_id, text)
+                    await _send_buy_announcement(context, chat_id, text, coin_type=coin_type)
                 except Exception as exc:
                     error_name = exc.__class__.__name__
                     logging.error(
