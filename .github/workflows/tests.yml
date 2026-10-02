@@ -3,7 +3,7 @@ name: Tests
 on:
   pull_request:
   push:
-    branches: [main, 'codex/group-stars-subscriptions']
+    branches: [main, 'codex/group-subscriptions-current']
 
 permissions:
   contents: read

@@ -3406,9 +3406,13 @@ async def _report_airdrop(message, run):
         await _reply_with_footer(message, chunk)
 
 
-@premium_group_feature
 async def airdrop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send equal or tiered leaderboard rewards in bounded atomic PTBs."""
+    # Admins must be able to reconcile an existing payout after access expires.
+    # Status only inspects saved transactions; creating rewards remains gated.
+    is_status = bool(context.args and context.args[0].lower() == 'status')
+    if not is_status and not await require_group_access(update, context):
+        return
     if not await require_admin(update, context):
         return
     chat_id = update.effective_chat.id

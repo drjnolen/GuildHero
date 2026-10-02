@@ -36,6 +36,10 @@ their existing admin, wallet, and transaction checks remain unchanged. The gener
 Free groups still retain configuration, calendar events, wallets, and buy-tracker
 state needed for their free features; these are not ordinary chat-message tracking.
 
+Admins can still use `/airdrop status` after access expires to reconcile existing
+payouts. Quality-first scoring, batched/tiered rewards, buybot stream recovery, and
+the Chart/Buy buttons from the current codebase are retained.
+
 **Before deploying this release:**
 
 1. Add your complimentary groups to the hosting provider's

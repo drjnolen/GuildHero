@@ -1402,7 +1402,7 @@ class TestPremiumFeatureGates(unittest.IsolatedAsyncioTestCase):
                 update = self.update()
                 context = SimpleNamespace(bot_data={
                     'group_access': SimpleNamespace(config=SimpleNamespace(stars=250))
-                })
+                }, args=[])
                 await command(update, context)
                 database.assert_not_called()
                 self.assertEqual(database.mock_calls, [])
@@ -1667,6 +1667,28 @@ class TestFormatDetailedLeaderboard(unittest.TestCase):
 
 
 class TestBatchedAirdropCommand(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        access = patch.object(bot, 'require_group_access', AsyncMock(return_value=True))
+        self.access_check = access.start()
+        self.addCleanup(access.stop)
+
+    async def test_status_remains_available_without_subscription(self):
+        self.access_check.side_effect = AssertionError('Status must not require subscription')
+        update = SimpleNamespace(effective_chat=SimpleNamespace(id=-100), message=SimpleNamespace(reply_text=AsyncMock()))
+        context = SimpleNamespace(args=['status'], application=SimpleNamespace(bot_data={}))
+        with patch.object(bot, 'require_admin', AsyncMock(return_value=True)), \
+             patch.object(bot, '_airdrop_command_locked', AsyncMock()) as status:
+            await bot.airdrop_command(update, context)
+            status.assert_awaited_once_with(update, context)
+        self.access_check.assert_not_awaited()
+
+    async def test_status_still_requires_admin(self):
+        context = SimpleNamespace(args=['status'])
+        with patch.object(bot, 'require_admin', AsyncMock(return_value=False)), \
+             patch.object(bot, '_airdrop_command_locked', AsyncMock()) as status:
+            await bot.airdrop_command(SimpleNamespace(), context)
+            status.assert_not_awaited()
+
     async def test_tiered_command_preserves_ranks_when_wallet_is_missing(self):
         leaderboard = [(f"user{i}", {}, 1, str(i)) for i in range(1, 11)]
         store = {}
@@ -1791,6 +1813,11 @@ class TestBuyButtons(unittest.IsolatedAsyncioTestCase):
 
 
 class TestQualityLeaderboard(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        access = patch.object(bot, 'has_group_access', AsyncMock(return_value=True))
+        access.start()
+        self.addCleanup(access.stop)
+
     async def test_full_counts_and_quiet_user_survive_busy_chat(self):
         messages = [{"user_id": 1, "username": "busy", "text": "Repeated hype to the moon",
                      "date": "2026-09-01T00:00:00+00:00", "is_reply": True} for _ in range(1600)]

@@ -30,6 +30,10 @@ on existing paid/whitelisted features; existing sampling, input limits, caching,
 and command rate limits still apply. Monitor real per-group costs before promising
 unlimited usage at this price.
 
+The admin-only `/airdrop status` command remains available after expiry so admins
+can reconcile saved payouts. It does not create transfers or analyze chat history.
+New airdrops retain the current batched/tiered payout logic and require group access.
+
 ## Billing behavior
 
 - A current group admin accepts displayed terms, then gets an invoice link.
