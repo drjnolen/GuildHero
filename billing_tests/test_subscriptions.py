@@ -112,6 +112,7 @@ class PaymentTests(unittest.IsolatedAsyncioTestCase):
         self.store.get_subscription.return_value = None
         self.store.get_order.return_value = dict(chat_id=-100, user_id=7, stars=250)
         self.store.reserve_checkout.return_value = True
+        self.store.pending_cleanup.return_value = []
         self.store.apply_payment.return_value = dict(chat_id=-100, duplicate=False, conflict=False, refunded=False)
         self.config = sub.SubscriptionConfig(frozenset(), support_url='https://t.me/operator')
         self.access = sub.GroupAccess(self.store, self.config)
@@ -192,10 +193,58 @@ class PaymentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_conflicting_payment_is_refunded_and_renewal_canceled(self):
         self.store.apply_payment.return_value = dict(chat_id=-100, duplicate=False, conflict=True, refunded=False)
+        self.store.pending_cleanup.return_value = [self.cleanup_payment()]
         await sub.successful_payment_callback(update_with_payment(), self.context)
         self.bot.refund_star_payment.assert_awaited_once_with(user_id=7, telegram_payment_charge_id='charge-1')
         self.bot.edit_user_star_subscription.assert_awaited_once()
         self.store.mark_refunded.assert_called_once()
+
+    def cleanup_payment(self, **overrides):
+        record = dict(payload='saved-order', charge_id='charge-1', first_charge_id='charge-1',
+                      user_id=7, chat_id=-100, refunded=False, canceled=False)
+        return {**record, **overrides}
+
+    async def test_refunded_duplicate_retries_cancellation_after_failure_and_restart(self):
+        record = self.cleanup_payment()
+        self.store.pending_cleanup.side_effect = lambda: [dict(record)] if not (record['refunded'] and record['canceled']) else []
+        self.store.mark_refunded.side_effect = lambda *_: record.update(refunded=True)
+        self.store.set_canceled.side_effect = lambda *_: record.update(canceled=True)
+        self.store.apply_payment.return_value = dict(chat_id=-100, duplicate=False, conflict=True, refunded=False)
+        self.bot.edit_user_star_subscription.side_effect = RuntimeError('temporary outage')
+        with self.assertLogs(sub.logger, level='ERROR'):
+            await sub.successful_payment_callback(update_with_payment(), self.context)
+        self.assertTrue(record['refunded'])
+        self.assertFalse(record['canceled'])
+        self.assertIn('pending automatic recovery', self.reply.await_args.args[0])
+        self.context.bot_data['group_access'] = sub.GroupAccess(self.store, self.config)
+        self.bot.edit_user_star_subscription.side_effect = None
+        self.store.apply_payment.return_value = dict(chat_id=-100, duplicate=True, conflict=True, refunded=True)
+        await sub.successful_payment_callback(update_with_payment(), self.context)
+        self.assertTrue(record['canceled'])
+        self.assertEqual(self.bot.edit_user_star_subscription.await_count, 2)
+        self.bot.refund_star_payment.assert_awaited_once()
+
+    async def test_periodic_recovery_only_retries_unfinished_refund(self):
+        record = self.cleanup_payment()
+        self.store.pending_cleanup.side_effect = lambda: [dict(record)]
+        self.store.set_canceled.side_effect = lambda *_: record.update(canceled=True)
+        self.store.mark_refunded.side_effect = lambda *_: record.update(refunded=True)
+        self.bot.refund_star_payment.side_effect = RuntimeError('temporary outage')
+        with self.assertLogs(sub.logger, level='ERROR'):
+            await sub.retry_subscription_cleanup(self.context)
+        self.assertTrue(record['canceled'])
+        self.assertFalse(record['refunded'])
+        self.bot.refund_star_payment.side_effect = None
+        completed = await sub.retry_subscription_cleanup(self.context)
+        self.assertEqual(completed, {'charge-1'})
+        self.bot.edit_user_star_subscription.assert_awaited_once()
+        self.assertEqual(self.bot.refund_star_payment.await_count, 2)
+
+    async def test_startup_schedules_durable_cleanup(self):
+        application = SimpleNamespace(bot_data=self.context.bot_data, job_queue=MagicMock())
+        await sub.initialize_subscriptions(application)
+        application.job_queue.run_repeating.assert_called_once_with(
+            sub.retry_subscription_cleanup, interval=60, first=5, name='subscription-cleanup')
 
     async def test_refund_service_message_revokes_cached_access(self):
         payment = RefundedPayment('XTR', 250, 'saved-order', 'charge-1')
@@ -257,6 +306,51 @@ class PaymentTests(unittest.IsolatedAsyncioTestCase):
 
 
 class UpdateProcessorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_other_groups_proceed_but_same_chat_callbacks_remain_serial(self):
+        processor = BillingUpdateProcessor()
+        entered, release, other = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        order = []
+        def update(chat):
+            return SimpleNamespace(effective_chat=SimpleNamespace(id=chat), effective_message=None,
+                                   pre_checkout_query=None)
+        async def slow():
+            entered.set()
+            await release.wait()
+        async def same_chat():
+            order.append('same')
+        async def other_chat():
+            other.set()
+        first = asyncio.create_task(processor.process_update(update(-100), slow()))
+        await entered.wait()
+        second = asyncio.create_task(processor.process_update(update(-100), same_chat()))
+        third = asyncio.create_task(processor.process_update(update(-200), other_chat()))
+        try:
+            await asyncio.wait_for(other.wait(), 1)
+            self.assertEqual(order, [])
+        finally:
+            release.set()
+            await asyncio.gather(first, second, third)
+        self.assertEqual(order, ['same'])
+        self.assertFalse(processor._chat_locks)
+
+    async def test_canceled_waiter_does_not_leak_lock_or_block_chat(self):
+        processor = BillingUpdateProcessor()
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def slow():
+            entered.set()
+            await release.wait()
+        follower = AsyncMock()
+        first = asyncio.create_task(processor.process_update(Update(1), slow()))
+        await entered.wait()
+        second = asyncio.create_task(processor.process_update(Update(2), follower()))
+        await asyncio.sleep(0)
+        second.cancel()
+        await asyncio.gather(second, return_exceptions=True)
+        release.set()
+        await first
+        follower.assert_not_awaited()
+        self.assertFalse(processor._chat_locks)
+
     async def test_billing_bypasses_slow_analytics_but_other_updates_stay_serial(self):
         processor = BillingUpdateProcessor()
         entered, release, paid = asyncio.Event(), asyncio.Event(), asyncio.Event()

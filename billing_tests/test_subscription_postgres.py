@@ -96,6 +96,30 @@ class PostgresBillingTests(unittest.TestCase):
         self.pay()
         self.assertEqual(self.store.get_subscription(-100)['expires_at'], 0)
 
+    def test_duplicate_cleanup_survives_refund_until_cancellation_is_persisted(self):
+        self.pay()
+        self.pay(payload='b', user=8, charge='duplicate-subscription')
+        self.assertEqual(len(self.store.pending_cleanup()), 1)
+        self.store.mark_refunded('b', 'duplicate-subscription')
+        pending = self.store.pending_cleanup()
+        self.assertTrue(pending[0]['refunded'])
+        self.assertFalse(pending[0]['canceled'])
+        replay = self.pay(payload='b', user=8, charge='duplicate-subscription')
+        self.assertTrue(replay['refunded'])
+        self.assertTrue(replay['conflict'])
+        self.store.set_canceled('b')
+        self.assertEqual(self.store.pending_cleanup(), [])
+
+    def test_canceling_duplicate_does_not_lose_pending_refund(self):
+        self.pay()
+        self.pay(payload='b', user=8, charge='duplicate-subscription')
+        self.store.set_canceled('b')
+        pending = self.store.pending_cleanup()
+        self.assertTrue(pending[0]['canceled'])
+        self.assertFalse(pending[0]['refunded'])
+        self.store.mark_refunded('b', 'duplicate-subscription')
+        self.assertEqual(self.store.pending_cleanup(), [])
+
     def test_refund_before_success_blocks_reactivation(self):
         self.store.mark_refunded('a', 'first')
         self.assertTrue(self.pay()['refunded'])

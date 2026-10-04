@@ -50,6 +50,7 @@ class GroupAccess:
         self.store, self.config, self.clock = store, config, clock
         self._cache = OrderedDict()
         self._lock = asyncio.Lock()
+        self._cleanup_lock = asyncio.Lock()
 
     def invalidate(self, chat_id):
         self._cache.pop(chat_id, None)
@@ -90,6 +91,8 @@ def get_access(context):
 async def initialize_subscriptions(application):
     access = get_access(application)
     await asyncio.to_thread(access.store.ensure_schema)
+    application.job_queue.run_repeating(retry_subscription_cleanup, interval=60, first=5,
+                                        name='subscription-cleanup')
     if not access.config.support_url:
         logger.warning('PAYMENT_SUPPORT_URL is unset; new subscription checkout is disabled')
 
@@ -302,20 +305,58 @@ async def successful_payment_callback(update, context):
         await update.effective_message.reply_text('Your payment needs operator reconciliation. Please use /paysupport; do not pay again.')
         return
     access.invalidate(result['chat_id'])
-    if result['refunded']:
-        return
-    if result['conflict']:
+    if result.get('conflict'):
         # A delayed checkout can finish after another invoice has already paid.
         # Refund it instead of charging twice for the same active group.
-        await context.bot.refund_star_payment(user_id=update.effective_user.id, telegram_payment_charge_id=payment.telegram_payment_charge_id)
-        await asyncio.to_thread(access.store.mark_refunded, payment.invoice_payload, payment.telegram_payment_charge_id)
-        await context.bot.edit_user_star_subscription(user_id=update.effective_user.id, telegram_payment_charge_id=payment.telegram_payment_charge_id, is_canceled=True)
-        await asyncio.to_thread(access.store.set_canceled, payment.invoice_payload)
-        access.invalidate(result['chat_id'])
-        await update.effective_message.reply_text('This group already has an active subscription. The duplicate payment was refunded and its renewal canceled.')
-    elif not result['duplicate']:
+        completed = await retry_subscription_cleanup(context)
+        if result['duplicate']:
+            return  # Replays resume work without sending misleading repeat receipts.
+        if payment.telegram_payment_charge_id in completed:
+            await update.effective_message.reply_text('This group already has an active subscription. The duplicate payment was refunded and its renewal canceled.')
+        else:
+            await update.effective_message.reply_text('Duplicate subscription detected. Refund/renewal cancellation is pending automatic recovery. Do not pay again; use /paysupport if it remains unresolved.')
+    elif not result['refunded'] and not result['duplicate']:
         expires = datetime.fromtimestamp(expiration, timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
         await update.effective_message.reply_text(f"✅ Group {result['chat_id']} has paid access through {expires}. Use /subscription in the group to manage renewal.")
+
+
+async def retry_subscription_cleanup(context):
+    """Resume saved duplicate-payment work after API errors or restarts."""
+    access = get_access(context)
+    completed = set()
+    # Read inside the lock so an event and the periodic job cannot act on stale
+    # refund state. This bot runs as one polling replica.
+    async with access._cleanup_lock:
+        try:
+            pending = await asyncio.to_thread(access.store.pending_cleanup)
+        except Exception:
+            logger.exception('Could not load pending subscription cleanup')
+            return completed
+        for payment in pending:
+            ok = True
+            # Cancel first, but do not let a cancellation outage prevent refund.
+            if not payment['canceled']:
+                try:
+                    await context.bot.edit_user_star_subscription(
+                        user_id=payment['user_id'],
+                        telegram_payment_charge_id=payment['first_charge_id'] or payment['charge_id'],
+                        is_canceled=True,
+                    )
+                    await asyncio.to_thread(access.store.set_canceled, payment['payload'])
+                except Exception:
+                    ok = False
+                    logger.exception('Duplicate subscription cancellation pending for %s', payment['charge_id'])
+            if not payment['refunded']:
+                try:
+                    await context.bot.refund_star_payment(user_id=payment['user_id'], telegram_payment_charge_id=payment['charge_id'])
+                    await asyncio.to_thread(access.store.mark_refunded, payment['payload'], payment['charge_id'])
+                    access.invalidate(payment['chat_id'])
+                except Exception:
+                    ok = False
+                    logger.exception('Duplicate subscription refund pending for %s', payment['charge_id'])
+            if ok:
+                completed.add(payment['charge_id'])
+    return completed
 
 
 async def refunded_payment_callback(update, context):
