@@ -1,4 +1,4 @@
-"""Keep payment validation responsive without racing wallet/calendar state."""
+"""Serialize each chat's conversations without blocking unrelated groups."""
 
 import asyncio
 
@@ -8,7 +8,7 @@ from telegram.ext import BaseUpdateProcessor
 class BillingUpdateProcessor(BaseUpdateProcessor):
     def __init__(self):
         super().__init__(max_concurrent_updates=256)
-        self._ordinary_updates = asyncio.Lock()
+        self._chat_locks = {}
 
     async def initialize(self):
         pass
@@ -24,7 +24,20 @@ class BillingUpdateProcessor(BaseUpdateProcessor):
         if billing:
             await coroutine
         else:
-            # ConversationHandler state and existing money-transfer handlers
-            # keep the same serial behavior as before. Only billing can bypass.
-            async with self._ordinary_updates:
-                await coroutine
+            # ConversationHandler uses per-chat state. Keep each chat serial,
+            # including its callbacks, while another group's AI request waits.
+            chat = getattr(update, 'effective_chat', None)
+            key = chat.id if chat else None
+            entry = self._chat_locks.setdefault(key, [asyncio.Lock(), 0])
+            entry[1] += 1
+            started = False
+            try:
+                async with entry[0]:
+                    started = True
+                    await coroutine
+            finally:
+                if not started:
+                    coroutine.close()
+                entry[1] -= 1
+                if not entry[1]:
+                    del self._chat_locks[key]

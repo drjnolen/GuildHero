@@ -36,7 +36,7 @@ their existing admin, wallet, and transaction checks remain unchanged. The gener
 Free groups still retain configuration, calendar events, wallets, and buy-tracker
 state needed for their free features; these are not ordinary chat-message tracking.
 
-Admins can still use `/airdrop status` after access expires to reconcile existing
+Admins can still use `/airdrop status` and `/raffle status` after access expires to reconcile existing
 payouts. Quality-first scoring, batched/tiered rewards, buybot stream recovery, and
 the Chart/Buy buttons from the current codebase are retained.
 
@@ -74,16 +74,35 @@ observe a change; operate this polling bot as one replica.
 - **/bestof** `<#>` — Curated digest of the best messages (Most Humorous, Most Degen, Best Alpha, Most Helpful)
 - **/vibecheck** `<#>` `[topic]` — Sentiment analysis with bullish/bearish classification
 
+These responses show the actual number and time span of stored messages included
+in the AI input. Partial coverage is explicitly labeled when sampling or the
+character budget omits text. Ordinary commands are serialized within each chat;
+a slow scoring request in one group no longer holds the update lock for all groups.
+
 ### 💰 Crypto Tools
 - **/price** `<symbol>` — Live cryptocurrency price lookup with 24h change, market cap, and volume, including SUI ecosystem tickers like SUI, DEEP, WAL, and NS
 - **/airdrop** `<count>` `<amount>` — Airdrop SUI tokens to top scorers by replying to a `/score` leaderboard (admin only)
 - **/raffle** `<amount>` — Pick a weighted winner from the top 20 ranked wallets in a replied `/score` leaderboard and airdrop the prize (admin only)
+- **/raffle status** `[id]` — Reconcile a saved draw without redrawing or resending its prize, including after a restart or subscription expiry (admin only)
 - **/setairdropwallet** — Configure an encrypted, per-group airdrop wallet in DM (admin only)
 - **/settoken** `<coin_type|off>` — Set or clear the group's airdrop token (admin only; airdrops fall back to `0x2::sui::SUI`)
 - **/setbuybot** `on|off` — Toggle finalized DEX-buy announcements for the explicitly selected token (admin only)
 - **/setbuyimage** — Set custom buy announcement media by replying to a photo, GIF, video, or image/video file; use `off` to remove it (admin only)
 - **/setemoji** `<emoji>` — Set the group's buybot emoji (admin only)
 - **/setminbuy** `<USD amount>` — Suppress buy announcements below a per-group USD minimum; use `off` or `0` to remove it (admin only)
+
+Custom-token airdrops and raffles require verified token decimals; a metadata
+outage stops the payout instead of assuming SUI precision. Native SUI retains its
+known nine decimals. Failed metadata lookups are retried on subsequent requests.
+Wallet setup rechecks the submitting user's current admin role in the target
+group and accepts private-key submissions only in DM.
+
+Raffles save the winner and prepared transaction digest before submission, using
+the same durable batch mechanism as airdrops. Redelivery/status never sends again.
+An unresolved payout blocks new rewards in that group until its saved transaction
+is reconciled. A saved `not_sent` raffle is not automatically retried; inspect its
+status before deliberately issuing a new draw. Legacy raffles sent before this
+update have no journal and still require manual transaction verification.
 
 ### 📊 Leaderboards & Stats
 - **/score** — Detailed AI-integrated contribution leaderboard with quality, tone, helpfulness, and humor scoring (admin only)

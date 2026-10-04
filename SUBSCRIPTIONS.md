@@ -82,7 +82,14 @@ require manual reconciliation against
 [getStarTransactions](https://core.telegram.org/bots/api#getstartransactions) and
 the purchaser's receipt. Do not fabricate a payment or manually extend expiration
 without verifying it against Telegram. An operator must resolve any automatic
-refund/cancellation API failure before considering the incident closed.
+refund/cancellation API failure before considering the incident closed. Duplicate
+subscription cleanup now records refund and cancellation independently and retries
+unfinished work every 60 seconds, beginning shortly after startup. A successful
+refund does not suppress an unfinished cancellation. Look for pending-cleanup
+errors in logs and verify the saved payment/order states before closing an incident.
+This uses the existing billing tables and requires no new secrets or schema changes.
+It does not replace receipt reconciliation for an initial payment that could not be
+persisted during an extended database outage.
 
 Run a single polling replica. External refunds/configuration changes and any
 other process's entitlement changes can take up to 60 seconds to be observed by

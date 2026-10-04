@@ -405,9 +405,11 @@ def get_proportionally_sampled_messages(messages):
     )
     return sampled_messages
 
-def build_safe_transcript(messages, line_formatter, max_chars=12000):
+def build_safe_transcript(messages, line_formatter, max_chars=12000, *, with_coverage=False):
     """Builds a transcript from messages, ensuring it doesn't exceed a character limit."""
     transcript_lines = []
+    included = []
+    clipped = False
     char_count = 0
 
     # Iterate in reverse to prioritize recent messages
@@ -420,12 +422,37 @@ def build_safe_transcript(messages, line_formatter, max_chars=12000):
         if len(line) + separator_size > remaining:
             if not transcript_lines:
                 transcript_lines.append(line[:max_chars])
+                included.append(msg)
+                clipped = True
             break
         transcript_lines.append(line)
+        included.append(msg)
         char_count += len(line) + separator_size
 
     # Return in chronological order
-    return "\n".join(reversed(transcript_lines))
+    transcript = "\n".join(reversed(transcript_lines))
+    if with_coverage:
+        return transcript, list(reversed(included)), clipped
+    return transcript
+
+
+def prepare_ai_transcript(messages, formatter):
+    """Disclose both count sampling and the later character-budget reduction."""
+    sampled = get_proportionally_sampled_messages(messages)
+    transcript, included, clipped = build_safe_transcript(sampled, formatter, with_coverage=True)
+    if not included:
+        raise ValueError('No messages fit the transcript')
+    start = datetime.datetime.fromisoformat(included[0]['date'])
+    end = datetime.datetime.fromisoformat(included[-1]['date'])
+    start = (start if start.tzinfo else start.replace(tzinfo=datetime.timezone.utc)).astimezone(datetime.timezone.utc)
+    end = (end if end.tzinfo else end.replace(tzinfo=datetime.timezone.utc)).astimezone(datetime.timezone.utc)
+    coverage = f"Evidence: {len(included)} of {len(messages)} matching stored messages"
+    coverage += f" ({start:%Y-%m-%d %H:%M} to {end:%Y-%m-%d %H:%M} UTC)."
+    if len(included) < len(messages) or clipped:
+        coverage += ' Partial coverage; omitted text was not analyzed.'
+    if clipped:
+        coverage += ' The included message was shortened.'
+    return transcript, coverage, (end - start).days + 1
 
 # --- Database Key Helper Functions ---
 def _get_user_key(chat_id, user_id):
@@ -810,11 +837,13 @@ async def sui_get_coin_metadata(coin_type: str) -> dict | None:
         logging.warning(f"Failed to fetch coin metadata for {coin_type}: {exc}")
         metadata = None
 
-    _coin_metadata_cache[coin_type] = metadata
+    # Never pin a transient failure (or malformed decimals) until restart.
+    if isinstance(metadata, dict) and type(metadata.get('decimals')) is int and 0 <= metadata['decimals'] <= 255:
+        _coin_metadata_cache[coin_type] = metadata
     return metadata
 
 
-async def get_coin_amount_config(coin_type: str) -> dict:
+async def get_coin_amount_config(coin_type: str, *, require_verified=False) -> dict:
     metadata = await sui_get_coin_metadata(coin_type)
     decimals = metadata.get("decimals") if isinstance(metadata, dict) else None
     symbol = metadata.get("symbol") if isinstance(metadata, dict) else None
@@ -823,7 +852,10 @@ async def get_coin_amount_config(coin_type: str) -> dict:
         if isinstance(metadata, dict)
         else None
     )
-    if not isinstance(decimals, int):
+    if type(decimals) is not int or not 0 <= decimals <= 255:
+        if require_verified and coin_type != DEFAULT_SUI_COIN_TYPE:
+            raise ValueError('Token decimals are unavailable. No payout was sent. Please retry when token metadata is available.')
+        # Retain the existing buy-display fallback; never use it for custom-token payouts.
         decimals = DEFAULT_SUI_COIN_DECIMALS
     if not symbol:
         symbol = coin_type.split("::")[-1]
@@ -2636,6 +2668,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
 
     if context.args and context.args[0].startswith('airdropwallet_'):
+        if update.effective_chat.type != 'private':
+            await update.message.reply_text('Open the setup button in a private chat with me. Never send a private key in a group.')
+            return ConversationHandler.END
         try:
             target_chat_id = int(context.args[0].split('_')[1])
             logging.info(f"Airdrop wallet flow requested for user {user_id} and chat {target_chat_id}")
@@ -2803,32 +2838,19 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         summary_title_context = f"the last {len(messages)} messages"
 
-        days = None
-        if len(messages) > 1:
-            start_date = datetime.datetime.fromisoformat(messages[0]['date'])
-            end_date = datetime.datetime.fromisoformat(messages[-1]['date'])
-            days = (end_date - start_date).days + 1
-        elif len(messages) == 1:
-            days = 1
-
         if topic:
             messages = [msg for msg in messages if topic.lower() in msg['text'].lower()]
             if not messages:
                 await update.message.reply_text(f"No messages found about '{topic}' in the specified range.")
                 return
 
-        sampled_messages = await asyncio.to_thread(get_proportionally_sampled_messages, messages)
-
-        if len(sampled_messages) < len(messages):
-            await update.message.reply_text(f"⚠️ Your request was too large. Summarizing a representative sample of messages.")
-
         formatter = lambda msg: f"[{datetime.datetime.fromisoformat(msg['date']).strftime('%m/%d/%Y')}] @{msg['username']}: {msg['text']}"
-        transcript = build_safe_transcript(sampled_messages, formatter)
+        transcript, coverage, covered_days = await asyncio.to_thread(prepare_ai_transcript, messages, formatter)
 
-        summary = await asyncio.to_thread(summarize_chat_history, transcript, days, topic)
+        summary = await asyncio.to_thread(summarize_chat_history, transcript, covered_days, topic)
 
-        title = f"<b>Summary for {summary_title_context} on '{topic}':</b>\n\n" if topic else f"<b>Summary for {summary_title_context}:</b>\n\n"
-        await _reply_with_footer(update.message, title + summary)
+        title = f"<b>Summary for {summary_title_context} on '{html.escape(topic)}':</b>\n\n" if topic else f"<b>Summary for {summary_title_context}:</b>\n\n"
+        await _reply_with_footer(update.message, title + html.escape(coverage) + '\n\n' + summary)
 
     except (ValueError, IndexError):
         await update.message.reply_text(INVALID_FORMAT_MESSAGE)
@@ -2861,28 +2883,15 @@ async def bestof_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         title_context = f"the last {len(messages)} messages"
-        days = None
-        if len(messages) > 1:
-            start_date = datetime.datetime.fromisoformat(messages[0]['date'])
-            end_date = datetime.datetime.fromisoformat(messages[-1]['date'])
-            days = (end_date - start_date).days + 1
-        elif len(messages) == 1:
-            days = 1
-
-        sampled_messages = await asyncio.to_thread(get_proportionally_sampled_messages, messages)
-
-        if len(sampled_messages) < len(messages):
-            await update.message.reply_text(f"⚠️ Your request was too large. Curating from a representative sample of messages.")
-
         formatter = lambda msg: f"@{msg['username']}: {msg['text']}"
-        transcript = build_safe_transcript(sampled_messages, formatter)
+        transcript, coverage, covered_days = await asyncio.to_thread(prepare_ai_transcript, messages, formatter)
 
-        best_of_digest = await asyncio.to_thread(get_best_of_messages, transcript, days)
+        best_of_digest = await asyncio.to_thread(get_best_of_messages, transcript, covered_days)
         best_of_digest = best_of_digest.replace(' "</blockquote>', '</blockquote>')
 
         await _reply_with_footer(
             update.message,
-            f"🏆 <b>Best of {title_context}:</b>\n\n{best_of_digest}",
+            f"🏆 <b>Best of {title_context}:</b>\n\n{html.escape(coverage)}\n\n{best_of_digest}",
         )
 
     except (ValueError, IndexError):
@@ -2925,13 +2934,8 @@ async def vibecheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"No messages found about '{topic}' in the specified range.")
                 return
 
-        sampled_messages = await asyncio.to_thread(get_proportionally_sampled_messages, messages)
-
-        if len(sampled_messages) < len(messages):
-            await update.message.reply_text(f"⚠️ Your request was too large. Analyzing a representative sample of messages.")
-
         formatter = lambda msg: f"@{msg['username']}: {msg['text']}"
-        transcript = build_safe_transcript(sampled_messages, formatter)
+        transcript, coverage, covered_days = await asyncio.to_thread(prepare_ai_transcript, messages, formatter)
 
         vibe_data = await asyncio.to_thread(get_vibe_check, transcript, topic)
 
@@ -2949,6 +2953,7 @@ async def vibecheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         topic_str = f"on <b>{html.escape(topic)}</b>" if topic else ""
         response_text = (
             f"📊 <b>Vibe Check for {title_context} {topic_str}</b>\n\n"
+            f"{html.escape(coverage)}\n\n"
             f"<b>Key Messages:</b>\n{key_messages_html}\n"
             f"<b>Sentiment:</b> {vibe_data.get('sentiment')} {sentiment_emoji}\n\n"
             f"<i>{html.escape(vibe_data.get('summary', ''))}</i>"
@@ -3372,8 +3377,17 @@ async def setairdropwallet_command(update: Update, context: ContextTypes.DEFAULT
 async def _report_airdrop(message, run):
     counts = defaultdict(int)
     total_sent = 0
-    lines = [f"🪂 <b>Airdrop #{run['id']}</b>",
+    kind = run.get("kind", "airdrop")
+    lines = [f"🪂 <b>{kind.title()} #{run['id']}</b>",
              f"Token: <code>{html.escape(run['coin_type'])}</code>"]
+    if kind == 'raffle':
+        winner = run['batches'][0]['recipients'][0]
+        lines.extend([
+            f"Winner: #{winner['rank']} @{html.escape(winner['username'])}",
+            f"Wallet: <code>{html.escape(winner['wallet'])}</code>",
+            f"Sender: <code>{html.escape(run['sender'])}</code>",
+            f"Eligible wallets: {run['eligible_wallets']} / {RAFFLE_MAX_RANK} (weighted by rank)",
+        ])
     for batch in run["batches"]:
         counts[batch["status"]] += len(batch["recipients"])
         if batch["status"] == "sent":
@@ -3394,7 +3408,7 @@ async def _report_airdrop(message, run):
                          f"{format_token_amount(int(item['amount']), run['decimals'])} {html.escape(run['symbol'])}")
     for item in run["skipped"]:
         lines.append(f"⏭️ #{item['rank']} @{html.escape(item['username'])}: {item['reason']}")
-    lines.append(f"Check again: /airdrop status {run['id']}. Status checks never send payments.")
+    lines.append(f"Check again: /{kind} status {run['id']}. Status checks never send payments.")
     # Keep large reports within Telegram's message size limit.
     chunk = ""
     for line in lines:
@@ -3475,9 +3489,11 @@ async def _airdrop_command_locked(update, context):
                 f"Airdrop #{previous_id} has an unconfirmed batch. Use /airdrop status {previous_id} "
                 "before sending more rewards. If it remains unconfirmed, ask the operator to reconcile its saved transaction ID.")
             return
+    if await _unconfirmed_reward(chat_id, service, update.message, 'raffle'):
+        return
     coin_type = db.get(_get_airdrop_token_key(chat_id), DEFAULT_SUI_COIN_TYPE)
-    config = await get_coin_amount_config(coin_type)
     try:
+        config = await get_coin_amount_config(coin_type, require_verified=True)
         tiers = parse_airdrop_tiers(context.args, config['decimals'])
     except ValueError as exc:
         await update.message.reply_text(f"Invalid rewards: {exc}")
@@ -3527,134 +3543,117 @@ async def _airdrop_command_locked(update, context):
     await _report_airdrop(update.message, run)
 
 
-@premium_group_feature
+async def _unconfirmed_reward(chat_id, service, message, kind):
+    previous_id = await asyncio.to_thread(db.get, f'{kind}_latest:{chat_id}')
+    if not previous_id:
+        return False
+    key = f'{kind}_run:{chat_id}:{previous_id}'
+    run = await asyncio.to_thread(db.get, key)
+    if not run:
+        # A missing journal is not proof that no transaction was submitted.
+        await message.reply_text(f'Cannot load {kind} #{previous_id}. Ask the operator to restore its payout record before sending more rewards.')
+        return True
+    await reconcile_batches(service, db, key, run)
+    if any(batch['status'] in ('unknown', 'submitted') for batch in run['batches']):
+        await message.reply_text(f'{kind.title()} #{previous_id} has an unconfirmed payout. Use /{kind} status {previous_id} before sending more rewards.')
+        return True
+    return False
+
+
 async def raffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Picks a weighted winner from a replied leaderboard and airdrops the prize."""
+    """Persist the draw and prepared transaction; status never sends funds."""
+    is_status = bool(context.args and context.args[0].lower() == 'status')
+    if not is_status and not await require_group_access(update, context):
+        return
     if not await require_admin(update, context):
         return
-
-    _track_chat(update.effective_chat.id)
-    if len(context.args) < 1:
-        await update.message.reply_text(
-            "Usage: Reply to a /score leaderboard message with:\n"
-            "/raffle &lt;amount&gt;\n\n"
-            "Example:\n"
-            "1. Run /score 30 days\n"
-            "2. Broadcast the leaderboard to the group\n"
-            "3. Reply to that leaderboard message with /raffle 500\n\n"
-            "<i>The winner is selected from the top 20 ranked users with registered wallets, with slightly better odds for higher ranks.</i>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
     chat_id = update.effective_chat.id
-    coin_type = db.get(_get_airdrop_token_key(chat_id), DEFAULT_SUI_COIN_TYPE)
-    coin_amount_config = await get_coin_amount_config(coin_type)
-    try:
-        amount = parse_token_amount(context.args[0], coin_amount_config.get('decimals', DEFAULT_SUI_COIN_DECIMALS))
-    except ValueError as e:
-        await update.message.reply_text(f"❌ Invalid raffle prize amount: {html.escape(str(e))}", parse_mode=ParseMode.HTML)
+    # Share the payout lock with airdrops, including status reconciliation.
+    lock = context.application.bot_data.setdefault(f'airdrop_lock:{chat_id}', asyncio.Lock())
+    if lock.locked():
+        await update.message.reply_text('A reward operation is already running for this group. Please wait.')
         return
+    async with lock:
+        await _raffle_command_locked(update, context)
 
-    if not update.message.reply_to_message:
-        await update.message.reply_text(
-            "❌ Please reply to a /score leaderboard message to use /raffle.\n\n"
-            "1. Run /score (e.g. /score 30 days)\n"
-            "2. Broadcast the leaderboard to the group\n"
-            "3. Reply to that leaderboard message with /raffle &lt;amount&gt;",
-            parse_mode=ParseMode.HTML,
-        )
+
+async def _raffle_command_locked(update, context):
+    chat_id = update.effective_chat.id
+    message = update.message
+    service = get_sui_service(SUI_GRPC_URL, SUI_GRPC_HEADERS)
+    latest_key = f'raffle_latest:{chat_id}'
+    if context.args and context.args[0].lower() == 'status':
+        if len(context.args) > 2 or (len(context.args) == 2 and not context.args[1].isdigit()):
+            await message.reply_text('Use /raffle status or /raffle status <id>.')
+            return
+        run_id = context.args[1] if len(context.args) == 2 else await asyncio.to_thread(db.get, latest_key)
+        key = f'raffle_run:{chat_id}:{run_id}'
+        run = await asyncio.to_thread(db.get, key)
+        if not run:
+            await message.reply_text('No saved raffle found for this group.')
+            return
+        await reconcile_batches(service, db, key, run)
+        await _report_airdrop(message, run)
         return
-
-    replied_msg_id = update.message.reply_to_message.message_id
-    leaderboard = _get_leaderboard_messages(context).get((chat_id, replied_msg_id))
-
+    if len(context.args) != 1 or not message.reply_to_message:
+        await message.reply_text('Reply to a /score leaderboard with /raffle <amount>. Use /raffle status to check a saved draw. The winner is drawn from the top 20 ranked users with wallets, weighted by rank.')
+        return
+    run_id = str(message.message_id)
+    key = f'raffle_run:{chat_id}:{run_id}'
+    existing = await asyncio.to_thread(db.get, key)
+    if existing:
+        await reconcile_batches(service, db, key, existing)
+        await _report_airdrop(message, existing)
+        return
+    for kind in ('raffle', 'airdrop'):
+        if await _unconfirmed_reward(chat_id, service, message, kind):
+            return
+    leaderboard = _get_leaderboard_messages(context).get((chat_id, message.reply_to_message.message_id))
     if not leaderboard:
-        await update.message.reply_text('❌ The replied message is not a recognized leaderboard. Please reply to a leaderboard broadcasted by /score.')
+        await message.reply_text('The replied message is not a recognized leaderboard. Reply to a leaderboard broadcast by /score.')
         return
-
-    weighted_candidates = []
-
-    for rank, (username, _metrics, _message_count, user_id_str) in enumerate(leaderboard[:RAFFLE_MAX_RANK], start=1):
-        wallet_data = await asyncio.to_thread(get_wallet, chat_id, int(user_id_str))
-        if not wallet_data or not wallet_data.get('wallet_address'):
-            continue
-        weighted_candidates.append(
-            {
-                'rank': rank,
-                'username': username or f'user_{user_id_str}',
-                'wallet_address': wallet_data['wallet_address'],
-            }
-        )
-
-    if not weighted_candidates:
-        await update.message.reply_text(f'❌ None of the top {RAFFLE_MAX_RANK} leaderboard users have wallets registered.')
+    coin_type = await asyncio.to_thread(db.get, _get_airdrop_token_key(chat_id), DEFAULT_SUI_COIN_TYPE)
+    try:
+        config = await get_coin_amount_config(coin_type, require_verified=True)
+        amount = parse_token_amount(context.args[0], config['decimals'])
+    except ValueError as exc:
+        await message.reply_text(f'Raffle cannot proceed: {exc}')
         return
-
-    winner = select_weighted_raffle_winner(weighted_candidates)
+    candidates = []
+    for rank, (username, _metrics, _count, user_id) in enumerate(leaderboard[:RAFFLE_MAX_RANK], 1):
+        data = await asyncio.to_thread(get_wallet, chat_id, int(user_id))
+        wallet = normalize_wallet_address((data or {}).get('wallet_address', ''))
+        if wallet:
+            candidates.append({'rank': rank, 'username': username or f'user_{user_id}',
+                               'wallet_address': wallet, 'user_id': str(user_id)})
+    if not candidates:
+        await message.reply_text(f'None of the top {RAFFLE_MAX_RANK} leaderboard users have valid wallets registered.')
+        return
+    winner = select_weighted_raffle_winner(candidates)
     if not winner:
-        await update.message.reply_text('❌ Could not select a raffle winner.')
+        await message.reply_text('Could not select a raffle winner.')
         return
-
     try:
-        sender_config = await asyncio.to_thread(resolve_airdrop_sender, chat_id)
-    except Exception as e:
-        logging.error(f'Failed to resolve raffle sender for chat {chat_id}: {e}')
-        await update.message.reply_text(f'❌ {html.escape(str(e))}', parse_mode=ParseMode.HTML)
+        sender = await asyncio.to_thread(resolve_airdrop_sender, chat_id)
+        if not sender:
+            raise ValueError('Configure a sender with /setairdropwallet first.')
+        await preflight_airdrop(sender['wallet_address'], 1, amount, coin_type)
+    except Exception as exc:
+        await message.reply_text(f'Raffle preflight failed: {exc}')
         return
-
-    if not sender_config:
-        await update.message.reply_text(
-            '❌ No airdrop wallet is configured for this group. Use /setairdropwallet, or configure the legacy SUI_PRIVATE_KEY fallback.',
-        )
-        return
-
-    try:
-        preflight = await preflight_airdrop(sender_config['wallet_address'], 1, amount, coin_type)
-    except Exception as e:
-        logging.error(f'Raffle preflight failed for chat {chat_id}: {e}')
-        await update.message.reply_text(f'❌ Raffle preflight failed: {html.escape(str(e))}', parse_mode=ParseMode.HTML)
-        return
-
-    preflight_lines = [
-        f"🎟️ Running a raffle for <code>{html.escape(coin_type)}</code> across {len(weighted_candidates)} registered wallets from the top {RAFFLE_MAX_RANK}.",
-        f"Winner odds are weighted slightly by leaderboard place.",
-        f"Sender: <code>{html.escape(_short_address(sender_config['wallet_address']))}</code> ({html.escape(sender_config['source'])})",
-        f"Preflight: {format_token_amount(preflight['available_sui_balance'], DEFAULT_SUI_COIN_DECIMALS)} SUI available / {format_token_amount(preflight['required_sui_balance'], DEFAULT_SUI_COIN_DECIMALS)} SUI required",
-    ]
-    if coin_type != DEFAULT_SUI_COIN_TYPE:
-        preflight_lines.append(
-            f"Token preflight: {format_token_amount(preflight['available_token_balance'], coin_amount_config['decimals'])} {html.escape(coin_amount_config['symbol'])} available / {format_token_amount(preflight['required_token_balance'], coin_amount_config['decimals'])} {html.escape(coin_amount_config['symbol'])} required"
-        )
-    await update.message.reply_text("\n".join(preflight_lines), parse_mode=ParseMode.HTML)
-
-    safe_username = html.escape(winner['username'])
-    try:
-        tx_result = await sui_transfer_token(winner['wallet_address'], amount, coin_type, sender_config['private_key_hex'])
-    except Exception as e:
-        logging.error(f"Raffle transfer failed for {winner['username']} ({winner['wallet_address']}): {e}")
-        await update.message.reply_text(
-            (
-                "❌ <b>Raffle draw failed</b>\n\n"
-                f"Winner: #{winner['rank']} @{safe_username}\n"
-                f"Wallet: <code>{html.escape(winner['wallet_address'])}</code>\n"
-                f"Error: {html.escape(str(e))}"
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    tx_digest = tx_result.get('digest', 'unknown')
-    summary = (
-        "🎉 <b>Raffle Complete</b>\n\n"
-        f"Token: <code>{html.escape(coin_type)}</code>\n"
-        f"Prize: {format_token_amount(amount, coin_amount_config['decimals'])} {html.escape(coin_amount_config['symbol'])}\n"
-        f"Winner: #{winner['rank']} @{safe_username}\n"
-        f"Wallet: <code>{html.escape(winner['wallet_address'])}</code>\n"
-        f"Eligible wallets: {len(weighted_candidates)} / {RAFFLE_MAX_RANK}\n"
-        f"Transaction: <code>{html.escape(tx_digest)}</code>"
-    )
-    await _reply_with_footer(update.message, summary)
+    recipient = {'rank': winner['rank'], 'username': winner['username'],
+                 'user_id': winner['user_id'], 'wallet': winner['wallet_address'], 'amount': str(amount)}
+    run = {'id': run_id, 'kind': 'raffle', 'coin_type': coin_type,
+           'decimals': config['decimals'], 'symbol': config['symbol'],
+           'sender': sender['wallet_address'], 'eligible_wallets': len(candidates),
+           'leaderboard_message_id': message.reply_to_message.message_id,
+           'skipped': [], 'batches': [{'status': 'not_sent', 'recipients': [recipient]}]}
+    # No signing or submission until both journal writes succeed.
+    await asyncio.to_thread(db.__setitem__, key, run)
+    await asyncio.to_thread(db.__setitem__, latest_key, run_id)
+    await message.reply_text(f"Raffle #{run_id}: selected #{winner['rank']} @{winner['username']}. Preparing the saved prize; check /raffle status {run_id} if interrupted.")
+    await execute_batches(service, db, key, run, sender['private_key_hex'], SUI_GAS_BUDGET)
+    await _report_airdrop(message, run)
 
 
 async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3925,12 +3924,16 @@ async def receive_airdrop_private_key(update: Update, context: ContextTypes.DEFA
         return ConversationHandler.END
 
     try:
-        chat_info = await context.bot.get_chat(target_chat_id)
-        chat_name = chat_info.title or f'Group (ID: {target_chat_id})'
         try:
             await update.message.delete()
         except Exception:
             logging.warning('Could not delete private key submission message for user %s', user_id)
+
+        if update.effective_chat.type != 'private' or not await user_is_admin(context, target_chat_id, user_id):
+            await update.message.reply_text('Wallet setup canceled. Only a current group admin can configure the wallet, in a private chat.')
+            return ConversationHandler.END
+        chat_info = await context.bot.get_chat(target_chat_id)
+        chat_name = chat_info.title or f'Group (ID: {target_chat_id})'
 
         if submitted_value.lower() == 'remove':
             await asyncio.to_thread(delete_airdrop_wallet, target_chat_id)

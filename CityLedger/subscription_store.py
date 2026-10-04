@@ -141,7 +141,8 @@ class SubscriptionStore:
             if payment['payload'] != payload:
                 raise ValueError('Payment charge belongs to a different order')
             if payment['refunded']:
-                return {'chat_id': order['chat_id'], 'refunded': True, 'duplicate': not inserted}
+                return {'chat_id': order['chat_id'], 'refunded': True,
+                        'conflict': payment['needs_refund'], 'duplicate': not inserted}
             if not inserted:
                 return {
                     'chat_id': order['chat_id'], 'duplicate': True,
@@ -193,3 +194,15 @@ class SubscriptionStore:
     def set_canceled(self, payload):
         with self._transaction() as cur:
             cur.execute("UPDATE subscription_orders SET canceled = TRUE WHERE payload = %s", (payload,))
+
+    def pending_cleanup(self):
+        """Refund and renewal cancellation are independent durable steps."""
+        with self._transaction() as cur:
+            cur.execute(
+                """SELECT p.*, o.user_id, o.chat_id, o.first_charge_id, o.canceled
+                   FROM subscription_payments p
+                   JOIN subscription_orders o ON o.payload = p.payload
+                   WHERE p.needs_refund AND (NOT p.refunded OR NOT o.canceled)
+                   ORDER BY p.charge_id LIMIT 100"""
+            )
+            return [dict(row) for row in cur.fetchall()]
