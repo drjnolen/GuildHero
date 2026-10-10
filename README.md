@@ -232,12 +232,12 @@ To enable airdrops:
 
 The buy bot reads finalized Sui checkpoints over gRPC. A transaction is announced when:
 
-1. The selected token has a positive balance change for a wallet; and
+1. The selected token has a positive balance change for a wallet (or a supported full-route confirmation proves the purchase before an index deposit); and
 2. The successful transaction contains swap evidence, or the recipient has a net outflow of another coin after SUI gas is removed.
 
 This deliberately excludes plain transfers, airdrops, failed transactions, claims, rewards, and most liquidity operations. The announcement includes the token amount, SUI and USD purchase values, a transaction-derived post-buy market-cap estimate, a size-based flame scale, smart buyer badges, an abbreviated explorer link for the purchasing wallet, token-wide 24-hour and 1-hour DEX volume, an abbreviated sender link when different, and a transaction explorer link.
 
-The market-cap estimate uses the finalized purchase's effective USD price per received token multiplied by Sui's on-chain total supply. This makes the triggering buy part of the displayed estimate instead of relying on a potentially stale pre-buy market snapshot. If the transaction cannot be valued in USD or Sui does not expose the coin's supply, the alert displays `N/A` without suppressing the buy.
+The market-cap estimate uses the finalized purchase's effective USD price per purchased token multiplied by Sui's on-chain total supply. It is an execution-price estimate, not a circulating-supply or spot-price feed. Supported, fee-free `ConfirmSwapEventV3` SUI routes use each token's confirmed input/output totals, excluding intermediate hops and other basket purchases. This also preserves the gross purchase amount when tokens are subsequently deposited into an index. Other simple swaps use net wallet balances; unsupported ambiguous baskets/deposits and malformed confirmations are skipped instead of assigning the whole transaction's spending to wallet leftovers. If the transaction cannot be valued in USD or Sui does not expose the coin's supply, the alert displays `N/A` without suppressing the buy.
 
 Rolling USD volume comes from [DEX Screener](https://docs.dexscreener.com/api/reference) and is summed across the selected token's unique Sui pools. Results are cached for 60 seconds. Because the provider can lag a newly finalized transaction, GuildHero adds the triggering buy's USD value to both displayed windows. If provider volume is unavailable but the buy can be valued, the current buy becomes the minimum displayed 1-hour and 24-hour volume instead of showing `N/A`.
 
@@ -248,7 +248,7 @@ Buyer badges are tracked separately for each group, selected token, and wallet:
 - 💎 **Returning Holder** — the wallet held the token before the purchase or GuildHero previously observed it buying that token
 - 🔥 **Three-Day Streak** — the wallet buys on three consecutive UTC calendar days
 
-GuildHero verifies holdings with Sui RPC once per detected purchase and infers the pre-purchase balance by subtracting the finalized token receipt. If the balance is unavailable or inconsistent, the holder-status badge is omitted instead of claiming the buyer is new. Buyer history is saved only after Telegram accepts the announcement, so delivery retries do not create false returning-buyer or streak badges.
+GuildHero verifies holdings with Sui RPC once per detected purchase and infers the pre-purchase balance by subtracting the finalized net wallet balance change, not gross swap output that was subsequently deposited. If the balance is unavailable or inconsistent, or the net receipt is non-positive, the on-chain holder-status badge is omitted instead of claiming the buyer is new. Buyer history is saved only after Telegram accepts the announcement, so delivery retries do not create false returning-buyer or streak badges.
 
 To enable it in a group:
 

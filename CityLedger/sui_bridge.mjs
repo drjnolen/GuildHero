@@ -10,6 +10,7 @@ const CHECKPOINT_READ_MASK = {
     'sequence_number',
     'transactions.digest',
     'transactions.transaction.sender',
+    'transactions.transaction.gas_payment.owner',
     'transactions.transaction.kind.programmable_transaction.commands.move_call.package',
     'transactions.transaction.kind.programmable_transaction.commands.move_call.module',
     'transactions.transaction.kind.programmable_transaction.commands.move_call.function',
@@ -20,6 +21,7 @@ const CHECKPOINT_READ_MASK = {
     'transactions.events.events.module',
     'transactions.events.events.event_type',
     'transactions.events.events.sender',
+    'transactions.events.events.json',
     'transactions.checkpoint',
     'transactions.timestamp',
     'transactions.balance_changes',
@@ -231,6 +233,16 @@ function mapMoveCalls(transaction) {
     }));
 }
 
+function mapSwapFields(event) {
+  const fields = event.json?.kind?.structValue?.fields ?? {};
+  // Preserve integer strings exactly; do not forward large arbitrary event data.
+  return Object.fromEntries(
+    ['from', 'target', 'amount_in', 'amount_out', 'quote_id', 'fee_amount']
+      .filter((name) => fields[name]?.kind?.oneofKind === 'stringValue')
+      .map((name) => [name, fields[name].kind.stringValue]),
+  );
+}
+
 export function mapCheckpoint(checkpoint) {
   if (!checkpoint || checkpoint.sequenceNumber === undefined) {
     throw new Error('Sui gRPC returned an incomplete checkpoint.');
@@ -265,7 +277,8 @@ export function mapCheckpoint(checkpoint) {
           storage_rebate:
             item.effects?.gasUsed?.storageRebate?.toString() ?? '0',
         },
-        gas_payer: item.effects?.gasObject?.inputOwner?.address ?? '',
+        gas_payer: item.transaction?.gasPayment?.owner ??
+          item.effects?.gasObject?.inputOwner?.address ?? '',
       },
       events: {
         events: (item.events?.events ?? []).map((event) => ({
@@ -273,6 +286,7 @@ export function mapCheckpoint(checkpoint) {
           module: event.module ?? '',
           event_type: event.eventType ?? '',
           sender: event.sender ?? '',
+          parsed_json: mapSwapFields(event),
         })),
       },
       checkpoint:

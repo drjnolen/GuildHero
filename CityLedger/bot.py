@@ -1134,7 +1134,8 @@ async def _get_pre_purchase_token_balance(event, coin_type: str) -> int | None:
     """Infer holdings before a finalized buy from the wallet's current balance."""
 
     try:
-        purchased_amount = int(event.amount)
+        balance_change = getattr(event, "wallet_balance_change", None)
+        net_received = int(event.amount if balance_change is None else balance_change)
         post_purchase_balance = int(
             await sui_get_total_balance(event.wallet, coin_type)
         )
@@ -1147,17 +1148,17 @@ async def _get_pre_purchase_token_balance(event, coin_type: str) -> int | None:
         )
         return None
 
-    if purchased_amount <= 0 or post_purchase_balance < purchased_amount:
+    if net_received <= 0 or post_purchase_balance < net_received:
         logging.info(
             "Cannot infer pre-purchase holdings for %s in %s: balance %s is "
-            "below finalized purchase amount %s",
+            "inconsistent with finalized net receipt %s",
             event.wallet,
             coin_type,
             post_purchase_balance,
-            purchased_amount,
+            net_received,
         )
         return None
-    return post_purchase_balance - purchased_amount
+    return post_purchase_balance - net_received
 
 
 def _updated_buybot_buyer_profile(

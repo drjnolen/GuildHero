@@ -126,6 +126,7 @@ test('maps only buy-detection fields from a gRPC checkpoint', () => {
               module: 'pool',
               event_type: '0xcetus::pool::SwapEvent',
               sender: '0xbuyer',
+              parsed_json: {},
             },
           ],
         },
@@ -140,6 +141,27 @@ test('maps only buy-detection fields from a gRPC checkpoint', () => {
         ],
       },
     ],
+  });
+});
+
+test('preserves exact route fields and address-balance gas ownership', () => {
+  const fields = Object.fromEntries(Object.entries({
+    from: '2::sui::SUI', target: 'abc::coin::COIN',
+    amount_in: '6066111605', amount_out: '18446744073709551615',
+    fee_amount: '0', quote_id: 'route-1', ignored: 'discarded',
+  }).map(([key, stringValue]) => [key, { kind: { oneofKind: 'stringValue', stringValue } }]));
+  fields.numeric = { kind: { oneofKind: 'numberValue', numberValue: 42 } };
+  const mapped = mapCheckpoint({ sequenceNumber: 1n, transactions: [{
+    transaction: { sender: '0xbuyer', gasPayment: { owner: '0xsponsor' } },
+    events: { events: [{ json: { kind: {
+      oneofKind: 'structValue', structValue: { fields },
+    } } }] },
+  }] }).transactions[0];
+  assert.equal(mapped.effects.gas_payer, '0xsponsor');
+  assert.deepEqual(mapped.events.events[0].parsed_json, {
+    from: '2::sui::SUI', target: 'abc::coin::COIN',
+    amount_in: '6066111605', amount_out: '18446744073709551615',
+    fee_amount: '0', quote_id: 'route-1',
   });
 });
 
@@ -192,7 +214,9 @@ test('fetches checkpoint batches with bounded concurrency and preserves sequence
   let peakInFlight = 0;
   const client = {
     ledgerService: {
-      getCheckpoint: async ({ checkpointId }) => {
+      getCheckpoint: async ({ checkpointId, readMask }) => {
+        assert.ok(readMask.paths.includes('transactions.events.events.json'));
+        assert.ok(readMask.paths.includes('transactions.transaction.gas_payment.owner'));
         inFlight += 1;
         peakInFlight = Math.max(peakInFlight, inFlight);
         const sequenceNumber = checkpointId.sequenceNumber;
@@ -303,6 +327,8 @@ test('drains finalized checkpoints from the live subscription', async () => {
     ['201', '202', '203'],
   );
   assert.equal(subscribedRequests.length, 1);
+  assert.ok(subscribedRequests[0].readMask.paths.includes('transactions.events.events.json'));
+  assert.ok(subscribedRequests[0].readMask.paths.includes('transactions.transaction.gas_payment.owner'));
   assert.ok(
     subscribedRequests[0].readMask.paths.includes(
       'transactions.balance_changes',
