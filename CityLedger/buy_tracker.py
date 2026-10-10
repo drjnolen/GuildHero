@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -14,6 +15,12 @@ DEFAULT_DEX_PACKAGES = {
     "0x8b14f4351bb342b81c27fce2fe6d0f56b98288dc88fbe60b28b26d804b25941a": "Turbos",
 }
 SUI_COIN_TYPE = "0x2::sui::sui"
+# Full-route confirmations, not individual pool/hop events. Pin the defining
+# package/type: an unrelated package can emit an identically named event.
+_CONFIRMED_SWAP_TYPE = (
+    "0xffd4058af7d6f6d66c335930cced8c91e38ec943e2392232aee27e8127e684e9"
+    "::router::ConfirmSwapEventV3"
+)
 
 _DEX_NAME_HINTS = (
     ("cetus", "Cetus"),
@@ -60,6 +67,8 @@ class BuyEvent:
     sui_spent: int | None = None
     checkpoint: int | None = None
     timestamp: Any = None
+    # Swap output may subsequently be deposited/transferred in the same PTB.
+    wallet_balance_change: int | None = None
 
 
 def _get(value: Any, name: str, default=None):
@@ -237,6 +246,60 @@ def _wallet_spent_another_coin(
     return False
 
 
+def _route_coin_type(value: Any) -> str:
+    if not isinstance(value, str) or not re.fullmatch(
+        r"(?:0x)?[0-9a-fA-F]{1,64}::[A-Za-z_][A-Za-z_0-9]*::[A-Za-z_][A-Za-z_0-9]*",
+        value,
+    ):
+        return ""
+    return canonicalize_sui_type(value if value.startswith("0x") else "0x" + value)
+
+
+def _confirmed_swap_totals(
+    events: list[Any], selected: str, sender: str | None,
+) -> tuple[int, int | None] | None:
+    """Sum complete routes; only report exact SUI spend for all-SUI inputs."""
+
+    amount = spent = 0
+    all_sui_inputs = True
+    quote_ids = set()
+    for event in events:
+        data = _get(event, "parsed_json")
+        if not isinstance(data, Mapping) or _get(event, "sender") != sender:
+            return None
+        source = _route_coin_type(data.get("from"))
+        target = _route_coin_type(data.get("target"))
+        # Missing types or buying then selling this token makes attribution unsafe.
+        if not source or not target or source == selected:
+            return None
+        if target != selected:
+            continue
+        quote_id = data.get("quote_id")
+        if not isinstance(quote_id, str) or not quote_id:
+            return None
+        if quote_id in quote_ids:
+            return None
+        quote_ids.add(quote_id)
+        values = [data.get(key) for key in ("amount_in", "amount_out", "fee_amount")]
+        if any(
+            not isinstance(value, str) or not re.fullmatch(r"[0-9]{1,20}", value)
+            for value in values
+        ):
+            return None
+        route_spent, route_amount, fee = map(int, values)
+        # Fee-bearing variants need their own verified accounting semantics.
+        if not 0 < route_spent < 2**64 or not 0 < route_amount < 2**64 or fee:
+            return None
+        amount += route_amount
+        if source == SUI_COIN_TYPE:
+            spent += route_spent
+        else:
+            # Preserve the existing market-price estimate for cross-token buys;
+            # their input units must never be interpreted as MIST.
+            all_sui_inputs = False
+    return (amount, spent if all_sui_inputs else None) if amount else None
+
+
 def detect_buy(
     transaction: Any,
     selected_coin_type: str,
@@ -244,9 +307,9 @@ def detect_buy(
 ) -> BuyEvent | None:
     """Detect the principal recipient of a selected token in a DEX swap.
 
-    Named swap calls/events are preferred evidence. Unknown or upgraded venues
-    are also accepted when the recipient spent another coin, after subtracting
-    SUI gas, unless the transaction is clearly a claim or liquidity operation.
+    Supported complete route confirmations preserve gross output and input cost.
+    Otherwise, simple swaps use net wallet balances; ambiguous baskets and
+    deposit/claim/liquidity operations are excluded.
     """
 
     if not selected_coin_type or not _transaction_succeeded(transaction):
@@ -264,31 +327,74 @@ def detect_buy(
         except (TypeError, ValueError):
             continue
         address = str(_get(change, "address", "") or "")
-        if amount > 0 and address:
+        if address:
             received_by_wallet[address] = received_by_wallet.get(address, 0) + amount
-
-    if not received_by_wallet:
-        return None
 
     tx_data = _get(transaction, "transaction")
     sender = str(_get(tx_data, "sender", "") or "") or None
+    confirmations = [
+        event for event in _events(transaction)
+        if _get(event, "event_type") == _CONFIRMED_SWAP_TYPE
+    ]
+    if confirmations:
+        totals = _confirmed_swap_totals(confirmations, selected, sender)
+        if not totals or not sender:
+            return None
+        # Event.sender identifies the transaction sender, not necessarily the
+        # recipient. Do not attribute another wallet's receipt to the sender.
+        if any(
+            address != sender and amount > 0
+            for address, amount in received_by_wallet.items()
+        ):
+            return None
+        amount, spent = totals
+        return BuyEvent(
+            digest=str(_get(transaction, "digest", "") or ""),
+            coin_type=selected_coin_type,
+            amount=amount,
+            wallet=sender,
+            sender=sender,
+            exchange=_infer_exchange(package_clues, dex_packages),
+            sui_spent=spent,
+            checkpoint=_get(transaction, "checkpoint"),
+            timestamp=_get(transaction, "timestamp"),
+            wallet_balance_change=received_by_wallet.get(sender, 0),
+        )
+
+    received_by_wallet = {
+        wallet: amount for wallet, amount in received_by_wallet.items() if amount > 0
+    }
+    if not received_by_wallet:
+        return None
+
     if sender in received_by_wallet:
         wallet = sender
     else:
         wallet = max(received_by_wallet, key=received_by_wallet.get)
 
-    if not has_swap_evidence:
-        has_non_buy_evidence = any(
-            hint in descriptor
-            for descriptor in descriptors
-            for hint in _NON_BUY_OPERATION_HINTS
-        )
-        if has_non_buy_evidence or not _wallet_spent_another_coin(
-            transaction,
-            wallet,
-            selected_coin_type,
-        ):
-            return None
+    # Without a supported route confirmation, a basket or deposit cannot safely
+    # pair the whole wallet's spend with a single token's leftover balance.
+    wallet_coins: dict[str, int] = {}
+    for change in _get(transaction, "balance_changes", []) or []:
+        if str(_get(change, "address", "")).lower() != wallet.lower():
+            continue
+        coin = canonicalize_sui_type(_get(change, "coin_type"))
+        try:
+            wallet_coins[coin] = wallet_coins.get(coin, 0) + int(_get(change, "amount", 0))
+        except (TypeError, ValueError):
+            continue
+    has_deposit = any(
+        hint in descriptor for descriptor in descriptors
+        for hint in (*_NON_BUY_OPERATION_HINTS, "deposit", "::mint", "::stake")
+    )
+    inputs = sum(_wallet_net_spend(transaction, wallet, coin) > 0 for coin in wallet_coins)
+    if has_deposit or sum(amount > 0 for amount in wallet_coins.values()) > 1 or inputs > 1:
+        return None
+
+    if not has_swap_evidence and not _wallet_spent_another_coin(
+        transaction, wallet, selected_coin_type,
+    ):
+        return None
 
     return BuyEvent(
         digest=str(_get(transaction, "digest", "") or ""),
@@ -300,4 +406,5 @@ def detect_buy(
         sui_spent=_wallet_net_spend(transaction, wallet, SUI_COIN_TYPE) or None,
         checkpoint=_get(transaction, "checkpoint"),
         timestamp=_get(transaction, "timestamp"),
+        wallet_balance_change=received_by_wallet[wallet],
     )

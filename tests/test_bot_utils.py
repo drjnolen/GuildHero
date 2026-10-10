@@ -7,6 +7,7 @@ pure helper functions are exercised – no real network or database calls are ma
 
 import asyncio
 import datetime
+import json
 import os
 import sys
 import unittest
@@ -91,6 +92,29 @@ from bot import (  # noqa: E402
 # ---------------------------------------------------------------------------
 
 class TestBuyAnnouncementFormatting(unittest.TestCase):
+    def test_manifest_index_purchase_valuation_and_display(self):
+        # Public transaction projection; price and supply are fixed test inputs,
+        # not a historical USD-price feed.
+        transaction = json.loads(
+            (PROJECT_ROOT / "tests/fixtures/manifest_index_buy.json").read_text()
+        )
+        coin_type = (
+            "0xc466c28d87b3d5cd34f3d5c088751532d71a38d93a8aae4551dd56272cfb4355"
+            "::manifest::MANIFEST"
+        )
+        event = bot.detect_buy(transaction, coin_type)
+        config = {"symbol": "MANIFEST", "decimals": 9,
+                  "total_supply": Decimal("1000000000000000000")}
+        valuation = _calculate_buy_valuation(event, config, sui_usd_price="1.12")
+        self.assertEqual(valuation["sui"], Decimal("6.066111605"))
+        self.assertEqual(valuation["usd"], Decimal("6.79404499760"))
+        self.assertGreater(valuation["market_cap"], Decimal("700000"))
+        self.assertLess(valuation["market_cap"], Decimal("800000"))
+        text = _format_buy_announcement(event, config, valuation)
+        self.assertIn("<b>Purchased:</b> 9,162 MANIFEST", text)
+        self.assertIn("<b>Spent:</b> 6 SUI / $6.79 USD", text)
+        self.assertIn("<b>Market Cap:</b> $741.53K", text)
+
     def _event(self, *, amount=10_000_000_000, sui_spent=None):
         return SimpleNamespace(
             amount=amount,
@@ -316,6 +340,20 @@ class TestBuyAnnouncementFormatting(unittest.TestCase):
 
 
 class TestSmartBuyerBadges(unittest.TestCase):
+    def test_holder_check_uses_net_wallet_receipt_after_deposit(self):
+        async def exercise(net_received):
+            event = SimpleNamespace(amount=9_162_159_175_791,
+                                    wallet_balance_change=net_received,
+                                    wallet="0xbuyer")
+            with patch.object(bot, "sui_get_total_balance", AsyncMock(
+                return_value=339_584_339_822
+            )):
+                return await bot._get_pre_purchase_token_balance(event, "token")
+
+        self.assertEqual(asyncio.run(exercise(339_584_334_822)), 5_000)
+        self.assertIsNone(asyncio.run(exercise(0)))
+        self.assertIsNone(asyncio.run(exercise(-100)))
+
     def test_first_observed_buy_can_also_be_a_whale(self):
         badges = _classify_buy_badges(
             {},
