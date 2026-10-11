@@ -41,7 +41,7 @@ def contribution_messages(messages):
         if date.tzinfo is None:
             date = date.replace(tzinfo=datetime.timezone.utc)
         days[date.astimezone(datetime.timezone.utc).date()] += 1
-    return unique, sum(min(count, 10) for count in days.values()), len(days)
+    return unique, sum(min(count, 20) for count in days.values()), len(days)
 
 
 def contribution_total(metrics, activity_count, active_days):
@@ -49,11 +49,16 @@ def contribution_total(metrics, activity_count, active_days):
     # Normalize the relative weights so perfect scores still reach 100.
     quality = sum(scores[field] * weight for field, weight in SCORE_WEIGHTS.items())
     quality *= 5 / sum(SCORE_WEIGHTS.values())
-    # Tone and humor alone cannot lift low-quality chatter to the top.
-    quality *= min(1, scores['quality'] / 10)
-    activity = .65 + .20 * math.log1p(min(activity_count, 100)) / math.log1p(100)
-    activity += .15 * min(active_days, 7) / 7
-    return round(min(100, max(0, quality * activity)), 2)
+    # Low-quality content discounts participation credit as well as quality.
+    quality_gate = min(1, scores['quality'] / 10)
+    count = min(100, max(0, activity_count))
+    # Smooth diminishing returns, normalized to 1 at 100 eligible posts.
+    activity = 1.1 * count / (count + 10)
+    consistency = .90 + .10 * min(max(0, active_days), count, 7) / 7
+    # Sustained participation matters, but very low-quality volume may still
+    # lose to a few excellent posts. Zero quality earns no participation floor.
+    total = (30 + .70 * quality) * quality_gate * activity * consistency
+    return round(min(100, max(0, total)), 2)
 
 
 def score_transcript(messages, max_messages=200, max_chars=12000):
