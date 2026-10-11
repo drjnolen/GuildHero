@@ -32,12 +32,12 @@ class ScoringTests(unittest.TestCase):
                            contribution_total(dict(quality=4, tone=20, helpfulness=2, humor=20), 100, 7))
         self.assertEqual(contribution_total(dict.fromkeys(metrics, 20), 10000, 100), 100)
 
-    def test_humor_adds_only_about_one_point_at_max_activity(self):
+    def test_humor_remains_a_small_bonus_at_max_activity(self):
         metrics = dict(quality=12, tone=12, helpfulness=12, humor=0)
         without_humor = contribution_total(metrics, 100, 7)
         with_humor = contribution_total({**metrics, 'humor': 20}, 100, 7)
-        # Previously the full humor range added 5 points; now it adds ~1.04.
-        self.assertAlmostEqual(with_humor - without_humor, 1.04, places=2)
+        # Humor contributes ~1.04 points to quality, then gets the 70% blend.
+        self.assertAlmostEqual(with_humor - without_humor, .73, places=2)
 
     def test_activity_beats_humor_at_equal_other_categories(self):
         metrics = dict(quality=12, tone=12, helpfulness=11, humor=0)
@@ -47,13 +47,56 @@ class ScoringTests(unittest.TestCase):
 
     def test_total_scale_is_preserved_with_lower_humor_weight(self):
         metrics = dict(quality=20, tone=20, helpfulness=20, humor=0)
-        self.assertEqual(contribution_total(dict.fromkeys(metrics, 0), 100, 7), 0)
-        self.assertEqual(contribution_total(metrics, 100, 7), 98.96)
+        self.assertEqual(contribution_total(dict.fromkeys(metrics, 0), 100, 7), 30)
+        self.assertEqual(contribution_total(metrics, 100, 7), 99.27)
         self.assertEqual(contribution_total({**metrics, 'humor': 20}, 100, 7), 100)
+
+    def test_two_perfect_posts_never_beat_fifteen_zero_quality_posts(self):
+        perfect = dict(quality=20, tone=20, helpfulness=20, humor=20)
+        poor = dict.fromkeys(perfect, 0)
+        # Extremes bound every possible valid category combination, even
+        # granting sparse users the maximum consistency input.
+        sparse_max = max(contribution_total(perfect, count, 7) for count in (1, 2))
+        for count in range(15, 101):
+            for days in range(1, 8):
+                with self.subTest(count=count, days=days):
+                    self.assertGreater(contribution_total(poor, count, days), sparse_max)
+
+    def test_ten_excellent_posts_can_beat_twenty_good_posts(self):
+        excellent = dict(quality=19, tone=19, helpfulness=19, humor=0)
+        good = dict(quality=12, tone=12, helpfulness=12, humor=0)
+        self.assertGreater(contribution_total(excellent, 10, 1),
+                           contribution_total(good, 20, 1))
+
+    def test_activity_is_monotonic_with_diminishing_returns_and_a_cap(self):
+        metrics = dict(quality=15, tone=15, helpfulness=15, humor=0)
+        totals = [contribution_total(metrics, n, 1) for n in range(101)]
+        self.assertTrue(all(a < b for a, b in zip(totals, totals[1:])))
+        gains = [totals[n + 10] - totals[n] for n in range(0, 100, 10)]
+        self.assertTrue(all(a > b for a, b in zip(gains, gains[1:])))
+        self.assertEqual(contribution_total(metrics, 100, 7),
+                         contribution_total(metrics, 1000, 70))
+
+    def test_zero_eligible_posts_earn_no_points_even_with_perfect_scores(self):
+        metrics = dict(quality=20, tone=20, helpfulness=20, humor=20)
+        self.assertEqual(contribution_total(metrics, 0, 7), 0)
+        messages = [message('gm'), message('https://example.com'), message('👍')]
+        _, count, days = contribution_messages(messages)
+        self.assertEqual(contribution_total(metrics, count, days), 0)
+
+    def test_fifteen_same_day_posts_count_toward_sparse_user_guarantee(self):
+        established = [message(f'Useful explanation of distinct issue {i}') for i in range(15)]
+        sparse = established[:2]
+        _, count, days = contribution_messages(established)
+        _, sparse_count, sparse_days = contribution_messages(sparse)
+        self.assertEqual((count, days), (15, 1))
+        perfect = dict(quality=20, tone=20, helpfulness=20, humor=20)
+        self.assertGreater(contribution_total(dict.fromkeys(perfect, 0), count, days),
+                           contribution_total(perfect, sparse_count, sparse_days))
 
     def test_daily_activity_is_capped(self):
         messages = [message(f'Useful explanation of distinct issue number {i}') for i in range(50)]
-        self.assertEqual(contribution_messages(messages)[1:], (10, 1))
+        self.assertEqual(contribution_messages(messages)[1:], (20, 1))
 
     def test_transcript_covers_early_and_late_messages_under_limit(self):
         messages = [message(f'entry{i} ' + 'x' * 10000) for i in range(30)]

@@ -41,7 +41,7 @@ def contribution_messages(messages):
         if date.tzinfo is None:
             date = date.replace(tzinfo=datetime.timezone.utc)
         days[date.astimezone(datetime.timezone.utc).date()] += 1
-    return unique, sum(min(count, 10) for count in days.values()), len(days)
+    return unique, sum(min(count, 20) for count in days.values()), len(days)
 
 
 def contribution_total(metrics, activity_count, active_days):
@@ -51,9 +51,14 @@ def contribution_total(metrics, activity_count, active_days):
     quality *= 5 / sum(SCORE_WEIGHTS.values())
     # Tone and humor alone cannot lift low-quality chatter to the top.
     quality *= min(1, scores['quality'] / 10)
-    activity = .65 + .20 * math.log1p(min(activity_count, 100)) / math.log1p(100)
-    activity += .15 * min(active_days, 7) / 7
-    return round(min(100, max(0, quality * activity)), 2)
+    count = min(100, max(0, activity_count))
+    # Smooth diminishing returns, normalized to 1 at 100 eligible posts.
+    activity = 1.1 * count / (count + 10)
+    consistency = .90 + .10 * min(max(0, active_days), count, 7) / 7
+    # Participation earns a bounded floor: even perfect 1-2-post scores
+    # cannot beat 15 eligible posts, while quality still differentiates peers.
+    total = (30 + .70 * quality) * activity * consistency
+    return round(min(100, max(0, total)), 2)
 
 
 def score_transcript(messages, max_messages=200, max_chars=12000):
