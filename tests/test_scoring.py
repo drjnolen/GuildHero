@@ -47,20 +47,30 @@ class ScoringTests(unittest.TestCase):
 
     def test_total_scale_is_preserved_with_lower_humor_weight(self):
         metrics = dict(quality=20, tone=20, helpfulness=20, humor=0)
-        self.assertEqual(contribution_total(dict.fromkeys(metrics, 0), 100, 7), 30)
+        self.assertEqual(contribution_total(dict.fromkeys(metrics, 0), 100, 7), 0)
         self.assertEqual(contribution_total(metrics, 100, 7), 99.27)
         self.assertEqual(contribution_total({**metrics, 'humor': 20}, 100, 7), 100)
 
-    def test_two_perfect_posts_never_beat_fifteen_zero_quality_posts(self):
+    def test_two_perfect_posts_lose_to_fifteen_with_quality_at_least_seven(self):
         perfect = dict(quality=20, tone=20, helpfulness=20, humor=20)
-        poor = dict.fromkeys(perfect, 0)
-        # Extremes bound every possible valid category combination, even
-        # granting sparse users the maximum consistency input.
+        established = dict(quality=7, tone=0, helpfulness=0, humor=0)
+        # Minimal non-exceptional quality and zero other categories bound
+        # established scores; sparse users get maximum consistency input.
         sparse_max = max(contribution_total(perfect, count, 7) for count in (1, 2))
         for count in range(15, 101):
             for days in range(1, 8):
                 with self.subTest(count=count, days=days):
-                    self.assertGreater(contribution_total(poor, count, days), sparse_max)
+                    self.assertGreater(contribution_total(established, count, days), sparse_max)
+
+    def test_very_low_quality_volume_can_lose_to_one_excellent_post(self):
+        perfect = dict(quality=20, tone=20, helpfulness=20, humor=20)
+        poor = dict(quality=2, tone=2, helpfulness=2, humor=0)
+        for count in (15, 20, 100):
+            with self.subTest(count=count):
+                self.assertLess(contribution_total(poor, count, 7),
+                                contribution_total(perfect, 1, 1))
+        # Friendly/funny content cannot earn points when Quality is zero.
+        self.assertEqual(contribution_total({**perfect, 'quality': 0}, 100, 7), 0)
 
     def test_ten_excellent_posts_can_beat_twenty_good_posts(self):
         excellent = dict(quality=19, tone=19, helpfulness=19, humor=0)
@@ -91,7 +101,7 @@ class ScoringTests(unittest.TestCase):
         _, sparse_count, sparse_days = contribution_messages(sparse)
         self.assertEqual((count, days), (15, 1))
         perfect = dict(quality=20, tone=20, helpfulness=20, humor=20)
-        self.assertGreater(contribution_total(dict.fromkeys(perfect, 0), count, days),
+        self.assertGreater(contribution_total(dict(quality=7, tone=0, helpfulness=0, humor=0), count, days),
                            contribution_total(perfect, sparse_count, sparse_days))
 
     def test_daily_activity_is_capped(self):
