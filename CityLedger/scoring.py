@@ -6,6 +6,8 @@ import unicodedata
 from collections import Counter
 
 SCORE_FIELDS = ("quality", "tone", "helpfulness", "humor")
+# Humor is reduced 80% from its previous relative weight of 5.
+SCORE_WEIGHTS = {"quality": 50, "tone": 15, "helpfulness": 30, "humor": 1}
 
 
 def validate_scores(value):
@@ -44,8 +46,9 @@ def contribution_messages(messages):
 
 def contribution_total(metrics, activity_count, active_days):
     scores = validate_scores(metrics)
-    quality = (scores['quality'] * .50 + scores['helpfulness'] * .30
-               + scores['tone'] * .15 + scores['humor'] * .05) * 5
+    # Normalize the relative weights so perfect scores still reach 100.
+    quality = sum(scores[field] * weight for field, weight in SCORE_WEIGHTS.items())
+    quality *= 5 / sum(SCORE_WEIGHTS.values())
     # Tone and humor alone cannot lift low-quality chatter to the top.
     quality *= min(1, scores['quality'] / 10)
     activity = .65 + .20 * math.log1p(min(activity_count, 100)) / math.log1p(100)

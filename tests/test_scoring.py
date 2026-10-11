@@ -32,6 +32,25 @@ class ScoringTests(unittest.TestCase):
                            contribution_total(dict(quality=4, tone=20, helpfulness=2, humor=20), 100, 7))
         self.assertEqual(contribution_total(dict.fromkeys(metrics, 20), 10000, 100), 100)
 
+    def test_humor_adds_only_about_one_point_at_max_activity(self):
+        metrics = dict(quality=12, tone=12, helpfulness=12, humor=0)
+        without_humor = contribution_total(metrics, 100, 7)
+        with_humor = contribution_total({**metrics, 'humor': 20}, 100, 7)
+        # Previously the full humor range added 5 points; now it adds ~1.04.
+        self.assertAlmostEqual(with_humor - without_humor, 1.04, places=2)
+
+    def test_activity_beats_humor_at_equal_other_categories(self):
+        metrics = dict(quality=12, tone=12, helpfulness=11, humor=0)
+        active = contribution_total(metrics, 10, 1)
+        funny = contribution_total({**metrics, 'humor': 8}, 5, 1)
+        self.assertGreater(active, funny)
+
+    def test_total_scale_is_preserved_with_lower_humor_weight(self):
+        metrics = dict(quality=20, tone=20, helpfulness=20, humor=0)
+        self.assertEqual(contribution_total(dict.fromkeys(metrics, 0), 100, 7), 0)
+        self.assertEqual(contribution_total(metrics, 100, 7), 98.96)
+        self.assertEqual(contribution_total({**metrics, 'humor': 20}, 100, 7), 100)
+
     def test_daily_activity_is_capped(self):
         messages = [message(f'Useful explanation of distinct issue number {i}') for i in range(50)]
         self.assertEqual(contribution_messages(messages)[1:], (10, 1))
