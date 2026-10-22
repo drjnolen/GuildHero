@@ -261,6 +261,13 @@ class SuiGrpcService:
             for checkpoint in result.get("checkpoints") or []
         ]
 
+    async def stop_checkpoint_subscription(self) -> None:
+        """Stop idle streaming without starting or closing the shared SDK process."""
+
+        if self._process is None or self._process.returncode is not None:
+            return
+        await self._request("stopCheckpointSubscription", timeout=15.0)
+
     @staticmethod
     def _checkpoint_from_result(result: dict[str, Any]) -> SuiCheckpoint:
         return SuiCheckpoint(

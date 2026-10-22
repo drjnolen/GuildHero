@@ -1607,6 +1607,212 @@ class TestBuyBotRuntimeEfficiency(unittest.TestCase):
 # Buy bot activation boundaries
 # ---------------------------------------------------------------------------
 
+class TestBuyBotComputeEfficiency(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.db = _FakeDB({"buybot:checkpoint": 100, "buybot:live_checkpoint": 100})
+        self.enterContext(patch.object(bot, "db", self.db))
+        self.announce = self.enterContext(patch.object(
+            bot, "_announce_checkpoint_buys", AsyncMock(return_value=True),
+        ))
+        self.chats = {"0xabc::coin::COIN": [(42, 100)]}
+        self.application = SimpleNamespace(bot_data={}, bot=SimpleNamespace())
+        self.context = SimpleNamespace(application=self.application, bot=self.application.bot)
+        self.service = SimpleNamespace(
+            get_latest_checkpoint=AsyncMock(return_value=self.checkpoint(100)),
+            get_subscribed_checkpoints=AsyncMock(),
+            get_checkpoints=AsyncMock(side_effect=lambda numbers: [
+                self.checkpoint(number) for number in numbers
+            ]),
+            stop_checkpoint_subscription=AsyncMock(),
+        )
+        self.enterContext(patch.object(bot, "get_sui_service", return_value=self.service))
+        self.enterContext(patch.object(bot, "_load_buybot_chat_tokens", return_value=self.chats))
+
+    @staticmethod
+    def checkpoint(number):
+        return SimpleNamespace(sequence_number=number, transactions=[])
+
+    async def test_caught_up_cycle_processes_each_checkpoint_once(self):
+        self.service.get_subscribed_checkpoints.return_value = [
+            self.checkpoint(number) for number in range(101, 111)
+        ]
+        await bot.check_sui_buys(self.context)
+
+        self.service.get_checkpoints.assert_not_awaited()
+        self.assertEqual(self.announce.await_count, 10)
+        self.assertEqual(self.db["buybot:checkpoint"], 110)
+        self.assertEqual(self.db["buybot:live_checkpoint"], 110)
+
+    async def test_continuous_tracker_reuses_each_cycles_live_work(self):
+        self.service.get_subscribed_checkpoints.side_effect = [
+            [self.checkpoint(101)], [self.checkpoint(102)], asyncio.CancelledError(),
+        ]
+        with self.assertRaises(asyncio.CancelledError):
+            await bot.run_sui_buy_tracker(self.application)
+
+        self.service.get_checkpoints.assert_not_awaited()
+        self.assertEqual(self.announce.await_count, 2)
+        self.assertEqual(self.db["buybot:checkpoint"], 102)
+
+    async def test_short_live_gap_is_fetched_and_processed_only_once(self):
+        self.service.get_subscribed_checkpoints.return_value = [self.checkpoint(110)]
+        await bot.check_sui_buys(self.context)
+
+        self.assertEqual(self.service.get_checkpoints.await_count, 1)
+        self.assertEqual(list(self.service.get_checkpoints.await_args.args[0]), list(range(101, 110)))
+        self.assertEqual(self.announce.await_count, 10)
+        self.assertEqual(self.db["buybot:checkpoint"], 110)
+
+    async def test_large_gap_still_recovers_older_missing_checkpoints(self):
+        self.service.get_subscribed_checkpoints.return_value = [self.checkpoint(400)]
+        await bot.check_sui_buys(self.context)
+
+        fetched = [number for call in self.service.get_checkpoints.await_args_list for number in call.args[0]]
+        self.assertEqual(sorted(fetched), list(range(101, 400)))
+        self.assertEqual(self.announce.await_count, 300)
+        self.assertEqual(self.db["buybot:checkpoint"], 350)
+        self.assertEqual(self.db["buybot:live_checkpoint"], 400)
+
+    async def test_restart_does_not_treat_live_cursor_as_contiguous_coverage(self):
+        self.db["buybot:live_checkpoint"] = 110
+        self.service.get_subscribed_checkpoints.return_value = [self.checkpoint(110)]
+        await bot.check_sui_buys(self.context)
+
+        self.assertEqual(self.announce.await_count, 10)
+        self.assertEqual(self.service.get_checkpoints.await_args.args[0], list(range(101, 111)))
+        self.assertEqual(self.db["buybot:checkpoint"], 110)
+
+    async def test_failed_live_delivery_is_not_reused_and_is_recovered(self):
+        processed = set()
+        self.announce.side_effect = [True, False]
+        live, succeeded = await bot._process_live_buybot_checkpoints(
+            self.context, self.service, self.chats,
+            [self.checkpoint(101), self.checkpoint(102)], 100, processed,
+        )
+        self.assertFalse(succeeded)
+        self.assertEqual(live, 101)
+        self.assertEqual(processed, {101})
+
+        self.announce.side_effect = None
+        cursor, succeeded = await bot._advance_buybot_history(
+            self.context, self.service, self.chats, 102, 100, processed,
+        )
+        self.assertTrue(succeeded)
+        self.assertEqual(cursor, 102)
+        self.service.get_checkpoints.assert_awaited_once_with([102])
+
+    async def test_failed_recovery_preserves_prefix_without_skipping_hole(self):
+        self.announce.return_value = False
+        cursor, succeeded = await bot._advance_buybot_history(
+            self.context, self.service, self.chats, 103, 100, {101, 103},
+        )
+        self.assertFalse(succeeded)
+        self.assertEqual(cursor, 101)
+        self.assertEqual(self.db["buybot:checkpoint"], 101)
+        self.service.get_checkpoints.assert_awaited_once_with([102])
+
+    async def test_missing_rpc_checkpoint_does_not_advance_past_hole(self):
+        self.service.get_checkpoints.side_effect = None
+        self.service.get_checkpoints.return_value = []
+        with self.assertRaisesRegex(RuntimeError, "omitted checkpoint 102"):
+            await bot._advance_buybot_history(
+                self.context, self.service, self.chats, 103, 100, {101, 103},
+            )
+        self.assertLess(self.db["buybot:checkpoint"], 102)
+
+    async def test_cursor_write_failure_does_not_mark_live_checkpoint_reusable(self):
+        class UnavailableDB(_FakeDB):
+            def __setitem__(self, key, value):
+                raise RuntimeError("database unavailable")
+
+        processed = set()
+        with patch.object(bot, "db", UnavailableDB()):
+            with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+                await bot._process_live_buybot_checkpoints(
+                    self.context, self.service, self.chats, [self.checkpoint(101)], 100, processed,
+                )
+        self.assertEqual(processed, set())
+
+    async def test_disabling_last_group_stops_stream_and_reenable_resumes(self):
+        configurations = iter([self.chats, {}, self.chats])
+        self.enterContext(patch.object(bot, "_load_buybot_chat_tokens", side_effect=lambda: next(configurations)))
+
+        async def first_subscription(**kwargs):
+            bot._invalidate_buybot_config(self.application)
+            self.service.get_subscribed_checkpoints.side_effect = asyncio.CancelledError()
+            return [self.checkpoint(101)]
+
+        async def reenable(application, timeout=None):
+            self.service.stop_checkpoint_subscription.assert_awaited_once()
+            bot._invalidate_buybot_config(application)
+
+        self.service.get_subscribed_checkpoints.side_effect = first_subscription
+        self.enterContext(patch.object(bot, "_wait_for_buybot_config_change", side_effect=reenable))
+        with self.assertRaises(asyncio.CancelledError):
+            await bot.run_sui_buy_tracker(self.application)
+
+        self.service.stop_checkpoint_subscription.assert_awaited_once()
+        self.assertEqual(self.service.get_latest_checkpoint.await_count, 2)
+        self.assertEqual(self.service.get_subscribed_checkpoints.await_count, 2)
+        self.assertEqual(self.db["buybot:checkpoint"], 101)
+
+
+class TestBuyBotEarlyDeduplication(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.db = _FakeDB({"buybot_seen:42": ["DuplicateBuy"]})
+        self.enterContext(patch.object(bot, "db", self.db))
+        self.event = SimpleNamespace(
+            amount=10_000_000_000, sui_spent=1_000_000_000,
+            wallet="0xbuyer", sender="0xbuyer", digest="DuplicateBuy",
+            timestamp={"seconds": "1785126600", "nanos": 0}, exchange="Cetus",
+        )
+        self.enterContext(patch.object(bot, "detect_buy", return_value=self.event))
+        self.metadata = self.enterContext(patch.object(bot, "get_coin_amount_config", AsyncMock(
+            return_value={"symbol": "CITY", "decimals": 9},
+        )))
+        self.valuation = self.enterContext(patch.object(bot, "_get_buy_valuation", AsyncMock(
+            return_value={"sui": Decimal("1"), "usd": Decimal("10")},
+        )))
+        self.volume = self.enterContext(patch.object(bot, "fetch_token_volume", AsyncMock(return_value=None)))
+        self.balance = self.enterContext(patch.object(bot, "sui_get_total_balance", AsyncMock(return_value=self.event.amount)))
+        self.send = self.enterContext(patch.object(bot, "_send_buy_announcement", AsyncMock()))
+
+    async def announce(self, chats):
+        return await bot._announce_checkpoint_buys(
+            SimpleNamespace(), SimpleNamespace(sequence_number=101, transactions=[object()]),
+            {"0xabc::city::CITY": chats},
+        )
+
+    async def test_seen_or_not_yet_active_chats_skip_all_enrichment(self):
+        self.assertTrue(await self.announce([(42, 100), (43, 101), (44, 102)]))
+        for lookup in (self.metadata, self.valuation, self.volume, self.balance, self.send):
+            lookup.assert_not_awaited()
+
+    async def test_mixed_chats_share_enrichment_and_retry_only_failed_delivery(self):
+        async def deliver(context, chat_id, text, **kwargs):
+            if chat_id == 44:
+                raise RuntimeError("temporary")
+
+        self.send.side_effect = deliver
+        chats = [(42, 100), (43, 100), (44, 100), (45, 101)]
+        self.assertFalse(await self.announce(chats))
+        self.assertEqual([call.args[1] for call in self.send.await_args_list], [43, 44])
+        for lookup in (self.metadata, self.valuation, self.volume, self.balance):
+            self.assertEqual(lookup.await_count, 1)
+        self.assertEqual(self.db["buybot_seen:43"], ["DuplicateBuy"])
+        self.assertNotIn("buybot_seen:44", self.db)
+
+        self.send.reset_mock(side_effect=True)
+        self.assertTrue(await self.announce(chats))
+        self.assertEqual(self.send.await_args.args[1], 44)
+        self.assertEqual(self.db["buybot_seen:44"], ["DuplicateBuy"])
+        self.send.reset_mock()
+        self.assertTrue(await self.announce(chats))
+        self.send.assert_not_awaited()
+        for lookup in (self.metadata, self.valuation, self.volume, self.balance):
+            self.assertEqual(lookup.await_count, 2)
+
+
 class TestBuyBotActivationCheckpoints(unittest.TestCase):
     def test_initializes_new_chats_without_replaying_history(self):
         original_db = bot.db

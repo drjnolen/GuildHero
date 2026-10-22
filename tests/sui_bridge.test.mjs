@@ -336,6 +336,76 @@ test('drains finalized checkpoints from the live subscription', async () => {
   );
 });
 
+test('stops streaming, discards buffered checkpoints, and resumes on the same client', async () => {
+  const streams = [];
+  const client = {
+    subscriptionService: {
+      subscribeCheckpoints(request, { abort }) {
+        const stream = { abort, finished: false };
+        streams.push(stream);
+        const base = BigInt(streams.length * 100);
+        return { responses: { async *[Symbol.asyncIterator]() {
+          try {
+            yield { checkpoint: { sequenceNumber: base + 1n, transactions: [] } };
+            yield { checkpoint: { sequenceNumber: base + 2n, transactions: [] } };
+            await new Promise(resolve => {
+              if (abort.aborted) resolve();
+              else abort.addEventListener('abort', resolve, { once: true });
+            });
+            // Model a final in-flight response arriving while cancellation settles.
+            yield { checkpoint: { sequenceNumber: base + 3n, transactions: [] } };
+          } finally {
+            stream.finished = true;
+          }
+        } } };
+      },
+    },
+    getBalance: async () => ({ balance: { balance: '25' } }),
+  };
+  const next = { method: 'subscribedCheckpoints', params: { maxItems: 1, waitMs: 100 } };
+  const stop = { method: 'stopCheckpointSubscription' };
+  await handleRequest(stop, client); // Stopping before activation is a no-op.
+  assert.equal(streams.length, 0);
+  assert.equal((await handleRequest(next, client)).checkpoints[0].sequenceNumber, '101');
+  await handleRequest(stop, client);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(streams[0].abort.aborted, true);
+  assert.equal(streams[0].finished, true);
+  await handleRequest(stop, client); // Repeated stops do not create a stream.
+  assert.equal(streams.length, 1);
+  assert.deepEqual(await handleRequest({
+    method: 'balance', params: { owner: '0x1', coinType: '0x2::sui::SUI' },
+  }, client), { balance: '25' });
+
+  // Old buffered/in-flight items are gone; new reads create one fresh stream.
+  assert.equal((await handleRequest(next, client)).checkpoints[0].sequenceNumber, '201');
+  assert.equal((await handleRequest(next, client)).checkpoints[0].sequenceNumber, '202');
+  assert.equal(streams.length, 2);
+  await handleRequest(stop, client);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(streams[1].finished, true);
+});
+
+test('stopping a subscription settles pending reads without waiting for their timeout', async () => {
+  let signal;
+  let finished = false;
+  const client = { subscriptionService: { subscribeCheckpoints(request, { abort }) {
+    signal = abort;
+    return { responses: { async *[Symbol.asyncIterator]() {
+      await new Promise(resolve => abort.addEventListener('abort', resolve, { once: true }));
+      finished = true;
+      throw new Error('aborted');
+    } } };
+  } } };
+  const pending = handleRequest({
+    method: 'subscribedCheckpoints', params: { waitMs: 5000 },
+  }, client);
+  await handleRequest({ method: 'stopCheckpointSubscription' }, client);
+  assert.deepEqual(await pending, { checkpoints: [] });
+  assert.equal(signal.aborted, true);
+  assert.equal(finished, true);
+});
+
 test('rejects oversized checkpoint batches', async () => {
   await assert.rejects(
     handleRequest(

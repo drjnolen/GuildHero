@@ -1748,10 +1748,24 @@ async def _announce_checkpoint_buys(
     amount_configs: dict[str, dict] = {}
     minimums_by_chat: dict[int, Decimal | None] = {}
     emojis_by_chat: dict[int, str] = {}
+    eligible_token_chats = {}
+    for coin_type, chats in token_chats.items():
+        eligible_chats = [
+            chat_id for chat_id, start_checkpoint in chats
+            if checkpoint.sequence_number > start_checkpoint
+        ]
+        if eligible_chats:
+            eligible_token_chats[coin_type] = eligible_chats
     for transaction in checkpoint.transactions or []:
-        for coin_type, chats in token_chats.items():
+        for coin_type, eligible_chats in eligible_token_chats.items():
             event = detect_buy(transaction, coin_type, SUI_DEX_PACKAGES)
             if not event or not event.digest:
+                continue
+            pending_chats = [
+                chat_id for chat_id in eligible_chats
+                if not await asyncio.to_thread(_buybot_digest_seen, chat_id, event.digest)
+            ]
+            if not pending_chats:
                 continue
             if coin_type not in amount_configs:
                 amount_configs[coin_type] = await get_coin_amount_config(coin_type)
@@ -1765,11 +1779,7 @@ async def _announce_checkpoint_buys(
                 valuation.get("usd"),
             )
 
-            for chat_id, start_checkpoint in chats:
-                if checkpoint.sequence_number <= start_checkpoint:
-                    continue
-                if await asyncio.to_thread(_buybot_digest_seen, chat_id, event.digest):
-                    continue
+            for chat_id in pending_chats:
                 if chat_id not in minimums_by_chat:
                     minimums_by_chat[chat_id] = await asyncio.to_thread(
                         _get_buybot_minimum_usd,
@@ -1853,6 +1863,7 @@ async def _announce_and_advance_buybot_cursor(
     checkpoint,
     token_chats: dict[str, list[tuple[int, int]]],
     cursor_key: str,
+    processed_checkpoints: set[int] | None = None,
 ) -> bool:
     if not await _announce_checkpoint_buys(context, checkpoint, token_chats):
         return False
@@ -1861,6 +1872,8 @@ async def _announce_and_advance_buybot_cursor(
         cursor_key,
         checkpoint.sequence_number,
     )
+    if processed_checkpoints is not None:
+        processed_checkpoints.add(checkpoint.sequence_number)
     return True
 
 
@@ -1870,6 +1883,7 @@ async def _process_live_buybot_checkpoints(
     token_chats: dict[str, list[tuple[int, int]]],
     checkpoints,
     live_cursor,
+    processed_checkpoints: set[int] | None = None,
 ):
     """Process subscription items and bounded gap recovery in order."""
 
@@ -1904,6 +1918,7 @@ async def _process_live_buybot_checkpoints(
                         gap_checkpoint,
                         token_chats,
                         live_cursor_key,
+                        processed_checkpoints,
                     ):
                         return live_cursor, False
                     live_cursor = gap_checkpoint.sequence_number
@@ -1913,6 +1928,7 @@ async def _process_live_buybot_checkpoints(
             checkpoint,
             token_chats,
             live_cursor_key,
+            processed_checkpoints,
         ):
             return live_cursor, False
         live_cursor = checkpoint.sequence_number
@@ -1926,8 +1942,9 @@ async def _advance_buybot_history(
     token_chats: dict[str, list[tuple[int, int]]],
     latest_sequence: int,
     cursor,
+    processed_checkpoints: set[int] | None = None,
 ):
-    """Advance one bounded historical recovery batch behind the live stream."""
+    """Recover gaps, reusing successful live work from this configuration/cycle."""
 
     cursor_key = _get_buybot_checkpoint_key()
     if cursor is None or int(cursor) > latest_sequence:
@@ -1947,15 +1964,27 @@ async def _advance_buybot_history(
         latest_sequence,
         int(cursor) + _BUYBOT_MAX_CHECKPOINTS_PER_RUN,
     )
+    processed_checkpoints = processed_checkpoints or set()
+    saved_cursor = cursor
     for sequence_numbers in _buybot_checkpoint_batches(
         int(cursor) + 1,
         end_sequence,
     ):
-        checkpoints = await service.get_checkpoints(sequence_numbers)
+        missing_sequences = [
+            sequence for sequence in sequence_numbers
+            if sequence not in processed_checkpoints
+        ]
+        checkpoints = (
+            await service.get_checkpoints(missing_sequences)
+            if missing_sequences else []
+        )
         checkpoints_by_sequence = {
             checkpoint.sequence_number: checkpoint for checkpoint in checkpoints
         }
         for sequence_number in sequence_numbers:
+            if sequence_number in processed_checkpoints:
+                cursor = sequence_number
+                continue
             checkpoint = checkpoints_by_sequence.get(sequence_number)
             if checkpoint is None:
                 raise RuntimeError(
@@ -1967,8 +1996,17 @@ async def _advance_buybot_history(
                 token_chats,
                 cursor_key,
             ):
+                if cursor != saved_cursor:
+                    await asyncio.to_thread(db.__setitem__, cursor_key, cursor)
                 return cursor, False
             cursor = checkpoint.sequence_number
+            saved_cursor = cursor
+
+        # Reused checkpoints need only one recovery-cursor write per batch.
+        # Actual recovery deliveries retain their per-checkpoint durability.
+        if cursor != saved_cursor:
+            await asyncio.to_thread(db.__setitem__, cursor_key, cursor)
+            saved_cursor = cursor
 
     return cursor, True
 
@@ -1982,11 +2020,11 @@ async def check_sui_buys(context: ContextTypes.DEFAULT_TYPE):
 
     async with lock:
         token_chats = await _get_cached_buybot_chat_tokens(context.application)
-        if not token_chats:
-            return
-
         service = get_sui_service(SUI_GRPC_URL, SUI_GRPC_HEADERS)
         try:
+            if not token_chats:
+                await service.stop_checkpoint_subscription()
+                return
             latest = await service.get_latest_checkpoint()
             latest_sequence = int(latest.sequence_number)
             token_chats = await asyncio.to_thread(
@@ -2002,12 +2040,14 @@ async def check_sui_buys(context: ContextTypes.DEFAULT_TYPE):
                 db.get,
                 _get_buybot_live_checkpoint_key(),
             )
+            processed_checkpoints: set[int] = set()
             live_cursor, succeeded = await _process_live_buybot_checkpoints(
                 context,
                 service,
                 token_chats,
                 subscribed,
                 live_cursor,
+                processed_checkpoints,
             )
             if not succeeded:
                 return
@@ -2023,6 +2063,7 @@ async def check_sui_buys(context: ContextTypes.DEFAULT_TYPE):
                 token_chats,
                 latest_sequence,
                 cursor,
+                processed_checkpoints,
             )
         except asyncio.CancelledError:
             raise
@@ -2040,6 +2081,7 @@ async def run_sui_buy_tracker(application):
     history_cursor = None
     latest_sequence = None
     active_generation = None
+    service = None
 
     while True:
         try:
@@ -2052,6 +2094,8 @@ async def run_sui_buy_tracker(application):
                 token_chats = await _get_cached_buybot_chat_tokens(application)
                 active_generation = runtime["config_generation"]
                 if not token_chats:
+                    if service is not None:
+                        await service.stop_checkpoint_subscription()
                     token_chats = None
                     await _wait_for_buybot_config_change(application)
                     continue
@@ -2073,12 +2117,16 @@ async def run_sui_buy_tracker(application):
                 max_items=100,
                 wait_ms=_BUYBOT_SUBSCRIPTION_WAIT_MS,
             )
+            # Discard this small set each cycle: restarts/config changes must
+            # recover from durable cursors, never from stale in-memory coverage.
+            processed_checkpoints: set[int] = set()
             live_cursor, succeeded = await _process_live_buybot_checkpoints(
                 context,
                 service,
                 token_chats,
                 subscribed,
                 live_cursor,
+                processed_checkpoints,
             )
             if not succeeded:
                 await _wait_for_buybot_config_change(
@@ -2098,6 +2146,7 @@ async def run_sui_buy_tracker(application):
                 token_chats,
                 latest_sequence,
                 history_cursor,
+                processed_checkpoints,
             )
         except asyncio.CancelledError:
             raise
