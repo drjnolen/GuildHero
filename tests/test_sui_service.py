@@ -116,6 +116,31 @@ class SuiServiceHelpersTests(unittest.TestCase):
             self.assertEqual(service._request.await_count, 1)
         asyncio.run(exercise())
 
+    def test_stopping_subscription_keeps_live_bridge_available(self):
+        async def exercise():
+            service = SuiGrpcService("https://example.invalid")
+            process = SimpleNamespace(returncode=None)
+            service._process = process
+            service._request = AsyncMock()
+            service.close = AsyncMock()
+
+            await service.stop_checkpoint_subscription()
+
+            service._request.assert_awaited_once_with("stopCheckpointSubscription", timeout=15.0)
+            service.close.assert_not_awaited()
+            self.assertIs(service._process, process)
+        asyncio.run(exercise())
+
+    def test_stopping_idle_subscription_never_starts_bridge(self):
+        async def exercise():
+            service = SuiGrpcService("https://example.invalid")
+            service._request = AsyncMock()
+            await service.stop_checkpoint_subscription()
+            service._process = SimpleNamespace(returncode=0)
+            await service.stop_checkpoint_subscription()
+            service._request.assert_not_awaited()
+        asyncio.run(exercise())
+
     def test_polling_failure_is_reported_for_outer_backoff(self):
         async def exercise():
             service = SuiGrpcService("https://example.invalid")

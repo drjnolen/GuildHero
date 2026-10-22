@@ -273,7 +273,9 @@ Exchange labels are inferred from known package/module names. Operators can add 
 export SUI_DEX_PACKAGES_JSON='{"0xPACKAGE_ID":"Exchange Name"}'
 ```
 
-The public Sui Foundation endpoint is the default. A dedicated gRPC provider endpoint is recommended for production streaming; provider credentials can be passed through `SUI_GRPC_HEADERS_JSON`. The tracker keeps one finalized-checkpoint subscription while active and sleeps without scanning the database when no groups have buy announcements enabled.
+The public Sui Foundation endpoint is the default. A dedicated gRPC provider endpoint is recommended for production streaming; provider credentials can be passed through `SUI_GRPC_HEADERS_JSON`. The tracker keeps one finalized-checkpoint subscription while active. When the last group disables buy announcements, it cancels that subscription and clears its buffer, then waits for a configuration change without scanning the database. The shared SDK process remains available for payouts and other chain commands; re-enabling announcements starts a fresh subscription.
+
+Recovery reuses checkpoints successfully processed by the live stream in the same cycle, fetching only missing checkpoints. This temporary coverage is discarded between cycles and after restarts; recovery still follows durable cursors and stops at failed deliveries or missing RPC results. Already-announced purchases and checkpoints from before a group's activation skip price, volume, and holder lookups. These optimizations preserve live alert timing and existing buy detection, valuation, and badge rules.
 
 ## Architecture
 

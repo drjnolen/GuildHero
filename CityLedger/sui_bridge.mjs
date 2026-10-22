@@ -115,15 +115,21 @@ function createCheckpointSubscription(client) {
     waiters: [],
     error: null,
     pump: null,
+    controller: new AbortController(),
+    stopped: false,
   };
-  const call = client.subscriptionService.subscribeCheckpoints({
-    readMask: CHECKPOINT_READ_MASK,
-  });
+  const call = client.subscriptionService.subscribeCheckpoints(
+    { readMask: CHECKPOINT_READ_MASK },
+    { abort: state.controller.signal },
+  );
   checkpointSubscriptionStates.set(client, state);
 
   state.pump = (async () => {
     try {
       for await (const response of call.responses) {
+        if (state.stopped) {
+          break;
+        }
         if (!response.checkpoint) {
           continue;
         }
@@ -144,6 +150,9 @@ function createCheckpointSubscription(client) {
       }
       throw new Error('Sui checkpoint subscription ended unexpectedly.');
     } catch (error) {
+      if (state.stopped) {
+        return;
+      }
       state.error = error;
       for (const waiter of state.waiters.splice(0)) {
         clearTimeout(waiter.timer);
@@ -153,6 +162,21 @@ function createCheckpointSubscription(client) {
   })();
 
   return state;
+}
+
+function stopCheckpointSubscription(client) {
+  const state = checkpointSubscriptionStates.get(client);
+  if (!state) {
+    return;
+  }
+  checkpointSubscriptionStates.delete(client);
+  state.stopped = true;
+  state.controller.abort();
+  state.queue.length = 0;
+  for (const waiter of state.waiters.splice(0)) {
+    clearTimeout(waiter.timer);
+    waiter.resolve(null);
+  }
 }
 
 function waitForSubscribedCheckpoint(state, waitMs) {
@@ -184,15 +208,20 @@ async function getSubscribedCheckpoints(client, maxItems, waitMs) {
     first = await waitForSubscribedCheckpoint(state, waitMs);
   } catch (error) {
     // Drain buffered checkpoints before discarding a disconnected stream.
-    checkpointSubscriptionStates.delete(client);
+    if (checkpointSubscriptionStates.get(client) === state) {
+      checkpointSubscriptionStates.delete(client);
+    }
     throw error;
   }
-  if (!first) {
+  if (!first || state.stopped) {
     return [];
   }
 
   // Give the subscription pump one turn to enqueue any already-buffered items.
   await new Promise((resolve) => setTimeout(resolve, 0));
+  if (state.stopped) {
+    return [];
+  }
   const checkpoints = [first];
   while (checkpoints.length < maxItems && state.queue.length > 0) {
     checkpoints.push(state.queue.shift());
@@ -456,6 +485,10 @@ export async function handleRequest(request, client) {
           waitMs,
         ),
       };
+    }
+    case 'stopCheckpointSubscription': {
+      stopCheckpointSubscription(client);
+      return {};
     }
     case 'balance': {
       const response = await client.getBalance({
